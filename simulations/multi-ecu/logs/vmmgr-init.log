@@ -1,0 +1,7 @@
+[diag] creating NV store: /tmp/sumo-sovd-sim-nv.bin
+[factory] provisioned: serial=SN-VM-MGR-001 vin=W0VM000000TEST001
+[factory] hyp: hashed runner binary (18722208 bytes)
+[factory] hyp: wrote FW meta bank A (version: 1.0.0)
+[factory] os1: no image file, skipping hash
+[factory] os1: wrote FW meta bank A (version: 1.0.0)
+[factory] initialization complete

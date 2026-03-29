@@ -18,9 +18,10 @@ name = "Vehicle Gateway (multi-ecu sim)"
 # vm-mgr components via SOVD proxy
 # =============================================================================
 
-[proxy.vmmgr]
+[proxy.os1]
+name = "OS1 VM (vm-mgr)"
 url = "http://localhost:4001"
-components = ["os1"]
+component_id = "os1"
 
 # =============================================================================
 # UDS ECUs on vcan1

@@ -121,8 +121,9 @@ sleep 0.5
 # =============================================================================
 
 echo "[sim] starting SOVDd gateway on port $GATEWAY_PORT..."
-"$SOVDD_BIN/sovdd" --config "$CONFIG/gateway.toml" \
-    --did-dir "$SOVDD_DIR/simulations/basic_uds/config" \
+"$SOVDD_BIN/sovdd" "$CONFIG/gateway.toml" \
+    -d "$SOVDD_DIR/simulations/basic_uds/config/dids-engine.yaml" \
+    -d "$SOVDD_DIR/simulations/basic_uds/config/dids-body.yaml" \
     > "$LOG_DIR/gateway.log" 2>&1 &
 PIDS+=($!)
 

@@ -1,0 +1,5 @@
+[auth] Static mode (--token override)
+  Token: dev-...
+SOVD Security Helper listening on http://0.0.0.0:9100
+  ECUs: 3
+Failed to bind to 0.0.0.0:9100: Address already in use (os error 98)
