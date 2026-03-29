@@ -1,10 +1,10 @@
 /// Per-ECU flash — drives one ECU through SOVD flash lifecycle
 /// up to trial mode (activated, NOT committed).
 ///
-/// Commit/rollback is the campaign's responsibility, not per-ECU.
+/// Handles both direct components and gateway sub-entities.
+/// Commit/rollback is the campaign's responsibility.
 
 use sovd_client::flash::FlashClient;
-use sovd_client::SessionType;
 use sovd_client::SovdClient;
 use tracing::info;
 
@@ -27,12 +27,10 @@ pub struct EcuFlashResult {
 }
 
 /// Flash one ECU to trial mode: session → security → upload → flash → reset → activated.
-///
-/// Does NOT commit. The caller (campaign orchestrator) decides when to commit
-/// after all ECUs are in trial and system health is verified.
 pub async fn flash_ecu_to_trial(config: EcuFlashConfig) -> Result<EcuFlashResult, OrchestratorError> {
     let comp = &config.component_id;
-    info!(component = %comp, "starting ECU flash (to trial)");
+    let gw = config.gateway_id.as_deref();
+    info!(component = %comp, gateway = ?gw, "starting ECU flash (to trial)");
 
     let client = SovdClient::new(&config.server_url)
         .map_err(|e| OrchestratorError::Sovd {
@@ -40,22 +38,73 @@ pub async fn flash_ecu_to_trial(config: EcuFlashConfig) -> Result<EcuFlashResult
             message: format!("connect: {e}"),
         })?;
 
+    // For sub-entities, the mode target is "component_id" routed through the gateway.
+    // For direct components, target is None.
+    let (mode_component, mode_target) = if let Some(gw_id) = gw {
+        (gw_id, Some(comp.as_str()))
+    } else {
+        (comp.as_str(), None)
+    };
+
     // 1. Switch to programming session
     info!(component = %comp, "switching to programming session");
-    client.set_session(comp, SessionType::Programming)
-        .await
-        .map_err(|e| OrchestratorError::Sovd {
-            component: comp.clone(),
-            message: format!("set_session: {e}"),
-        })?;
+    client.set_mode_targeted(
+        mode_component,
+        "session",
+        serde_json::json!({"value": "programming"}),
+        mode_target,
+    )
+    .await
+    .map_err(|e| OrchestratorError::Sovd {
+        component: comp.clone(),
+        message: format!("set_session: {e}"),
+    })?;
 
-    // 2. Security unlock
-    // TODO: integrate with security helper for key computation
-    info!(component = %comp, level = config.security_level, "security unlock");
+    // 2. Security unlock — request seed
+    info!(component = %comp, level = config.security_level, "requesting security seed");
+    let seed_resp = client.set_mode_targeted(
+        mode_component,
+        "security",
+        serde_json::json!({"value": format!("level{}_requestseed", config.security_level)}),
+        mode_target,
+    )
+    .await
+    .map_err(|e| OrchestratorError::SecurityFailed {
+        component: comp.clone(),
+        message: format!("request seed: {e}"),
+    })?;
+
+    // Extract seed and compute key
+    // TODO: use security helper instead of hardcoded XOR
+    if let Some(seed_val) = seed_resp.seed.as_ref() {
+        let seed_str = seed_val
+            .get("Request_Seed")
+            .and_then(|s| s.as_str())
+            .or_else(|| seed_val.as_str())
+            .unwrap_or("");
+        let seed_bytes: Vec<u8> = seed_str
+            .split_whitespace()
+            .filter_map(|s: &str| u8::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .collect();
+        let key_hex: String = seed_bytes.iter().map(|b| format!("{:02x}", b ^ 0xFF)).collect();
+
+        info!(component = %comp, "sending security key");
+        client.set_mode_targeted(
+            mode_component,
+            "security",
+            serde_json::json!({"value": format!("level{}", config.security_level), "key": key_hex}),
+            mode_target,
+        )
+        .await
+        .map_err(|e| OrchestratorError::SecurityFailed {
+            component: comp.clone(),
+            message: format!("send key: {e}"),
+        })?;
+    }
 
     // 3. Create flash client
-    let flash_client = if let Some(ref gw) = config.gateway_id {
-        FlashClient::for_sovd_sub_entity(&config.server_url, gw, comp)
+    let flash_client = if let Some(gw_id) = gw {
+        FlashClient::for_sovd_sub_entity(&config.server_url, gw_id, comp)
     } else {
         FlashClient::for_sovd(&config.server_url, comp)
     }
@@ -127,17 +176,16 @@ pub async fn flash_ecu_to_trial(config: EcuFlashConfig) -> Result<EcuFlashResult
             message: format!("reset: {e}"),
         })?;
 
-    // 11. Wait for activation (poll until not awaiting_reset)
-    // TODO: poll activation state with timeout
+    // 11. Wait for activation
     info!(component = %comp, "waiting for activation");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // TODO: poll activation state with timeout
 
-    // ECU is now in trial mode — NOT committed
     info!(component = %comp, "ECU in trial mode (activated, not committed)");
 
     Ok(EcuFlashResult {
         component_id: comp.clone(),
-        active_version: None, // TODO: read from activation state
+        active_version: None,
         previous_version: None,
     })
 }

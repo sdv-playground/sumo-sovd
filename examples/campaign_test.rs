@@ -50,7 +50,7 @@ async fn main() {
     let result = orchestrator
         .flash_all(vec![EcuTarget {
             component_id: "os1".into(),
-            gateway_id: None,
+            gateway_id: Some("vehicle_gateway".into()),
             package: os1_v100.clone(),
         }])
         .await;
@@ -80,7 +80,7 @@ async fn main() {
     let result = orchestrator
         .flash_all(vec![EcuTarget {
             component_id: "os1".into(),
-            gateway_id: None,
+            gateway_id: Some("vehicle_gateway".into()),
             package: os1_v110,
         }])
         .await;
@@ -95,7 +95,7 @@ async fn main() {
             let result2 = orchestrator
                 .flash_all(vec![EcuTarget {
                     component_id: "os1".into(),
-                    gateway_id: None,
+                    gateway_id: Some("vehicle_gateway".into()),
                     package: os1_v100.clone(),
                 }])
                 .await;
@@ -120,7 +120,7 @@ async fn main() {
     let result = orchestrator
         .flash_all(vec![EcuTarget {
             component_id: "os1".into(),
-            gateway_id: None,
+            gateway_id: Some("vehicle_gateway".into()),
             package: os1_v120,
         }])
         .await;
@@ -142,7 +142,7 @@ async fn main() {
     let result = orchestrator
         .flash_all(vec![EcuTarget {
             component_id: "os1".into(),
-            gateway_id: None,
+            gateway_id: Some("vehicle_gateway".into()),
             package: crl,
         }])
         .await;
@@ -158,7 +158,7 @@ async fn main() {
             match orchestrator
                 .flash_all(vec![EcuTarget {
                     component_id: "os1".into(),
-                    gateway_id: None,
+                    gateway_id: Some("vehicle_gateway".into()),
                     package: os1_v100,
                 }])
                 .await
