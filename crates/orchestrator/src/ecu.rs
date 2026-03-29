@@ -1,8 +1,7 @@
-/// Per-ECU flash orchestration — drives one ECU through the full
-/// SOVD flash lifecycle using sovd-client.
+/// Per-ECU flash — drives one ECU through SOVD flash lifecycle
+/// up to trial mode (activated, NOT committed).
 ///
-/// This implements the L2 (image manifest) processing at the SOVD level:
-/// session → security → upload → verify → flash → finalize → reset → commit
+/// Commit/rollback is the campaign's responsibility, not per-ECU.
 
 use sovd_client::flash::FlashClient;
 use sovd_client::SessionType;
@@ -13,33 +12,28 @@ use crate::error::OrchestratorError;
 
 /// Configuration for a single ECU flash operation.
 pub struct EcuFlashConfig {
-    /// SOVD component ID (e.g., "os1", "engine_ecu")
     pub component_id: String,
-    /// SOVD server base URL
     pub server_url: String,
-    /// Gateway ID if ECU is behind a gateway
     pub gateway_id: Option<String>,
-    /// Security level required (e.g., 1)
     pub security_level: u8,
-    /// Firmware package bytes (integrated SUIT envelope)
     pub package: Vec<u8>,
 }
 
-/// Result of a single ECU flash operation.
+/// Result of flashing one ECU (in trial mode, not committed).
 pub struct EcuFlashResult {
     pub component_id: String,
-    pub success: bool,
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
-    pub message: String,
 }
 
-/// Drive one ECU through the full SOVD flash lifecycle.
-pub async fn flash_ecu(config: EcuFlashConfig) -> Result<EcuFlashResult, OrchestratorError> {
+/// Flash one ECU to trial mode: session → security → upload → flash → reset → activated.
+///
+/// Does NOT commit. The caller (campaign orchestrator) decides when to commit
+/// after all ECUs are in trial and system health is verified.
+pub async fn flash_ecu_to_trial(config: EcuFlashConfig) -> Result<EcuFlashResult, OrchestratorError> {
     let comp = &config.component_id;
-    info!(component = %comp, "starting ECU flash");
+    info!(component = %comp, "starting ECU flash (to trial)");
 
-    // Connect to SOVD server
     let client = SovdClient::new(&config.server_url)
         .map_err(|e| OrchestratorError::Sovd {
             component: comp.clone(),
@@ -55,7 +49,7 @@ pub async fn flash_ecu(config: EcuFlashConfig) -> Result<EcuFlashResult, Orchest
             message: format!("set_session: {e}"),
         })?;
 
-    // 2. Security unlock (request seed + send key via helper)
+    // 2. Security unlock
     // TODO: integrate with security helper for key computation
     info!(component = %comp, level = config.security_level, "security unlock");
 
@@ -70,7 +64,7 @@ pub async fn flash_ecu(config: EcuFlashConfig) -> Result<EcuFlashResult, Orchest
         message: format!("flash client: {e}"),
     })?;
 
-    // 4. Upload package
+    // 4. Upload
     info!(component = %comp, size = config.package.len(), "uploading package");
     let upload = flash_client.upload_file(&config.package)
         .await
@@ -133,25 +127,17 @@ pub async fn flash_ecu(config: EcuFlashConfig) -> Result<EcuFlashResult, Orchest
             message: format!("reset: {e}"),
         })?;
 
-    // 11. Wait for activation
+    // 11. Wait for activation (poll until not awaiting_reset)
+    // TODO: poll activation state with timeout
     info!(component = %comp, "waiting for activation");
-    // TODO: poll activation state until not AwaitingReset
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    // 12. Commit
-    info!(component = %comp, "committing firmware");
-    flash_client.commit_flash()
-        .await
-        .map_err(|e| OrchestratorError::FlashFailed {
-            component: comp.clone(),
-            message: format!("commit: {e}"),
-        })?;
+    // ECU is now in trial mode — NOT committed
+    info!(component = %comp, "ECU in trial mode (activated, not committed)");
 
-    info!(component = %comp, "ECU flash complete");
     Ok(EcuFlashResult {
         component_id: comp.clone(),
-        success: true,
         active_version: None, // TODO: read from activation state
         previous_version: None,
-        message: "firmware committed".into(),
     })
 }
