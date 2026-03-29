@@ -42,6 +42,7 @@ pub enum CampaignState {
 #[derive(Debug, Clone)]
 pub struct EcuStatus {
     pub component_id: String,
+    pub gateway_id: Option<String>,
     pub state: EcuState,
     pub update_type: UpdateType,
     pub active_version: Option<String>,
@@ -89,8 +90,9 @@ impl CampaignOrchestrator {
             .iter()
             .map(|t| EcuStatus {
                 component_id: t.component_id.clone(),
+                gateway_id: t.gateway_id.clone(),
                 state: EcuState::Pending,
-                update_type: UpdateType::Firmware, // updated after classification
+                update_type: UpdateType::Firmware,
                 active_version: None,
                 previous_version: None,
                 error: None,
@@ -138,7 +140,8 @@ impl CampaignOrchestrator {
                     if !activated.is_empty() {
                         warn!(count = activated.len(), "rolling back activated ECUs due to failure");
                         for rollback_comp in &activated {
-                            match self.rollback_one(rollback_comp).await {
+                            let rollback_gw = statuses.iter().find(|s| &s.component_id == rollback_comp).and_then(|s| s.gateway_id.as_deref());
+                        match self.rollback_one(rollback_comp, rollback_gw).await {
                                 Ok(()) => {
                                     if let Some(s) = statuses.iter_mut().find(|s| &s.component_id == rollback_comp) {
                                         s.state = EcuState::RolledBack;
@@ -182,7 +185,7 @@ impl CampaignOrchestrator {
 
         for ecu in &to_commit {
             info!(component = %ecu.component_id, "committing");
-            self.commit_one(&ecu.component_id).await?;
+            self.commit_one(&ecu.component_id, ecu.gateway_id.as_deref()).await?;
         }
 
         info!("campaign committed");
@@ -205,7 +208,7 @@ impl CampaignOrchestrator {
 
         for ecu in &activated {
             warn!(component = %ecu.component_id, "rolling back");
-            match self.rollback_one(&ecu.component_id).await {
+            match self.rollback_one(&ecu.component_id, ecu.gateway_id.as_deref()).await {
                 Ok(()) => info!(component = %ecu.component_id, "rolled back"),
                 Err(e) => error!(component = %ecu.component_id, error = %e, "rollback failed"),
             }
@@ -282,24 +285,28 @@ impl CampaignOrchestrator {
         self.flash_all(targets).await
     }
 
-    async fn commit_one(&self, component_id: &str) -> Result<(), OrchestratorError> {
-        let flash_client = FlashClient::for_sovd(&self.config.server_url, component_id)
-            .map_err(|e| OrchestratorError::Sovd {
-                component: component_id.to_string(),
-                message: format!("{e}"),
-            })?;
+    fn make_flash_client(&self, component_id: &str, gateway_id: Option<&str>) -> Result<FlashClient, OrchestratorError> {
+        let client = if let Some(gw) = gateway_id {
+            FlashClient::for_sovd_sub_entity(&self.config.server_url, gw, component_id)
+        } else {
+            FlashClient::for_sovd(&self.config.server_url, component_id)
+        };
+        client.map_err(|e| OrchestratorError::Sovd {
+            component: component_id.to_string(),
+            message: format!("{e}"),
+        })
+    }
+
+    async fn commit_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+        let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client.commit_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),
             message: format!("commit: {e}"),
         })
     }
 
-    async fn rollback_one(&self, component_id: &str) -> Result<(), OrchestratorError> {
-        let flash_client = FlashClient::for_sovd(&self.config.server_url, component_id)
-            .map_err(|e| OrchestratorError::Sovd {
-                component: component_id.to_string(),
-                message: format!("{e}"),
-            })?;
+    async fn rollback_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+        let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client.rollback_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),
             message: format!("rollback: {e}"),
