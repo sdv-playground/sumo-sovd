@@ -11,7 +11,7 @@ use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
 use tracing::{info, error, warn};
 
-use crate::ecu::{self, EcuFlashConfig, EcuFlashResult};
+use crate::ecu::{self, EcuFlashConfig, EcuFlashResult, UpdateType};
 use crate::error::OrchestratorError;
 
 /// Configuration for a campaign deployment.
@@ -43,6 +43,7 @@ pub enum CampaignState {
 pub struct EcuStatus {
     pub component_id: String,
     pub state: EcuState,
+    pub update_type: UpdateType,
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
     pub error: Option<String>,
@@ -89,6 +90,7 @@ impl CampaignOrchestrator {
             .map(|t| EcuStatus {
                 component_id: t.component_id.clone(),
                 state: EcuState::Pending,
+                update_type: UpdateType::Firmware, // updated after classification
                 active_version: None,
                 previous_version: None,
                 error: None,
@@ -102,21 +104,30 @@ impl CampaignOrchestrator {
             info!(component = %comp, progress = format!("{}/{}", i + 1, total), "flashing ECU");
             statuses[i].state = EcuState::Flashing;
 
-            match ecu::flash_ecu_to_trial(EcuFlashConfig {
-                component_id: comp.clone(),
-                server_url: self.config.server_url.clone(),
-                gateway_id: target.gateway_id.clone(),
-                security_level: self.config.security_level,
-                package: target.package.clone(),
-            })
+            match ecu::flash_ecu_to_trial(
+                EcuFlashConfig {
+                    component_id: comp.clone(),
+                    server_url: self.config.server_url.clone(),
+                    gateway_id: target.gateway_id.clone(),
+                    security_level: self.config.security_level,
+                    package: target.package.clone(),
+                },
+                &self.config.trust_anchor,
+            )
             .await
             {
                 Ok(result) => {
-                    statuses[i].state = EcuState::Activated;
+                    statuses[i].update_type = result.update_type;
+                    statuses[i].state = match result.update_type {
+                        UpdateType::Firmware => EcuState::Activated, // trial
+                        UpdateType::Policy => EcuState::Committed,   // immediate
+                    };
                     statuses[i].active_version = result.active_version;
                     statuses[i].previous_version = result.previous_version;
-                    activated.push(comp.clone());
-                    info!(component = %comp, "ECU activated (trial)");
+                    if result.update_type == UpdateType::Firmware {
+                        activated.push(comp.clone());
+                    }
+                    info!(component = %comp, update_type = ?result.update_type, "ECU update complete");
                 }
                 Err(e) => {
                     statuses[i].state = EcuState::Failed;
@@ -160,19 +171,21 @@ impl CampaignOrchestrator {
         &self,
         ecus: &[EcuStatus],
     ) -> Result<(), OrchestratorError> {
-        let activated: Vec<&EcuStatus> = ecus
+        let to_commit: Vec<&EcuStatus> = ecus
             .iter()
-            .filter(|e| e.state == EcuState::Activated)
+            .filter(|e| e.state == EcuState::Activated && e.update_type == UpdateType::Firmware)
             .collect();
 
-        info!(ecus = activated.len(), "committing all ECUs");
+        let policy_count = ecus.iter().filter(|e| e.update_type == UpdateType::Policy).count();
 
-        for ecu in &activated {
+        info!(firmware = to_commit.len(), policy = policy_count, "committing campaign");
+
+        for ecu in &to_commit {
             info!(component = %ecu.component_id, "committing");
             self.commit_one(&ecu.component_id).await?;
         }
 
-        info!("campaign committed — all ECUs permanent");
+        info!("campaign committed");
         Ok(())
     }
 

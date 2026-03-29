@@ -41,4 +41,5 @@ pub mod error;
 pub mod ecu;
 
 pub use campaign::CampaignOrchestrator;
+pub use ecu::UpdateType;
 pub use error::OrchestratorError;
