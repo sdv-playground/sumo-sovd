@@ -8,6 +8,7 @@ description = "SUIT campaign orchestrator over SOVD — coordinates multi-ECU fi
 [dependencies]
 # SUIT manifest parsing + validation
 sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-processor = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
 
