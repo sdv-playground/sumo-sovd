@@ -9,6 +9,7 @@
 use sumo_sovd_orchestrator::campaign::{
     CampaignConfig, CampaignOrchestrator, EcuTarget, EcuState,
 };
+use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
 use sumo_sovd_orchestrator::UpdateType;
 
 fn load_suit(path: &str) -> Vec<u8> {
@@ -32,10 +33,19 @@ async fn main() {
     let output_dir = format!("{vmmgr_dir}/example/output");
     let gw = Some("vehicle_gateway".to_string());
 
+    let helper_url = std::env::var("HELPER_URL")
+        .unwrap_or_else(|_| "http://localhost:9100".to_string());
+    let helper_token = std::env::var("HELPER_TOKEN")
+        .unwrap_or_else(|_| "dev-secret-123".to_string());
+
     let orchestrator = CampaignOrchestrator::new(CampaignConfig {
         server_url,
         trust_anchor,
         security_level: 1,
+        security_helper: SecurityHelperConfig {
+            url: helper_url,
+            token: helper_token,
+        },
     });
 
     let mut passed = 0;

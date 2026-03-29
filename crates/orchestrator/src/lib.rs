@@ -39,6 +39,7 @@
 pub mod campaign;
 pub mod error;
 pub mod ecu;
+pub mod security_helper;
 pub mod sovd_ops;
 
 pub use campaign::CampaignOrchestrator;

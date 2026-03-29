@@ -19,12 +19,14 @@ use tracing::{info, error, warn};
 
 use crate::ecu::{self, EcuFlashConfig, UpdateType};
 use crate::error::OrchestratorError;
+use crate::security_helper::SecurityHelperConfig;
 
 /// Configuration for a campaign deployment.
 pub struct CampaignConfig {
     pub server_url: String,
     pub trust_anchor: Vec<u8>,
     pub security_level: u8,
+    pub security_helper: SecurityHelperConfig,
 }
 
 /// State of individual ECUs within a campaign.
@@ -113,6 +115,7 @@ impl CampaignOrchestrator {
                     gateway_id: target.gateway_id.clone(),
                     security_level: self.config.security_level,
                     package: target.package.clone(),
+                    security_helper: self.config.security_helper.clone(),
                 },
                 &self.config.trust_anchor,
             )

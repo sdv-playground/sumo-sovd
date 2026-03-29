@@ -8,9 +8,10 @@ use sovd_client::flash::FlashClient;
 use sovd_client::SovdClient;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
-use tracing::info;
+use tracing::{info, debug};
 
 use crate::error::OrchestratorError;
+use crate::security_helper::{self, SecurityHelperConfig};
 
 /// Configuration for a single ECU update.
 pub struct EcuFlashConfig {
@@ -19,6 +20,7 @@ pub struct EcuFlashConfig {
     pub gateway_id: Option<String>,
     pub security_level: u8,
     pub package: Vec<u8>,
+    pub security_helper: SecurityHelperConfig,
 }
 
 /// What kind of update this manifest represents.
@@ -113,12 +115,12 @@ pub async fn flash_ecu_to_trial(
             .and_then(|s| s.as_str())
             .or_else(|| seed_val.as_str())
             .unwrap_or("");
-        let seed_bytes: Vec<u8> = seed_str
-            .split_whitespace()
-            .filter_map(|s: &str| u8::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .collect();
-        // TODO: use security helper instead of hardcoded XOR
-        let key_hex: String = seed_bytes.iter().map(|b| format!("{:02x}", b ^ 0xFF)).collect();
+
+        // Compute key via security helper
+        let key_hex = security_helper::compute_key(
+            &config.security_helper, seed_str, config.security_level, comp,
+        )
+        .await?;
 
         info!(component = %comp, "sending security key");
         client.set_mode_targeted(
@@ -196,12 +198,31 @@ pub async fn flash_ecu_to_trial(
                     message: format!("reset: {e}"),
                 })?;
 
-            // Wait for activation
+            // Wait for activation — poll until not awaiting_reset
             info!(component = %comp, "waiting for activation");
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            // TODO: poll activation state with timeout
-
-            info!(component = %comp, "ECU in trial mode");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                match flash_client.get_activation_state().await {
+                    Ok(state) => {
+                        let s = state.state.to_lowercase().replace('_', "");
+                        if s != "awaitingreset" {
+                            info!(component = %comp, state = %state.state, "ECU activated");
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // ECU may be rebooting — retry
+                        debug!(component = %comp, "activation poll failed, retrying");
+                    }
+                }
+                if tokio::time::Instant::now() > deadline {
+                    return Err(OrchestratorError::Timeout {
+                        component: comp.clone(),
+                        operation: "activation".into(),
+                    });
+                }
+            }
         }
         UpdateType::Policy => {
             // Policy-only: floor applied on start_flash, nothing more to do
