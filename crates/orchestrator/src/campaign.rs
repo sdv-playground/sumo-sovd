@@ -15,6 +15,7 @@ use sumo_codec::labels::*;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
 use sovd_client::flash::FlashClient;
+use sovd_client::SovdClient;
 use tracing::{info, error, warn};
 
 use crate::ecu::{self, EcuFlashConfig, UpdateType};
@@ -316,7 +317,66 @@ impl CampaignOrchestrator {
         })
     }
 
+    /// Re-establish programming session + security unlock for an ECU.
+    /// Needed after ECU reset (ISO 14229 resets session to default).
+    async fn ensure_access(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+        let client = SovdClient::new(&self.config.server_url)
+            .map_err(|e| OrchestratorError::Sovd {
+                component: component_id.to_string(),
+                message: format!("{e}"),
+            })?;
+
+        let (mode_component, mode_target) = if let Some(gw) = gateway_id {
+            (gw, Some(component_id))
+        } else {
+            (component_id, None)
+        };
+
+        // Session → programming
+        client.set_mode_targeted(
+            mode_component, "session",
+            serde_json::json!({"value": "programming"}),
+            mode_target,
+        ).await.map_err(|e| OrchestratorError::Sovd {
+            component: component_id.to_string(),
+            message: format!("set_session: {e}"),
+        })?;
+
+        // Security unlock
+        let seed_resp = client.set_mode_targeted(
+            mode_component, "security",
+            serde_json::json!({"value": format!("level{}_requestseed", self.config.security_level)}),
+            mode_target,
+        ).await.map_err(|e| OrchestratorError::SecurityFailed {
+            component: component_id.to_string(),
+            message: format!("seed: {e}"),
+        })?;
+
+        if let Some(seed_val) = seed_resp.seed.as_ref() {
+            let seed_str = seed_val
+                .get("Request_Seed")
+                .and_then(|s| s.as_str())
+                .or_else(|| seed_val.as_str())
+                .unwrap_or("");
+            let key_hex = crate::security_helper::compute_key(
+                &self.config.security_helper, seed_str, self.config.security_level, component_id,
+            ).await?;
+            client.set_mode_targeted(
+                mode_component, "security",
+                serde_json::json!({"value": format!("level{}", self.config.security_level), "key": key_hex}),
+                mode_target,
+            ).await.map_err(|e| OrchestratorError::SecurityFailed {
+                component: component_id.to_string(),
+                message: format!("key: {e}"),
+            })?;
+        }
+
+        Ok(())
+    }
+
     async fn commit_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+        // Re-establish access (ECU reset clears session per ISO 14229)
+        self.ensure_access(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client.commit_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),
@@ -325,6 +385,7 @@ impl CampaignOrchestrator {
     }
 
     async fn rollback_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+        self.ensure_access(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client.rollback_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),
