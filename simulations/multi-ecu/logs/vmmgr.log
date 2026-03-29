@@ -1,6 +1,0 @@
-[2m2026-03-29T17:12:32.427010Z[0m [32m INFO[0m [2mvm_sovd[0m[2m:[0m device key loaded: /home/saka/dev/vm-mgr/example/keys/device.key
-[2m2026-03-29T17:12:32.428799Z[0m [32m INFO[0m [2mvm_sovd[0m[2m:[0m vm-sovd listening on 0.0.0.0:4001
-[2m2026-03-29T17:12:32.428814Z[0m [32m INFO[0m [2mvm_sovd[0m[2m:[0m   NV store: /tmp/sumo-sovd-sim-nv.bin
-[2m2026-03-29T17:12:32.428822Z[0m [32m INFO[0m [2mvm_sovd[0m[2m:[0m   trust anchor: /home/saka/dev/vm-mgr/example/keys/signing.pub
-[2m2026-03-29T17:12:32.428828Z[0m [32m INFO[0m [2mvm_sovd[0m[2m:[0m   components: hyp, os1, os2
-[2m2026-03-29T17:12:32.428832Z[0m [32m INFO[0m [2mvm_sovd[0m[2m:[0m   try: curl http://0.0.0.0:4001/vehicle/v1/components
