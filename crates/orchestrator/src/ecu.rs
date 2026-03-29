@@ -71,8 +71,14 @@ pub async fn flash_ecu_to_trial(
     let comp = &config.component_id;
     let gw = config.gateway_id.as_deref();
 
-    // Classify the manifest
-    let (update_type, _manifest) = classify_manifest(&config.package, trust_anchor)?;
+    // Classify the manifest (if it's a SUIT envelope; non-SUIT packages are treated as firmware)
+    let update_type = match classify_manifest(&config.package, trust_anchor) {
+        Ok((ut, _)) => ut,
+        Err(_) => {
+            debug!(component = %comp, "package is not a SUIT envelope — treating as opaque firmware");
+            UpdateType::Firmware
+        }
+    };
     info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU update");
 
     let client = SovdClient::new(&config.server_url)

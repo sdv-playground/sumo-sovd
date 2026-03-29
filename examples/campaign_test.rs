@@ -31,6 +31,9 @@ async fn main() {
         .expect("trust anchor not found — run vm-mgr example/build first");
 
     let output_dir = format!("{vmmgr_dir}/example/output");
+    let sovdd_dir = std::env::var("SOVDD_DIR")
+        .unwrap_or_else(|_| format!("{}/dev/SOVDd", std::env::var("HOME").unwrap()));
+    let sovdd_fw_dir = format!("{sovdd_dir}/simulations/supplier_ota/firmware");
     let gw = Some("vehicle_gateway".to_string());
 
     let helper_url = std::env::var("HELPER_URL")
@@ -134,7 +137,39 @@ async fn main() {
     }
 
     // ================================================================
-    // Test 5: CRL — bump security floor to 2
+    // Test 5: Multi-ECU campaign — flash os1 + engine_ecu together
+    // ================================================================
+    print_test("5: Multi-ECU campaign (os1 + engine_ecu)");
+    let engine_fw_path = format!("{sovdd_fw_dir}/engine_ecu_fw_v2.0.0.bin");
+    if std::path::Path::new(&engine_fw_path).exists() {
+        match orchestrator.flash_all(vec![
+            EcuTarget {
+                component_id: "os1".into(),
+                gateway_id: gw.clone(),
+                package: load_suit(&format!("{output_dir}/os1-v1.3.0.suit")),
+            },
+            EcuTarget {
+                component_id: "engine_ecu".into(),
+                gateway_id: gw.clone(),
+                package: std::fs::read(&engine_fw_path).unwrap(),
+            },
+        ]).await {
+            Ok(phase) => {
+                for ecu in &phase.ecus {
+                    println!("    {} → {:?}", ecu.component_id, ecu.state);
+                }
+                orchestrator.commit_all(&phase.ecus).await.expect("commit multi-ECU");
+                print_pass("os1 + engine_ecu flashed and committed together");
+                passed += 1;
+            }
+            Err(e) => { print_fail(&format!("{e}")); failed += 1; }
+        }
+    } else {
+        println!("  SKIP: {engine_fw_path} not found (run SOVDd gen-firmware.sh first)");
+    }
+
+    // ================================================================
+    // Test 6: CRL — bump security floor to 2 (os1 only)
     // (MUST BE LAST — permanently blocks secver < 2)
     // ================================================================
     print_test("5: CRL security floor bump (secver < 2 blocked)");
