@@ -1,17 +1,23 @@
-/// Campaign orchestrator — processes L1 campaign manifests and
-/// coordinates multi-ECU firmware updates via SOVD.
+/// Campaign orchestrator — sequence-driven multi-ECU updates via SOVD.
 ///
-/// Campaign lifecycle:
-/// 1. Flash all ECUs → all enter trial mode (activated, not committed)
-/// 2. System health check (caller decides — soak period, integration test, etc.)
-/// 3. Commit all or rollback all (atomic at campaign level)
+/// Reads the L1 campaign manifest's SUIT command sequences to determine
+/// the execution flow. The manifest declares what to do; the orchestrator
+/// executes it via SOVD REST calls.
+///
+/// Lifecycle:
+/// 1. Install phase (L1 install sequence): flash all ECUs to staging
+/// 2. All ECUs in trial — system health check (caller decides)
+/// 3. Commit all or rollback all
 
 use async_trait::async_trait;
+use sumo_codec::commands::CommandValue;
+use sumo_codec::labels::*;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
+use sovd_client::flash::FlashClient;
 use tracing::{info, error, warn};
 
-use crate::ecu::{self, EcuFlashConfig, EcuFlashResult, UpdateType};
+use crate::ecu::{self, EcuFlashConfig, UpdateType};
 use crate::error::OrchestratorError;
 
 /// Configuration for a campaign deployment.
@@ -21,24 +27,7 @@ pub struct CampaignConfig {
     pub security_level: u8,
 }
 
-/// State of a campaign deployment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CampaignState {
-    /// Campaign created, not started
-    Pending,
-    /// Flashing ECUs (some may be done, some in progress)
-    Flashing { completed: usize, total: usize },
-    /// All ECUs in trial — waiting for health check / commit decision
-    AwaitingCommit,
-    /// All ECUs committed — campaign complete
-    Committed,
-    /// All ECUs rolled back — campaign aborted
-    RolledBack,
-    /// Campaign failed — partial state, manual intervention needed
-    Failed { message: String },
-}
-
-/// Status of a single ECU within a campaign.
+/// State of individual ECUs within a campaign.
 #[derive(Debug, Clone)]
 pub struct EcuStatus {
     pub component_id: String,
@@ -54,18 +43,25 @@ pub struct EcuStatus {
 pub enum EcuState {
     Pending,
     Flashing,
-    Activated,  // Trial mode — not yet committed
+    Activated,  // Trial mode
     Committed,
     RolledBack,
     Failed,
 }
 
-/// Result of the flash phase (all ECUs in trial).
+/// Result of the flash phase.
 pub struct FlashPhaseResult {
     pub ecus: Vec<EcuStatus>,
 }
 
-/// Orchestrates a multi-ECU firmware campaign.
+/// Target ECU for a campaign.
+pub struct EcuTarget {
+    pub component_id: String,
+    pub gateway_id: Option<String>,
+    pub package: Vec<u8>,
+}
+
+/// Orchestrates multi-ECU firmware campaigns.
 pub struct CampaignOrchestrator {
     config: CampaignConfig,
 }
@@ -75,16 +71,19 @@ impl CampaignOrchestrator {
         Self { config }
     }
 
-    /// Phase 1: Flash all ECUs — puts each in trial mode (activated, not committed).
+    /// Flash all ECU targets — puts each in trial mode (not committed).
     ///
-    /// Returns the list of ECU statuses. All ECUs should be in Activated state.
-    /// If any ECU fails, the already-activated ones are rolled back automatically.
+    /// Reads the update type from each manifest's SUIT command sequences:
+    /// - has install+invoke → Firmware (full flash lifecycle, trial mode)
+    /// - no install/invoke → Policy (immediate apply, no trial)
+    ///
+    /// On failure, automatically rolls back already-activated ECUs.
     pub async fn flash_all(
         &self,
         targets: Vec<EcuTarget>,
     ) -> Result<FlashPhaseResult, OrchestratorError> {
         let total = targets.len();
-        info!(ecus = total, "starting campaign flash phase");
+        info!(ecus = total, "starting campaign — install phase");
 
         let mut statuses: Vec<EcuStatus> = targets
             .iter()
@@ -101,9 +100,10 @@ impl CampaignOrchestrator {
 
         let mut activated: Vec<String> = Vec::new();
 
+        // Install phase: flash each ECU
         for (i, target) in targets.iter().enumerate() {
             let comp = &target.component_id;
-            info!(component = %comp, progress = format!("{}/{}", i + 1, total), "flashing ECU");
+            info!(component = %comp, progress = format!("{}/{}", i + 1, total), "installing ECU");
             statuses[i].state = EcuState::Flashing;
 
             match ecu::flash_ecu_to_trial(
@@ -121,36 +121,35 @@ impl CampaignOrchestrator {
                 Ok(result) => {
                     statuses[i].update_type = result.update_type;
                     statuses[i].state = match result.update_type {
-                        UpdateType::Firmware => EcuState::Activated, // trial
-                        UpdateType::Policy => EcuState::Committed,   // immediate
+                        UpdateType::Firmware => EcuState::Activated,
+                        UpdateType::Policy => EcuState::Committed,
                     };
                     statuses[i].active_version = result.active_version;
                     statuses[i].previous_version = result.previous_version;
                     if result.update_type == UpdateType::Firmware {
                         activated.push(comp.clone());
                     }
-                    info!(component = %comp, update_type = ?result.update_type, "ECU update complete");
+                    info!(component = %comp, update_type = ?result.update_type, "ECU installed");
                 }
                 Err(e) => {
                     statuses[i].state = EcuState::Failed;
                     statuses[i].error = Some(format!("{e}"));
-                    error!(component = %comp, error = %e, "ECU flash failed");
+                    error!(component = %comp, error = %e, "ECU install failed");
 
-                    // Rollback all already-activated ECUs
+                    // Rollback already-activated ECUs
                     if !activated.is_empty() {
-                        warn!(count = activated.len(), "rolling back activated ECUs due to failure");
-                        for rollback_comp in &activated {
-                            let rollback_gw = statuses.iter().find(|s| &s.component_id == rollback_comp).and_then(|s| s.gateway_id.as_deref());
-                        match self.rollback_one(rollback_comp, rollback_gw).await {
+                        warn!(count = activated.len(), "rolling back activated ECUs");
+                        for rc in &activated {
+                            let gw = statuses.iter()
+                                .find(|s| &s.component_id == rc)
+                                .and_then(|s| s.gateway_id.as_deref());
+                            match self.rollback_one(rc, gw).await {
                                 Ok(()) => {
-                                    if let Some(s) = statuses.iter_mut().find(|s| &s.component_id == rollback_comp) {
+                                    if let Some(s) = statuses.iter_mut().find(|s| &s.component_id == rc) {
                                         s.state = EcuState::RolledBack;
                                     }
-                                    info!(component = %rollback_comp, "rolled back");
                                 }
-                                Err(re) => {
-                                    warn!(component = %rollback_comp, error = %re, "rollback failed");
-                                }
+                                Err(re) => warn!(component = %rc, error = %re, "rollback failed"),
                             }
                         }
                     }
@@ -163,25 +162,21 @@ impl CampaignOrchestrator {
             }
         }
 
-        info!(ecus = activated.len(), "all ECUs activated — awaiting commit decision");
+        let fw_count = activated.len();
+        let policy_count = statuses.iter().filter(|e| e.update_type == UpdateType::Policy).count();
+        info!(firmware = fw_count, policy = policy_count, "install phase complete — awaiting commit decision");
+
         Ok(FlashPhaseResult { ecus: statuses })
     }
 
-    /// Phase 2: Commit all ECUs — makes the trial firmware permanent.
-    ///
-    /// Call this after health checks pass during the soak period.
-    pub async fn commit_all(
-        &self,
-        ecus: &[EcuStatus],
-    ) -> Result<(), OrchestratorError> {
+    /// Commit all firmware ECUs — makes trial firmware permanent.
+    pub async fn commit_all(&self, ecus: &[EcuStatus]) -> Result<(), OrchestratorError> {
         let to_commit: Vec<&EcuStatus> = ecus
             .iter()
             .filter(|e| e.state == EcuState::Activated && e.update_type == UpdateType::Firmware)
             .collect();
 
-        let policy_count = ecus.iter().filter(|e| e.update_type == UpdateType::Policy).count();
-
-        info!(firmware = to_commit.len(), policy = policy_count, "committing campaign");
+        info!(ecus = to_commit.len(), "committing campaign");
 
         for ecu in &to_commit {
             info!(component = %ecu.component_id, "committing");
@@ -192,21 +187,16 @@ impl CampaignOrchestrator {
         Ok(())
     }
 
-    /// Phase 2 (alternative): Rollback all ECUs — reverts to previous firmware.
-    ///
-    /// Call this if health checks fail during the soak period.
-    pub async fn rollback_all(
-        &self,
-        ecus: &[EcuStatus],
-    ) -> Result<(), OrchestratorError> {
-        let activated: Vec<&EcuStatus> = ecus
+    /// Rollback all firmware ECUs — reverts to previous firmware.
+    pub async fn rollback_all(&self, ecus: &[EcuStatus]) -> Result<(), OrchestratorError> {
+        let to_rollback: Vec<&EcuStatus> = ecus
             .iter()
-            .filter(|e| e.state == EcuState::Activated)
+            .filter(|e| e.state == EcuState::Activated && e.update_type == UpdateType::Firmware)
             .collect();
 
-        warn!(ecus = activated.len(), "rolling back all ECUs");
+        warn!(ecus = to_rollback.len(), "rolling back campaign");
 
-        for ecu in &activated {
+        for ecu in &to_rollback {
             warn!(component = %ecu.component_id, "rolling back");
             match self.rollback_one(&ecu.component_id, ecu.gateway_id.as_deref()).await {
                 Ok(()) => info!(component = %ecu.component_id, "rolled back"),
@@ -217,10 +207,13 @@ impl CampaignOrchestrator {
         Ok(())
     }
 
-    /// Deploy an L1 campaign manifest — flash all dependencies.
+    /// Deploy an L1 campaign manifest.
     ///
-    /// Returns FlashPhaseResult with all ECUs in trial. Caller must then
-    /// call commit_all() or rollback_all() after health checks.
+    /// Reads the manifest's command sequences to determine which ECUs to update:
+    /// - dependency_resolution → resolve L2 manifests
+    /// - install (process-dependency) → flash each ECU
+    /// - validate → verify (done during install)
+    /// - invoke → deferred (commit_all triggers activation)
     pub async fn deploy_campaign(
         &self,
         campaign_envelope: &[u8],
@@ -237,22 +230,43 @@ impl CampaignOrchestrator {
             return Err(OrchestratorError::Manifest("not a campaign manifest".into()));
         }
 
-        let dep_count = manifest.dependency_count();
-        info!(dependencies = dep_count, "processing campaign manifest");
+        // Read install sequence to determine ECU ordering
+        let envelope = manifest.envelope();
+        let install_seq = envelope.manifest.severable.install.as_ref()
+            .ok_or_else(|| OrchestratorError::Manifest("campaign has no install sequence".into()))?;
 
+        // Extract component indices from install sequence's process-dependency directives
+        let mut dep_indices: Vec<usize> = Vec::new();
+        let mut current_idx = 0usize;
+        for item in &install_seq.items {
+            match (item.label, &item.value) {
+                (SUIT_DIRECTIVE_SET_COMPONENT_INDEX, CommandValue::ComponentIndex(idx)) => {
+                    current_idx = *idx;
+                }
+                (SUIT_DIRECTIVE_PROCESS_DEPENDENCY, _) => {
+                    dep_indices.push(current_idx);
+                }
+                _ => {}
+            }
+        }
+
+        info!(
+            dependencies = dep_indices.len(),
+            has_validate = envelope.manifest.validate.is_some(),
+            has_invoke = envelope.manifest.invoke.is_some(),
+            "campaign: install sequence declares {} ECUs", dep_indices.len()
+        );
+
+        // Resolve each dependency into an EcuTarget
         let mut targets = Vec::new();
-
-        for dep_idx in 0..dep_count {
-            let dep_uri = manifest.dependency_uri(dep_idx).ok_or_else(|| {
+        for dep_idx in &dep_indices {
+            let dep_uri = manifest.dependency_uri(*dep_idx).ok_or_else(|| {
                 OrchestratorError::Manifest(format!("no URI for dependency {dep_idx}"))
             })?;
 
             let l2_envelope = if dep_uri.starts_with('#') {
-                manifest
-                    .integrated_payload(dep_uri)
-                    .ok_or_else(|| {
-                        OrchestratorError::Manifest(format!("payload not found: {dep_uri}"))
-                    })?
+                manifest.integrated_payload(dep_uri)
+                    .ok_or_else(|| OrchestratorError::Manifest(format!("payload not found: {dep_uri}")))?
                     .to_vec()
             } else {
                 resolver.fetch_manifest(dep_uri).await?
@@ -266,9 +280,7 @@ impl CampaignOrchestrator {
                 .component_id(0)
                 .and_then(|segs| segs.last())
                 .and_then(|s| std::str::from_utf8(s).ok())
-                .ok_or_else(|| {
-                    OrchestratorError::Manifest(format!("L2 dep {dep_idx}: no component ID"))
-                })?
+                .ok_or_else(|| OrchestratorError::Manifest(format!("L2 dep {dep_idx}: no component ID")))?
                 .to_string();
 
             let package = resolver
@@ -282,6 +294,10 @@ impl CampaignOrchestrator {
             });
         }
 
+        // Execute: install all ECUs (flash_all handles per-ECU lifecycle)
+        // The L1 validate + invoke sequences are handled implicitly:
+        // - validate: each ECU validates during its flash process
+        // - invoke: deferred to commit_all (ECU reset + activation)
         self.flash_all(targets).await
     }
 
@@ -314,22 +330,10 @@ impl CampaignOrchestrator {
     }
 }
 
-use sovd_client::flash::FlashClient;
-
-/// Target ECU for a campaign deployment.
-pub struct EcuTarget {
-    pub component_id: String,
-    pub gateway_id: Option<String>,
-    pub package: Vec<u8>,
-}
-
 /// Resolves firmware packages for the orchestrator.
 #[async_trait]
 pub trait FirmwareResolver: Send + Sync {
-    /// Fetch an L2 manifest by URI.
     async fn fetch_manifest(&self, uri: &str) -> Result<Vec<u8>, OrchestratorError>;
-
-    /// Resolve a complete package (manifest + firmware) for an ECU.
     async fn resolve_package(
         &self,
         component_id: &str,
