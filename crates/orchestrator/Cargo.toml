@@ -1,0 +1,26 @@
+[package]
+name = "sumo-sovd-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SUIT campaign orchestrator over SOVD — coordinates multi-ECU firmware updates"
+
+[dependencies]
+# SUIT manifest parsing + validation
+sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-codec = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+
+# SOVD REST API client
+sovd-client = { git = "ssh://git@github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-core = { git = "ssh://git@github.com/sdv-playground/SOVDd.git", branch = "main" }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# Utilities
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+thiserror = "1"
+async-trait = "0.1"
