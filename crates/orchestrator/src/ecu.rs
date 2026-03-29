@@ -49,7 +49,7 @@ fn classify_manifest(
         .validate_envelope(envelope, &crypto, 0)
         .map_err(|e| OrchestratorError::Manifest(format!("{e:?}")))?;
 
-    let update_type = if manifest.has_firmware() {
+    let update_type = if manifest.has_install() || manifest.has_invoke() {
         UpdateType::Firmware
     } else {
         UpdateType::Policy
