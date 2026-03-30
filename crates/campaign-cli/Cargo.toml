@@ -1,0 +1,19 @@
+[package]
+name = "sumo-campaign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI tool for deploying SUIT firmware campaigns via SOVD"
+
+[[bin]]
+name = "sumo-campaign"
+path = "src/main.rs"
+
+[dependencies]
+sumo-sovd-orchestrator = { path = "../orchestrator" }
+sumo-onboard = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-crypto = { git = "ssh://git@github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

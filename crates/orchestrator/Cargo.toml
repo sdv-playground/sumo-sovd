@@ -28,6 +28,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[[example]]
-name = "campaign_test"
-path = "../../examples/campaign_test.rs"
+[dev-dependencies]
+sovd-api = { git = "ssh://git@github.com/sdv-playground/SOVDd.git", branch = "main" }
+axum = "0.8"
+parking_lot = "0.12"

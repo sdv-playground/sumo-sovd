@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/orchestrator"]
+members = ["crates/orchestrator", "crates/campaign-cli"]
 
 [workspace.package]
 version = "0.1.0"

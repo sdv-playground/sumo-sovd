@@ -58,6 +58,7 @@ pub struct FlashPhaseResult {
 }
 
 /// Target ECU for a campaign.
+#[derive(Clone)]
 pub struct EcuTarget {
     pub component_id: String,
     pub gateway_id: Option<String>,
