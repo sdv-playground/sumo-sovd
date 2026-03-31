@@ -1,7 +1,8 @@
 /// Per-ECU update — inspects SUIT manifest command sequences to determine
 /// the update flow: firmware flash (full lifecycle) vs policy-only (immediate).
 ///
-/// Firmware: session → security → upload → flash → finalize → reset → trial
+/// Firmware: session → security → upload → flash → finalize → AwaitingReset
+///           (reset is a campaign-level decision, not per-ECU)
 /// Policy:   session → security → upload → apply (immediate, no trial)
 
 use sovd_client::flash::FlashClient;
@@ -32,7 +33,7 @@ pub enum UpdateType {
     Policy,
 }
 
-/// Result of updating one ECU.
+/// Result of staging one ECU (before reset).
 pub struct EcuFlashResult {
     pub component_id: String,
     pub update_type: UpdateType,
@@ -60,11 +61,13 @@ fn classify_manifest(
     Ok((update_type, manifest))
 }
 
-/// Update one ECU — flow determined by manifest command sequences.
+/// Flash one ECU to staging — ends at AwaitingReset for firmware updates.
 ///
-/// For Firmware: puts ECU in trial mode (NOT committed).
-/// For Policy: applied immediately (no trial).
-pub async fn flash_ecu_to_trial(
+/// Does NOT reset the ECU. The orchestrator decides when to reset
+/// (e.g. after all ECUs are staged, or waiting for external power cycle).
+///
+/// For Policy updates: applied immediately (no staging/reset needed).
+pub async fn flash_ecu_to_staging(
     config: EcuFlashConfig,
     trust_anchor: &[u8],
 ) -> Result<EcuFlashResult, OrchestratorError> {
@@ -183,7 +186,7 @@ pub async fn flash_ecu_to_trial(
 
     match update_type {
         UpdateType::Firmware => {
-            // Full firmware lifecycle: poll → finalize → reset → wait for trial
+            // Flash → finalize → stop here (AwaitingReset)
             flash_client.poll_flash_complete_simple(&transfer.transfer_id).await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.clone(),
@@ -197,41 +200,10 @@ pub async fn flash_ecu_to_trial(
                     message: format!("finalize: {e}"),
                 })?;
 
-            info!(component = %comp, "resetting ECU");
-            flash_client.ecu_reset().await
-                .map_err(|e| OrchestratorError::FlashFailed {
-                    component: comp.clone(),
-                    message: format!("reset: {e}"),
-                })?;
-
-            // Wait for activation — poll until not awaiting_reset
-            info!(component = %comp, "waiting for activation");
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                match flash_client.get_activation_state().await {
-                    Ok(state) => {
-                        let s = state.state.to_lowercase().replace('_', "");
-                        if s != "awaitingreset" {
-                            info!(component = %comp, state = %state.state, "ECU activated");
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        // ECU may be rebooting — retry
-                        debug!(component = %comp, "activation poll failed, retrying");
-                    }
-                }
-                if tokio::time::Instant::now() > deadline {
-                    return Err(OrchestratorError::Timeout {
-                        component: comp.clone(),
-                        operation: "activation".into(),
-                    });
-                }
-            }
+            info!(component = %comp, "staged — awaiting reset");
         }
         UpdateType::Policy => {
-            // Policy-only: floor applied on start_flash, nothing more to do
+            // Policy-only: applied on start_flash, nothing more to do
             info!(component = %comp, "policy applied (no flash/reset needed)");
         }
     }
@@ -242,4 +214,54 @@ pub async fn flash_ecu_to_trial(
         active_version: None,
         previous_version: None,
     })
+}
+
+/// Reset one ECU and wait for it to reach trial (Activated) state.
+pub async fn reset_and_activate(
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(), OrchestratorError> {
+    let flash_client = if let Some(gw) = gateway_id {
+        FlashClient::for_sovd_sub_entity(server_url, gw, component_id)
+    } else {
+        FlashClient::for_sovd(server_url, component_id)
+    }.map_err(|e| OrchestratorError::Sovd {
+        component: component_id.to_string(),
+        message: format!("flash client: {e}"),
+    })?;
+
+    info!(component = %component_id, "resetting ECU");
+    flash_client.ecu_reset().await
+        .map_err(|e| OrchestratorError::FlashFailed {
+            component: component_id.to_string(),
+            message: format!("reset: {e}"),
+        })?;
+
+    // Wait for activation — poll until not awaiting_reset
+    info!(component = %component_id, "waiting for activation");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match flash_client.get_activation_state().await {
+            Ok(state) => {
+                let s = state.state.to_lowercase().replace('_', "");
+                if s != "awaitingreset" {
+                    info!(component = %component_id, state = %state.state, "ECU activated");
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                // ECU may be rebooting — retry
+                debug!(component = %component_id, "activation poll failed, retrying");
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(OrchestratorError::Timeout {
+                component: component_id.to_string(),
+                operation: "activation".into(),
+            });
+        }
+    }
 }

@@ -10,20 +10,22 @@
 //! Fleet Backend → [L1 campaign manifest + L2 image manifests + firmware]
 //!      ↓
 //! CampaignOrchestrator
-//!      ↓ for each dependency (ECU):
-//!      ↓   1. Switch to programming session
-//!      ↓   2. Unlock security (via security helper)
-//!      ↓   3. Upload manifest + firmware
-//!      ↓   4. Verify package
-//!      ↓   5. Start flash transfer
-//!      ↓   6. Monitor progress
-//!      ↓   7. Finalize transfer
-//!      ↓   8. Reset ECU
-//!      ↓   9. Wait for activation
-//!      ↓  10. Commit or rollback
+//!      ↓
+//!  Stage phase (per-ECU):        Reset phase (campaign-level):
+//!   1. Programming session        8. Reset all staged ECUs
+//!   2. Security unlock             9. Wait for activation (trial)
+//!   3. Upload package
+//!   4. Verify                    Commit phase (campaign-level):
+//!   5. Start flash transfer       10. Commit all or rollback all
+//!   6. Monitor progress
+//!   7. Finalize → AwaitingReset
 //!      ↓
 //! SOVD Servers (vm-mgr, SOVDd, etc.)
 //! ```
+//!
+//! The reset is a campaign-level decision, not per-ECU. The orchestrator
+//! stages all ECUs first, then resets them together when ready. This
+//! supports vehicles that need coordinated reboot or external power cycle.
 //!
 //! # Key Concepts
 //!

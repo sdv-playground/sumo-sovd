@@ -5,9 +5,10 @@
 /// executes it via SOVD REST calls.
 ///
 /// Lifecycle:
-/// 1. Install phase (L1 install sequence): flash all ECUs to staging
-/// 2. All ECUs in trial — system health check (caller decides)
-/// 3. Commit all or rollback all
+/// 1. Stage phase: flash all ECUs to staging (AwaitingReset)
+/// 2. Reset phase: reset all ECUs (orchestrator decides when)
+/// 3. All ECUs in trial — system health check (caller decides)
+/// 4. Commit all or rollback all
 
 use async_trait::async_trait;
 use sumo_codec::commands::CommandValue;
@@ -46,13 +47,19 @@ pub struct EcuStatus {
 pub enum EcuState {
     Pending,
     Flashing,
-    Activated,  // Trial mode
+    Staged,     // AwaitingReset — flash done, waiting for reset
+    Activated,  // Trial mode — reset done, running new firmware
     Committed,
     RolledBack,
     Failed,
 }
 
-/// Result of the flash phase.
+/// Result of the stage phase (all ECUs flashed, awaiting reset).
+pub struct StagePhaseResult {
+    pub ecus: Vec<EcuStatus>,
+}
+
+/// Result of the full flash phase (stage + reset + activate).
 pub struct FlashPhaseResult {
     pub ecus: Vec<EcuStatus>,
 }
@@ -75,19 +82,16 @@ impl CampaignOrchestrator {
         Self { config }
     }
 
-    /// Flash all ECU targets — puts each in trial mode (not committed).
+    /// Stage all ECU targets — flash each to staging (AwaitingReset).
     ///
-    /// Reads the update type from each manifest's SUIT command sequences:
-    /// - has install+invoke → Firmware (full flash lifecycle, trial mode)
-    /// - no install/invoke → Policy (immediate apply, no trial)
-    ///
-    /// On failure, automatically rolls back already-activated ECUs.
-    pub async fn flash_all(
+    /// Does NOT reset ECUs. Call `reset_all` when ready.
+    /// On failure, automatically rolls back already-staged ECUs.
+    pub async fn stage_all(
         &self,
         targets: Vec<EcuTarget>,
-    ) -> Result<FlashPhaseResult, OrchestratorError> {
+    ) -> Result<StagePhaseResult, OrchestratorError> {
         let total = targets.len();
-        info!(ecus = total, "starting campaign — install phase");
+        info!(ecus = total, "starting campaign — stage phase");
 
         let mut statuses: Vec<EcuStatus> = targets
             .iter()
@@ -102,15 +106,14 @@ impl CampaignOrchestrator {
             })
             .collect();
 
-        let mut activated: Vec<String> = Vec::new();
+        let mut staged: Vec<String> = Vec::new();
 
-        // Install phase: flash each ECU
         for (i, target) in targets.iter().enumerate() {
             let comp = &target.component_id;
-            info!(component = %comp, progress = format!("{}/{}", i + 1, total), "installing ECU");
+            info!(component = %comp, progress = format!("{}/{}", i + 1, total), "staging ECU");
             statuses[i].state = EcuState::Flashing;
 
-            match ecu::flash_ecu_to_trial(
+            match ecu::flash_ecu_to_staging(
                 EcuFlashConfig {
                     component_id: comp.clone(),
                     server_url: self.config.server_url.clone(),
@@ -126,25 +129,25 @@ impl CampaignOrchestrator {
                 Ok(result) => {
                     statuses[i].update_type = result.update_type;
                     statuses[i].state = match result.update_type {
-                        UpdateType::Firmware => EcuState::Activated,
+                        UpdateType::Firmware => EcuState::Staged,
                         UpdateType::Policy => EcuState::Committed,
                     };
                     statuses[i].active_version = result.active_version;
                     statuses[i].previous_version = result.previous_version;
                     if result.update_type == UpdateType::Firmware {
-                        activated.push(comp.clone());
+                        staged.push(comp.clone());
                     }
-                    info!(component = %comp, update_type = ?result.update_type, "ECU installed");
+                    info!(component = %comp, update_type = ?result.update_type, "ECU staged");
                 }
                 Err(e) => {
                     statuses[i].state = EcuState::Failed;
                     statuses[i].error = Some(format!("{e}"));
-                    error!(component = %comp, error = %e, "ECU install failed");
+                    error!(component = %comp, error = %e, "ECU staging failed");
 
-                    // Rollback already-activated ECUs
-                    if !activated.is_empty() {
-                        warn!(count = activated.len(), "rolling back activated ECUs");
-                        for rc in &activated {
+                    // Rollback already-staged ECUs
+                    if !staged.is_empty() {
+                        warn!(count = staged.len(), "rolling back staged ECUs");
+                        for rc in &staged {
                             let gw = statuses.iter()
                                 .find(|s| &s.component_id == rc)
                                 .and_then(|s| s.gateway_id.as_deref());
@@ -167,11 +170,57 @@ impl CampaignOrchestrator {
             }
         }
 
-        let fw_count = activated.len();
+        let fw_count = staged.len();
         let policy_count = statuses.iter().filter(|e| e.update_type == UpdateType::Policy).count();
-        info!(firmware = fw_count, policy = policy_count, "install phase complete — awaiting commit decision");
+        info!(firmware = fw_count, policy = policy_count, "stage phase complete — all ECUs awaiting reset");
 
-        Ok(FlashPhaseResult { ecus: statuses })
+        Ok(StagePhaseResult { ecus: statuses })
+    }
+
+    /// Reset all staged ECUs and wait for activation (trial mode).
+    pub async fn reset_all(&self, ecus: &mut [EcuStatus]) -> Result<(), OrchestratorError> {
+        let to_reset: Vec<(String, Option<String>)> = ecus
+            .iter()
+            .filter(|e| e.state == EcuState::Staged)
+            .map(|e| (e.component_id.clone(), e.gateway_id.clone()))
+            .collect();
+
+        if to_reset.is_empty() {
+            info!("no ECUs need reset");
+            return Ok(());
+        }
+
+        info!(ecus = to_reset.len(), "resetting all staged ECUs");
+
+        for (comp, gw) in &to_reset {
+            ecu::reset_and_activate(
+                &self.config.server_url,
+                comp,
+                gw.as_deref(),
+                60,
+            ).await?;
+
+            if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp) {
+                s.state = EcuState::Activated;
+            }
+        }
+
+        info!("all ECUs activated (trial mode)");
+        Ok(())
+    }
+
+    /// Flash all ECU targets — stage + reset + activate.
+    ///
+    /// Convenience method that runs the full lifecycle. Use `stage_all` +
+    /// `reset_all` separately if you need to pause between phases.
+    pub async fn flash_all(
+        &self,
+        targets: Vec<EcuTarget>,
+    ) -> Result<FlashPhaseResult, OrchestratorError> {
+        let stage_result = self.stage_all(targets).await?;
+        let mut ecus = stage_result.ecus;
+        self.reset_all(&mut ecus).await?;
+        Ok(FlashPhaseResult { ecus })
     }
 
     /// Commit all firmware ECUs — makes trial firmware permanent.
@@ -299,10 +348,7 @@ impl CampaignOrchestrator {
             });
         }
 
-        // Execute: install all ECUs (flash_all handles per-ECU lifecycle)
-        // The L1 validate + invoke sequences are handled implicitly:
-        // - validate: each ECU validates during its flash process
-        // - invoke: deferred to commit_all (ECU reset + activation)
+        // Execute: stage all ECUs, then reset all, then activate
         self.flash_all(targets).await
     }
 
