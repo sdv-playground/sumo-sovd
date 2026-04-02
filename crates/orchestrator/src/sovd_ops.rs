@@ -16,6 +16,7 @@ use sumo_onboard::platform::PlatformOps;
 use tracing::info;
 
 /// Maps component IDs to SOVD flash clients + staged payloads.
+#[allow(dead_code)]
 pub struct SovdPlatformOps {
     server_url: String,
     gateway_id: Option<String>,
@@ -48,6 +49,7 @@ impl SovdPlatformOps {
         self.written.borrow().get(component_id).cloned()
     }
 
+    #[allow(dead_code)]
     fn get_or_create_flash_client(&self, component_id: &str) -> Result<FlashClient, Sum2Error> {
         let mut clients = self.flash_clients.borrow_mut();
         if let Some(client) = clients.get(component_id) {
