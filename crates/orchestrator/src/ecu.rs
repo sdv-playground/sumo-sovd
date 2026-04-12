@@ -166,33 +166,24 @@ pub async fn flash_ecu_to_staging(
 
     // 5. Upload manifest (tiny, first in sequence)
     info!(component = %comp, size = config.manifest.len(), "uploading manifest");
-    let manifest_upload = flash_client.upload_file(&config.manifest).await
+    // 5. Upload manifest (processed synchronously — no poll needed)
+    flash_client.upload_file(&config.manifest).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("manifest upload: {e}"),
         })?;
-    flash_client.poll_upload_complete(&manifest_upload.upload_id).await
-        .map_err(|e| OrchestratorError::FlashFailed {
-            component: comp.clone(),
-            message: format!("manifest upload poll: {e}"),
-        })?;
 
-    // 6. Upload each payload in component order (streamed to bank)
+    // 6. Upload each payload in component order (each streamed to bank synchronously)
     for (uri, path) in &config.payloads {
         let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("read payload {}: {e}", path.display()),
         })?;
         info!(component = %comp, uri = %uri, size = data.len(), "uploading payload");
-        let upload = flash_client.upload_file(&data).await
+        flash_client.upload_file(&data).await
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: comp.clone(),
                 message: format!("payload upload ({uri}): {e}"),
-            })?;
-        flash_client.poll_upload_complete(&upload.upload_id).await
-            .map_err(|e| OrchestratorError::FlashFailed {
-                component: comp.clone(),
-                message: format!("payload upload poll ({uri}): {e}"),
             })?;
     }
 
