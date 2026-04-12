@@ -155,22 +155,28 @@ pub async fn flash_ecu_to_staging(
         message: format!("flash client: {e}"),
     })?;
 
-    // 4. Upload manifest (tiny)
+    // 4. Start flash session
+    info!(component = %comp, "starting flash session");
+    let transfer = flash_client.start_flash().await
+        .map_err(|e| OrchestratorError::FlashFailed {
+            component: comp.clone(),
+            message: format!("start flash: {e}"),
+        })?;
+
+    // 5. Upload manifest (tiny, first in sequence)
     info!(component = %comp, size = config.manifest.len(), "uploading manifest");
     let manifest_upload = flash_client.upload_file(&config.manifest).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("manifest upload: {e}"),
         })?;
-    let manifest_id = manifest_upload.upload_id;
-    flash_client.poll_upload_complete(&manifest_id).await
+    flash_client.poll_upload_complete(&manifest_upload.upload_id).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("manifest upload poll: {e}"),
         })?;
 
-    // 5. Upload each payload (streamed)
-    let mut payload_ids = std::collections::HashMap::new();
+    // 6. Upload each payload in component order (streamed to bank)
     for (uri, path) in &config.payloads {
         let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
@@ -182,22 +188,12 @@ pub async fn flash_ecu_to_staging(
                 component: comp.clone(),
                 message: format!("payload upload ({uri}): {e}"),
             })?;
-        let payload_id = upload.upload_id;
-        flash_client.poll_upload_complete(&payload_id).await
+        flash_client.poll_upload_complete(&upload.upload_id).await
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: comp.clone(),
                 message: format!("payload upload poll ({uri}): {e}"),
             })?;
-        payload_ids.insert(uri.clone(), payload_id);
     }
-
-    // 6. Start flash (manifest + payloads)
-    info!(component = %comp, payloads = payload_ids.len(), "starting flash transfer");
-    let transfer = flash_client.start_flash(&manifest_id, &payload_ids).await
-        .map_err(|e| OrchestratorError::FlashFailed {
-            component: comp.clone(),
-            message: format!("start flash: {e}"),
-        })?;
 
     match update_type {
         UpdateType::Firmware => {
