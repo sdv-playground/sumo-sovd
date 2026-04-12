@@ -76,13 +76,17 @@ enum Command {
         rollback: bool,
     },
 
-    /// Flash a single ECU with an L2 image manifest
+    /// Flash a single ECU with manifest + payload(s)
     Flash {
         /// Target ECU component ID
         component_id: String,
 
-        /// Path to L2 SUIT envelope
+        /// Path to SUIT manifest (small, no integrated payloads)
         manifest: String,
+
+        /// Payload files: "URI=path" (repeatable, e.g., "#kernel"=kernel.bin)
+        #[arg(long, short)]
+        payload: Vec<String>,
 
         /// Don't commit after flash
         #[arg(long)]
@@ -154,7 +158,8 @@ fn parse_campaign(
         targets.push(EcuTarget {
             component_id,
             gateway_id: gateway_id.clone(),
-            package,
+            manifest: package, // deploy path: integrated envelope
+            payloads: std::collections::HashMap::new(),
         });
     }
 
@@ -196,8 +201,8 @@ async fn main() {
             run_deploy(&orchestrator, &manifest, cli.trust_anchor.as_deref(),
                        cli.gateway, &sovd_ecus, no_commit, rollback).await
         }
-        Command::Flash { component_id, manifest, no_commit, rollback } => {
-            run_flash(&orchestrator, &component_id, &manifest,
+        Command::Flash { component_id, manifest, payload, no_commit, rollback } => {
+            run_flash(&orchestrator, &component_id, &manifest, &payload,
                       cli.gateway, no_commit, rollback).await
         }
     };
@@ -230,7 +235,7 @@ async fn run_deploy(
 
     info!("campaign has {} target(s):", targets.len());
     for t in &targets {
-        info!("  {} ({}B package)", t.component_id, t.package.len());
+        info!("  {} ({}B manifest, {} payloads)", t.component_id, t.manifest.len(), t.payloads.len());
     }
 
     info!("flashing all ECUs...");
@@ -265,19 +270,32 @@ async fn run_flash(
     orchestrator: &CampaignOrchestrator,
     component_id: &str,
     manifest_path: &str,
+    payload_args: &[String],
     gateway: Option<String>,
     no_commit: bool,
     rollback: bool,
 ) -> Result<(), String> {
-    let package = std::fs::read(manifest_path)
+    let manifest = std::fs::read(manifest_path)
         .map_err(|e| format!("read {manifest_path}: {e}"))?;
 
-    info!("flashing {component_id} with {manifest_path} ({}B)", package.len());
+    // Parse payload args: "URI=path" pairs
+    let mut payloads = std::collections::HashMap::new();
+    for arg in payload_args {
+        let (uri, path) = arg.split_once('=')
+            .ok_or_else(|| format!("invalid --payload: {arg} (expected URI=path)"))?;
+        payloads.insert(uri.to_string(), std::path::PathBuf::from(path));
+    }
+
+    info!(
+        "flashing {component_id} with {manifest_path} ({}B manifest, {} payloads)",
+        manifest.len(), payloads.len()
+    );
 
     let phase = orchestrator.flash_all(vec![EcuTarget {
         component_id: component_id.into(),
         gateway_id: gateway,
-        package,
+        manifest,
+        payloads,
     }]).await.map_err(|e| format!("flash failed: {e}"))?;
 
     for ecu in &phase.ecus {

@@ -20,7 +20,10 @@ pub struct EcuFlashConfig {
     pub server_url: String,
     pub gateway_id: Option<String>,
     pub security_level: u8,
-    pub package: Vec<u8>,
+    /// SUIT manifest bytes (small, ~1KB, no integrated payloads).
+    pub manifest: Vec<u8>,
+    /// Payload files: URI → file path (e.g., "#kernel" → "/path/to/kernel-payload.bin").
+    pub payloads: std::collections::HashMap<String, std::path::PathBuf>,
     pub security_helper: SecurityHelperConfig,
 }
 
@@ -74,8 +77,8 @@ pub async fn flash_ecu_to_staging(
     let comp = &config.component_id;
     let gw = config.gateway_id.as_deref();
 
-    // Classify the manifest (if it's a SUIT envelope; non-SUIT packages are treated as firmware)
-    let update_type = match classify_manifest(&config.package, trust_anchor) {
+    // Classify the manifest
+    let update_type = match classify_manifest(&config.manifest, trust_anchor) {
         Ok((ut, _)) => ut,
         Err(_) => {
             debug!(component = %comp, "package is not a SUIT envelope — treating as opaque firmware");
@@ -152,33 +155,45 @@ pub async fn flash_ecu_to_staging(
         message: format!("flash client: {e}"),
     })?;
 
-    // 4. Upload
-    info!(component = %comp, size = config.package.len(), "uploading package");
-    let upload = flash_client.upload_file(&config.package).await
+    // 4. Upload manifest (tiny)
+    info!(component = %comp, size = config.manifest.len(), "uploading manifest");
+    let manifest_upload = flash_client.upload_file(&config.manifest).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
-            message: format!("upload: {e}"),
+            message: format!("manifest upload: {e}"),
         })?;
-    let file_id = upload.upload_id;
-
-    let status = flash_client.poll_upload_complete(&file_id).await
+    let manifest_id = manifest_upload.upload_id;
+    flash_client.poll_upload_complete(&manifest_id).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
-            message: format!("upload poll: {e}"),
+            message: format!("manifest upload poll: {e}"),
         })?;
-    let file_id = status.file_id.unwrap_or(file_id);
 
-    // 5. Verify
-    info!(component = %comp, "verifying package");
-    flash_client.verify_file(&file_id).await
-        .map_err(|e| OrchestratorError::FlashFailed {
+    // 5. Upload each payload (streamed)
+    let mut payload_ids = std::collections::HashMap::new();
+    for (uri, path) in &config.payloads {
+        let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
-            message: format!("verify: {e}"),
+            message: format!("read payload {}: {e}", path.display()),
         })?;
+        info!(component = %comp, uri = %uri, size = data.len(), "uploading payload");
+        let upload = flash_client.upload_file(&data).await
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: comp.clone(),
+                message: format!("payload upload ({uri}): {e}"),
+            })?;
+        let payload_id = upload.upload_id;
+        flash_client.poll_upload_complete(&payload_id).await
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: comp.clone(),
+                message: format!("payload upload poll ({uri}): {e}"),
+            })?;
+        payload_ids.insert(uri.clone(), payload_id);
+    }
 
-    // 6. Start flash
-    info!(component = %comp, "starting flash transfer");
-    let transfer = flash_client.start_flash(&file_id).await
+    // 6. Start flash (manifest + payloads)
+    info!(component = %comp, payloads = payload_ids.len(), "starting flash transfer");
+    let transfer = flash_client.start_flash(&manifest_id, &payload_ids).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("start flash: {e}"),

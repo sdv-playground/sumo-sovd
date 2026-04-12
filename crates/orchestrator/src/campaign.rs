@@ -69,7 +69,10 @@ pub struct FlashPhaseResult {
 pub struct EcuTarget {
     pub component_id: String,
     pub gateway_id: Option<String>,
-    pub package: Vec<u8>,
+    /// SUIT manifest bytes (small, no integrated payloads).
+    pub manifest: Vec<u8>,
+    /// Payload files: URI → path.
+    pub payloads: std::collections::HashMap<String, std::path::PathBuf>,
 }
 
 /// Orchestrates multi-ECU firmware campaigns.
@@ -119,7 +122,8 @@ impl CampaignOrchestrator {
                     server_url: self.config.server_url.clone(),
                     gateway_id: target.gateway_id.clone(),
                     security_level: self.config.security_level,
-                    package: target.package.clone(),
+                    manifest: target.manifest.clone(),
+                    payloads: target.payloads.clone(),
                     security_helper: self.config.security_helper.clone(),
                 },
                 &self.config.trust_anchor,
@@ -344,7 +348,8 @@ impl CampaignOrchestrator {
             targets.push(EcuTarget {
                 component_id,
                 gateway_id: None,
-                package,
+                manifest: package, // L1 deploy: integrated envelope as manifest
+                payloads: std::collections::HashMap::new(),
             });
         }
 
