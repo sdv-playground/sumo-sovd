@@ -71,8 +71,8 @@ pub struct EcuTarget {
     pub gateway_id: Option<String>,
     /// SUIT manifest bytes (small, no integrated payloads).
     pub manifest: Vec<u8>,
-    /// Payload files: URI → path.
-    pub payloads: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Payload files in component order: [(URI, path), ...].
+    pub payloads: Vec<(String, std::path::PathBuf)>,
 }
 
 /// Orchestrates multi-ECU firmware campaigns.
@@ -349,7 +349,7 @@ impl CampaignOrchestrator {
                 component_id,
                 gateway_id: None,
                 manifest: package, // L1 deploy: integrated envelope as manifest
-                payloads: std::collections::HashMap::new(),
+                payloads: Vec::new(),
             });
         }
 

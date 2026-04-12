@@ -159,7 +159,7 @@ fn parse_campaign(
             component_id,
             gateway_id: gateway_id.clone(),
             manifest: package, // deploy path: integrated envelope
-            payloads: std::collections::HashMap::new(),
+            payloads: Vec::new(),
         });
     }
 
@@ -278,12 +278,12 @@ async fn run_flash(
     let manifest = std::fs::read(manifest_path)
         .map_err(|e| format!("read {manifest_path}: {e}"))?;
 
-    // Parse payload args: "URI=path" pairs
-    let mut payloads = std::collections::HashMap::new();
+    // Parse payload args: "URI=path" pairs (order matters — must match manifest components)
+    let mut payloads = Vec::new();
     for arg in payload_args {
         let (uri, path) = arg.split_once('=')
             .ok_or_else(|| format!("invalid --payload: {arg} (expected URI=path)"))?;
-        payloads.insert(uri.to_string(), std::path::PathBuf::from(path));
+        payloads.push((uri.to_string(), std::path::PathBuf::from(path)));
     }
 
     info!(

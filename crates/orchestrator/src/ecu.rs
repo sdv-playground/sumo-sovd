@@ -22,8 +22,9 @@ pub struct EcuFlashConfig {
     pub security_level: u8,
     /// SUIT manifest bytes (small, ~1KB, no integrated payloads).
     pub manifest: Vec<u8>,
-    /// Payload files: URI → file path (e.g., "#kernel" → "/path/to/kernel-payload.bin").
-    pub payloads: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Payload files in component order: [(URI, path), ...].
+    /// Order must match the manifest's component sequence.
+    pub payloads: Vec<(String, std::path::PathBuf)>,
     pub security_helper: SecurityHelperConfig,
 }
 
