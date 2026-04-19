@@ -1,7 +1,7 @@
 /// Per-ECU update — inspects SUIT manifest command sequences to determine
 /// the update flow: firmware flash (full lifecycle) vs policy-only (immediate).
 ///
-/// Firmware: session → security → upload → flash → finalize → AwaitingReset
+/// Firmware: session → security → upload → flash → finalize → AwaitingReboot
 ///           (reset is a campaign-level decision, not per-ECU)
 /// Policy:   session → security → upload → apply (immediate, no trial)
 
@@ -65,7 +65,7 @@ fn classify_manifest(
     Ok((update_type, manifest))
 }
 
-/// Flash one ECU to staging — ends at AwaitingReset for firmware updates.
+/// Flash one ECU to staging — ends at AwaitingReboot for firmware updates.
 ///
 /// Does NOT reset the ECU. The orchestrator decides when to reset
 /// (e.g. after all ECUs are staged, or waiting for external power cycle).
@@ -189,7 +189,7 @@ pub async fn flash_ecu_to_staging(
 
     match update_type {
         UpdateType::Firmware => {
-            // Flash → finalize → stop here (AwaitingReset)
+            // Flash → finalize → stop here (AwaitingReboot)
             flash_client.poll_flash_complete_simple(&transfer.transfer_id).await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.clone(),
@@ -242,7 +242,7 @@ pub async fn reset_and_activate(
             message: format!("reset: {e}"),
         })?;
 
-    // Wait for activation — poll until not awaiting_reset
+    // Wait for activation — poll until not awaiting_reboot
     info!(component = %component_id, "waiting for activation");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {

@@ -5,7 +5,7 @@
 /// executes it via SOVD REST calls.
 ///
 /// Lifecycle:
-/// 1. Stage phase: flash all ECUs to staging (AwaitingReset)
+/// 1. Stage phase: flash all ECUs to staging (AwaitingReboot)
 /// 2. Reset phase: reset all ECUs (orchestrator decides when)
 /// 3. All ECUs in trial — system health check (caller decides)
 /// 4. Commit all or rollback all
@@ -47,7 +47,7 @@ pub struct EcuStatus {
 pub enum EcuState {
     Pending,
     Flashing,
-    Staged,     // AwaitingReset — flash done, waiting for reset
+    Staged,     // AwaitingReboot — flash done, waiting for reset
     Activated,  // Trial mode — reset done, running new firmware
     Committed,
     RolledBack,
@@ -85,7 +85,7 @@ impl CampaignOrchestrator {
         Self { config }
     }
 
-    /// Stage all ECU targets — flash each to staging (AwaitingReset).
+    /// Stage all ECU targets — flash each to staging (AwaitingReboot).
     ///
     /// Does NOT reset ECUs. Call `reset_all` when ready.
     /// On failure, automatically rolls back already-staged ECUs.

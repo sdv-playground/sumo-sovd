@@ -7,3 +7,9 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
+# Temporary: pick up the local SOVDd checkout while iterating on the
+# FlashState rename (AwaitingExit→AwaitingActivation, AwaitingReset→
+# AwaitingReboot). Remove once SOVDd is committed + pushed.
+[patch."ssh://git@github.com/sdv-playground/SOVDd.git"]
+sovd-client = { path = "../SOVDd/crates/sovd-client" }
+

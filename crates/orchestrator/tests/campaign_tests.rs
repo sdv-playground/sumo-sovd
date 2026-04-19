@@ -194,7 +194,7 @@ impl DiagnosticBackend for TestBackend {
             return Err(BackendError::Internal(msg.clone()));
         }
         let tid = format!("xfer-{}", self.transfer_counter.fetch_add(1, Ordering::SeqCst));
-        *self.flash_state.write() = FlashState::AwaitingExit;
+        *self.flash_state.write() = FlashState::AwaitingActivation;
         Ok(tid)
     }
 
@@ -220,7 +220,7 @@ impl DiagnosticBackend for TestBackend {
     }
 
     async fn finalize_flash(&self) -> BackendResult<()> {
-        *self.flash_state.write() = FlashState::AwaitingReset;
+        *self.flash_state.write() = FlashState::AwaitingReboot;
         Ok(())
     }
 

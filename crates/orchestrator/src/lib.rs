@@ -18,7 +18,7 @@
 //!   4. Verify                    Commit phase (campaign-level):
 //!   5. Start flash transfer       10. Commit all or rollback all
 //!   6. Monitor progress
-//!   7. Finalize → AwaitingReset
+//!   7. Finalize → AwaitingReboot
 //!      ↓
 //! SOVD Servers (vm-mgr, SOVDd, etc.)
 //! ```
