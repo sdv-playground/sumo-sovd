@@ -189,7 +189,7 @@ impl DiagnosticBackend for TestBackend {
         }
     }
 
-    async fn start_flash(&self, _package_id: &str) -> BackendResult<String> {
+    async fn start_flash(&self) -> BackendResult<String> {
         if let Some(msg) = self.fail_flash.read().as_ref() {
             return Err(BackendError::Internal(msg.clone()));
         }
@@ -372,7 +372,8 @@ async fn test_flash_and_commit() {
     let result = fix.orchestrator.flash_all(vec![EcuTarget {
         component_id: "ecu1".into(),
         gateway_id: None,
-        package: vec![0xDE, 0xAD],
+        manifest: vec![0xDE, 0xAD],
+        payloads: vec![],
     }]).await.unwrap();
 
     assert_eq!(result.ecus.len(), 1);
@@ -391,7 +392,8 @@ async fn test_flash_and_rollback() {
     let result = fix.orchestrator.flash_all(vec![EcuTarget {
         component_id: "ecu1".into(),
         gateway_id: None,
-        package: vec![0xDE, 0xAD],
+        manifest: vec![0xDE, 0xAD],
+        payloads: vec![],
     }]).await.unwrap();
 
     assert_eq!(result.ecus[0].state, EcuState::Activated);
@@ -410,8 +412,8 @@ async fn test_multi_ecu_flash_and_commit() {
     let fix = setup_multi(backends).await;
 
     let result = fix.orchestrator.flash_all(vec![
-        EcuTarget { component_id: "ecu1".into(), gateway_id: None, package: vec![0x01] },
-        EcuTarget { component_id: "ecu2".into(), gateway_id: None, package: vec![0x02] },
+        EcuTarget { component_id: "ecu1".into(), gateway_id: None, manifest: vec![0x01], payloads: vec![] },
+        EcuTarget { component_id: "ecu2".into(), gateway_id: None, manifest: vec![0x02], payloads: vec![] },
     ]).await.unwrap();
 
     assert_eq!(result.ecus.len(), 2);
@@ -435,8 +437,8 @@ async fn test_flash_failure_triggers_rollback() {
     let fix = setup_multi(backends).await;
 
     let err = fix.orchestrator.flash_all(vec![
-        EcuTarget { component_id: "ecu1".into(), gateway_id: None, package: vec![0x01] },
-        EcuTarget { component_id: "ecu2".into(), gateway_id: None, package: vec![0x02] },
+        EcuTarget { component_id: "ecu1".into(), gateway_id: None, manifest: vec![0x01], payloads: vec![] },
+        EcuTarget { component_id: "ecu2".into(), gateway_id: None, manifest: vec![0x02], payloads: vec![] },
     ]).await;
 
     assert!(err.is_err(), "flash_all should fail when ecu2 fails");
@@ -451,7 +453,8 @@ async fn test_commit_skips_already_committed() {
     let result = fix.orchestrator.flash_all(vec![EcuTarget {
         component_id: "ecu1".into(),
         gateway_id: None,
-        package: vec![0xDE, 0xAD],
+        manifest: vec![0xDE, 0xAD],
+        payloads: vec![],
     }]).await.unwrap();
 
     let mut ecus = result.ecus;
