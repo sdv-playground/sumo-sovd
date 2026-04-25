@@ -248,7 +248,16 @@ pub async fn flash_ecu_to_staging(
     })
 }
 
-/// Reset one ECU and wait for it to reach trial (Activated) state.
+/// Reset one ECU and wait for it to reach trial (Activated) state, then
+/// (best-effort) wait for the guest VM to actually come up before returning.
+///
+/// The "Activated" flash state only confirms the bank pointer flipped — for
+/// VM-style components there's still a several-second gap before the new
+/// guest is actually running. If we hand off to commit/rollback during that
+/// gap we have no way to tell whether the new firmware is healthy. Polling
+/// the `guest_state` DID until it reaches "running" closes that window for
+/// VM components; for non-VM components (HSM, hypervisor host) the DID is
+/// absent and we fall through after a single attempt.
 pub async fn reset_and_activate(
     server_url: &str,
     component_id: &str,
@@ -279,9 +288,9 @@ pub async fn reset_and_activate(
         match flash_client.get_activation_state().await {
             Ok(state) => {
                 let s = state.state.to_lowercase().replace('_', "");
-                if s != "awaitingreset" {
-                    info!(component = %component_id, state = %state.state, "ECU activated");
-                    return Ok(());
+                if s != "awaitingreset" && s != "awaitingreboot" {
+                    info!(component = %component_id, state = %state.state, "flash state activated");
+                    break;
                 }
             }
             Err(_) => {
@@ -295,5 +304,79 @@ pub async fn reset_and_activate(
                 operation: "activation".into(),
             });
         }
+    }
+
+    // Best-effort guest-up check. Reads `guest_state` DID; if the component
+    // doesn't expose one (HSM, hypervisor host) we skip after a couple of
+    // failed reads. If it's exposed, wait for "running" before returning so
+    // the caller doesn't commit/rollback on a still-booting VM.
+    wait_for_guest_running(server_url, component_id, gateway_id, deadline).await?;
+
+    info!(component = %component_id, "ECU activated and guest running");
+    Ok(())
+}
+
+/// Poll the `guest_state` DID until it reads "running", giving up if the
+/// DID isn't exposed (e.g. for HSM / hypervisor host).
+async fn wait_for_guest_running(
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+    deadline: tokio::time::Instant,
+) -> Result<(), OrchestratorError> {
+    let url = match gateway_id {
+        Some(gw) => format!(
+            "{server_url}/vehicle/v1/components/{gw}/apps/{component_id}/data/guest_state"
+        ),
+        None => format!("{server_url}/vehicle/v1/components/{component_id}/data/guest_state"),
+    };
+
+    let http = reqwest::Client::new();
+    let mut not_found_count = 0u32;
+
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return Err(OrchestratorError::Timeout {
+                component: component_id.to_string(),
+                operation: "guest_state=running".into(),
+            });
+        }
+
+        match http.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let body: serde_json::Value = match resp.json().await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                };
+                // sovd-api wraps DID values as { "value": ..., ... };
+                // value can be a string or a JSON object — check both.
+                let v = body.get("value").unwrap_or(&body);
+                let s = v.as_str().unwrap_or("").to_lowercase();
+                debug!(component = %component_id, guest_state = %s, "polling guest_state");
+                if s == "running" {
+                    return Ok(());
+                }
+            }
+            Ok(resp) if resp.status().as_u16() == 404 => {
+                // Component doesn't expose guest_state — skip after a
+                // small number of confirmations to avoid skipping early
+                // during ECU reset window.
+                not_found_count += 1;
+                if not_found_count >= 3 {
+                    debug!(
+                        component = %component_id,
+                        "no guest_state DID — skipping guest-up check"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(_) | Err(_) => {
+                // ECU still rebooting / proxy not ready — retry
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
