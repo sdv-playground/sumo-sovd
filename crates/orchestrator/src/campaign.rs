@@ -187,6 +187,11 @@ impl CampaignOrchestrator {
     }
 
     /// Reset all staged ECUs and wait for activation (trial mode).
+    ///
+    /// All resets fan out concurrently — components own their own
+    /// post-reset health gating via the `Verifying → Activated`
+    /// transition, so total wall-clock time is `max(activation)`,
+    /// not `sum(activation)`.
     pub async fn reset_all(&self, ecus: &mut [EcuStatus]) -> Result<(), OrchestratorError> {
         let to_reset: Vec<(String, Option<String>)> = ecus
             .iter()
@@ -199,19 +204,49 @@ impl CampaignOrchestrator {
             return Ok(());
         }
 
-        info!(ecus = to_reset.len(), "resetting all staged ECUs");
+        info!(ecus = to_reset.len(), "resetting all staged ECUs (parallel)");
 
-        for (comp, gw) in &to_reset {
-            ecu::reset_and_activate(
-                &self.config.server_url,
-                comp,
-                gw.as_deref(),
-                60,
-            ).await?;
+        let server_url = self.config.server_url.clone();
+        let mut set = tokio::task::JoinSet::new();
+        for (comp, gw) in to_reset {
+            let url = server_url.clone();
+            set.spawn(async move {
+                let result = ecu::reset_and_activate(&url, &comp, gw.as_deref(), 60).await;
+                (comp, result)
+            });
+        }
 
-            if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp) {
-                s.state = EcuState::Activated;
+        let mut first_err: Option<OrchestratorError> = None;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((comp, Ok(()))) => {
+                    if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
+                        s.state = EcuState::Activated;
+                    }
+                }
+                Ok((comp, Err(e))) => {
+                    error!(component = %comp, error = %e, "ECU activation failed");
+                    if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
+                        s.state = EcuState::Failed;
+                        s.error = Some(format!("{e}"));
+                    }
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(join_err) => {
+                    error!(error = %join_err, "ECU activation task panicked");
+                    if first_err.is_none() {
+                        first_err = Some(OrchestratorError::Internal(
+                            format!("task panic: {join_err}"),
+                        ));
+                    }
+                }
             }
+        }
+
+        if let Some(e) = first_err {
+            return Err(e);
         }
 
         info!("all ECUs activated (trial mode)");

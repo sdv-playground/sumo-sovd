@@ -102,6 +102,53 @@ enum Command {
         #[arg(long)]
         rollback: bool,
     },
+
+    /// Flash multiple ECUs in one campaign — stages all, resets all
+    /// in parallel, then commits. Avoids embedding L2 payloads in an
+    /// L1 envelope (which would be impractical for large rootfs
+    /// images) by reading a small JSON spec listing per-ECU
+    /// manifests and payload paths.
+    ///
+    /// Spec format:
+    /// {
+    ///   "ecus": [
+    ///     {
+    ///       "component_id": "vm1",
+    ///       "manifest": "/tmp/vm1.suit",
+    ///       "payloads": [
+    ///         ["#kernel",   "/path/to/kernel.bin"],
+    ///         ["#firmware", "/path/to/rootfs.bin"],
+    ///         ["#config",   "/path/to/config.bin"]
+    ///       ]
+    ///     },
+    ///     { "component_id": "vm2", "manifest": "...", "payloads": [...] }
+    ///   ]
+    /// }
+    Multiflash {
+        /// Path to JSON spec describing the ECUs in the campaign
+        config: String,
+
+        /// Don't commit after flash
+        #[arg(long)]
+        no_commit: bool,
+
+        /// Rollback after flash
+        #[arg(long)]
+        rollback: bool,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct MultiflashSpec {
+    ecus: Vec<MultiflashEcu>,
+}
+
+#[derive(serde::Deserialize)]
+struct MultiflashEcu {
+    component_id: String,
+    manifest: String,
+    #[serde(default)]
+    payloads: Vec<(String, String)>,
 }
 
 // =============================================================================
@@ -144,9 +191,13 @@ fn parse_campaign(
             .validate_envelope(&l2_envelope, &crypto, 0)
             .map_err(|e| format!("validate L2 dep {i}: {e:?}"))?;
 
+        // SUIT manifests for our ECUs use ["<ecu>", "<sub>"] (e.g.
+        // ["vm1", "kernel"]) — the first segment identifies the ECU,
+        // remaining segments are sub-components within it. Route by
+        // the ECU id.
         let component_id = l2_manifest
             .component_id(0)
-            .and_then(|segs| segs.last())
+            .and_then(|segs| segs.first())
             .and_then(|s| std::str::from_utf8(s).ok())
             .ok_or_else(|| format!("L2 dep {i}: no component ID"))?
             .to_string();
@@ -211,6 +262,10 @@ async fn main() {
         Command::Flash { component_id, manifest, payload, no_commit, rollback } => {
             run_flash(&orchestrator, &component_id, &manifest, &payload,
                       cli.gateway, no_commit, rollback).await
+        }
+        Command::Multiflash { config, no_commit, rollback } => {
+            run_multiflash(&orchestrator, &config, cli.gateway,
+                           no_commit, rollback).await
         }
     };
 
@@ -324,6 +379,69 @@ async fn run_flash(
         orchestrator.commit_all(&phase.ecus).await
             .map_err(|e| format!("commit failed: {e}"))?;
         info!("{component_id} committed");
+    }
+
+    Ok(())
+}
+
+async fn run_multiflash(
+    orchestrator: &CampaignOrchestrator,
+    config_path: &str,
+    gateway: Option<String>,
+    no_commit: bool,
+    rollback: bool,
+) -> Result<(), String> {
+    let config_bytes = std::fs::read(config_path)
+        .map_err(|e| format!("read {config_path}: {e}"))?;
+    let spec: MultiflashSpec = serde_json::from_slice(&config_bytes)
+        .map_err(|e| format!("parse {config_path}: {e}"))?;
+
+    if spec.ecus.is_empty() {
+        return Err("multiflash spec has no ECUs".into());
+    }
+
+    let mut targets = Vec::with_capacity(spec.ecus.len());
+    for ecu in spec.ecus {
+        let manifest = std::fs::read(&ecu.manifest)
+            .map_err(|e| format!("read manifest {}: {e}", ecu.manifest))?;
+        let payloads: Vec<(String, std::path::PathBuf)> = ecu.payloads.into_iter()
+            .map(|(uri, path)| (uri, std::path::PathBuf::from(path)))
+            .collect();
+        info!(
+            "  {} ({}B manifest, {} payloads)",
+            ecu.component_id, manifest.len(), payloads.len()
+        );
+        targets.push(EcuTarget {
+            component_id: ecu.component_id,
+            gateway_id: gateway.clone(),
+            manifest,
+            payloads,
+        });
+    }
+
+    info!("flashing {} ECUs in one campaign...", targets.len());
+    let phase = orchestrator.flash_all(targets).await
+        .map_err(|e| format!("flash failed: {e}"))?;
+
+    for ecu in &phase.ecus {
+        info!("  {} → {:?}", ecu.component_id, ecu.state);
+    }
+
+    if no_commit {
+        info!("ECUs in trial mode (--no-commit). Use commit/rollback externally.");
+        return Ok(());
+    }
+
+    if rollback {
+        info!("rolling back...");
+        orchestrator.rollback_all(&phase.ecus).await
+            .map_err(|e| format!("rollback failed: {e}"))?;
+        info!("rollback complete");
+    } else {
+        info!("committing...");
+        orchestrator.commit_all(&phase.ecus).await
+            .map_err(|e| format!("commit failed: {e}"))?;
+        info!("campaign committed successfully");
     }
 
     Ok(())
