@@ -309,6 +309,7 @@ async fn setup(backend: Arc<dyn DiagnosticBackend>) -> TestFixture {
             url: format!("http://127.0.0.1:{helper_port}"),
             token: "test".into(),
         },
+        use_validated_flow: false,
     });
 
     TestFixture {
@@ -351,6 +352,7 @@ async fn setup_multi(backends: HashMap<String, Arc<dyn DiagnosticBackend>>) -> T
             url: format!("http://127.0.0.1:{helper_port}"),
             token: "test".into(),
         },
+        use_validated_flow: false,
     });
 
     TestFixture {

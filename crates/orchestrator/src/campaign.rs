@@ -1,14 +1,14 @@
-/// Campaign orchestrator — sequence-driven multi-ECU updates via SOVD.
-///
-/// Reads the L1 campaign manifest's SUIT command sequences to determine
-/// the execution flow. The manifest declares what to do; the orchestrator
-/// executes it via SOVD REST calls.
-///
-/// Lifecycle:
-/// 1. Stage phase: flash all ECUs to staging (AwaitingReboot)
-/// 2. Reset phase: reset all ECUs (orchestrator decides when)
-/// 3. All ECUs in trial — system health check (caller decides)
-/// 4. Commit all or rollback all
+//! Campaign orchestrator — sequence-driven multi-ECU updates via SOVD.
+//!
+//! Reads the L1 campaign manifest's SUIT command sequences to determine
+//! the execution flow. The manifest declares what to do; the orchestrator
+//! executes it via SOVD REST calls.
+//!
+//! Lifecycle:
+//! 1. Stage phase: flash all ECUs to staging (AwaitingReboot)
+//! 2. Reset phase: reset all ECUs (orchestrator decides when)
+//! 3. All ECUs in trial — system health check (caller decides)
+//! 4. Commit all or rollback all
 
 use async_trait::async_trait;
 use sumo_codec::commands::CommandValue;
@@ -29,6 +29,10 @@ pub struct CampaignConfig {
     pub trust_anchor: Vec<u8>,
     pub security_level: u8,
     pub security_helper: SecurityHelperConfig,
+    /// If true, after each ECU's `transfer_exit` the orchestrator drives
+    /// it through `validate()` → `activate()` so the lifecycle visibly
+    /// passes through `Validated`. Default false (classic flow).
+    pub use_validated_flow: bool,
 }
 
 /// State of individual ECUs within a campaign.
@@ -125,6 +129,7 @@ impl CampaignOrchestrator {
                     manifest: target.manifest.clone(),
                     payloads: target.payloads.clone(),
                     security_helper: self.config.security_helper.clone(),
+                    use_validated_flow: self.config.use_validated_flow,
                 },
                 &self.config.trust_anchor,
             )

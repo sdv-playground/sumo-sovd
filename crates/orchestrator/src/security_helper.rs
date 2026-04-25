@@ -1,8 +1,8 @@
-/// Security helper client — computes security keys from seeds.
-///
-/// Calls the SOVD security helper HTTP API to derive keys for
-/// ECU security unlock. Pluggable: production can use HSM, testing
-/// uses the XOR-based helper.
+//! Security helper client — computes security keys from seeds.
+//!
+//! Calls the SOVD security helper HTTP API to derive keys for
+//! ECU security unlock. Pluggable: production can use HSM, testing
+//! uses the XOR-based helper.
 
 use crate::error::OrchestratorError;
 use tracing::debug;

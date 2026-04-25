@@ -1,11 +1,11 @@
-/// SovdPlatformOps — adapts PlatformOps to SOVD REST API calls.
-///
-/// The SUIT processor calls PlatformOps methods; this adapter translates
-/// them into sovd-client flash operations against an SOVD server.
-///
-/// For campaigns, each component maps to an ECU behind the gateway.
-/// The processor walks the L1 sequences (install all → validate all → invoke all)
-/// and this adapter makes the corresponding SOVD calls.
+//! SovdPlatformOps — adapts PlatformOps to SOVD REST API calls.
+//!
+//! The SUIT processor calls PlatformOps methods; this adapter translates
+//! them into sovd-client flash operations against an SOVD server.
+//!
+//! For campaigns, each component maps to an ECU behind the gateway.
+//! The processor walks the L1 sequences (install all → validate all → invoke all)
+//! and this adapter makes the corresponding SOVD calls.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -83,7 +83,7 @@ impl PlatformOps for SovdPlatformOps {
     fn write(&self, component_id: &[u8], offset: usize, data: &[u8]) -> Result<(), Sum2Error> {
         let comp = String::from_utf8_lossy(component_id).to_string();
         let mut written = self.written.borrow_mut();
-        let buf = written.entry(comp).or_insert_with(Vec::new);
+        let buf = written.entry(comp).or_default();
         let end = offset + data.len();
         if buf.len() < end {
             buf.resize(end, 0);

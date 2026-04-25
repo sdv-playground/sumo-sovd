@@ -1,9 +1,9 @@
-/// Per-ECU update — inspects SUIT manifest command sequences to determine
-/// the update flow: firmware flash (full lifecycle) vs policy-only (immediate).
-///
-/// Firmware: session → security → upload → flash → finalize → AwaitingReboot
-///           (reset is a campaign-level decision, not per-ECU)
-/// Policy:   session → security → upload → apply (immediate, no trial)
+//! Per-ECU update — inspects SUIT manifest command sequences to determine
+//! the update flow: firmware flash (full lifecycle) vs policy-only (immediate).
+//!
+//! Firmware: session → security → upload → flash → finalize → AwaitingReboot
+//!           (reset is a campaign-level decision, not per-ECU)
+//! Policy:   session → security → upload → apply (immediate, no trial)
 
 use sovd_client::flash::FlashClient;
 use sovd_client::SovdClient;
@@ -26,6 +26,13 @@ pub struct EcuFlashConfig {
     /// Order must match the manifest's component sequence.
     pub payloads: Vec<(String, std::path::PathBuf)>,
     pub security_helper: SecurityHelperConfig,
+    /// If true, after `transfer_exit` the orchestrator drives the ECU
+    /// through `validate()` → `activate()` so the lifecycle visibly
+    /// passes through the `Validated` checkpoint. Useful for multi-cycle
+    /// campaigns where re-validation across power cycles is desired.
+    /// Default false → classic flow (`transfer_exit` lands at
+    /// `AwaitingReboot` directly).
+    pub use_validated_flow: bool,
 }
 
 /// What kind of update this manifest represents.
@@ -202,6 +209,28 @@ pub async fn flash_ecu_to_staging(
                     component: comp.clone(),
                     message: format!("finalize: {e}"),
                 })?;
+
+            if config.use_validated_flow {
+                // Drive lifecycle through Validated as a checkpoint —
+                // backend.validate() accepts AwaitingReboot and downshifts,
+                // backend.activate() then returns to AwaitingReboot. Useful
+                // for multi-cycle campaigns; backends that don't support
+                // the new ops will surface an HTTP error here so the caller
+                // knows to either upgrade them or disable the flag.
+                info!(component = %comp, "validating staged artifact");
+                flash_client.validate_flash().await
+                    .map_err(|e| OrchestratorError::FlashFailed {
+                        component: comp.clone(),
+                        message: format!("validate: {e}"),
+                    })?;
+
+                info!(component = %comp, "activating");
+                flash_client.activate_flash().await
+                    .map_err(|e| OrchestratorError::FlashFailed {
+                        component: comp.clone(),
+                        message: format!("activate: {e}"),
+                    })?;
+            }
 
             info!(component = %comp, "staged — awaiting reset");
         }

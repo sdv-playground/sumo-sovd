@@ -1,13 +1,13 @@
-/// sumo-campaign — CLI tool for deploying SUIT firmware campaigns via SOVD.
-///
-/// Deploy an L1 campaign manifest (multi-ECU):
-///   sumo-campaign deploy campaign.suit --server http://localhost:4000 \
-///     --trust-anchor keys/signing.pub --gateway vehicle_gateway \
-///     --sovd-ecus os1 --helper-url http://localhost:9100 --helper-token dev-secret-123
-///
-/// Flash a single L2 image manifest:
-///   sumo-campaign flash os1 manifest.suit --server http://localhost:4000 \
-///     --gateway vehicle_gateway --helper-url http://localhost:9100 --helper-token dev-secret-123
+//! sumo-campaign — CLI tool for deploying SUIT firmware campaigns via SOVD.
+//!
+//! Deploy an L1 campaign manifest (multi-ECU):
+//!   sumo-campaign deploy campaign.suit --server http://localhost:4000 \
+//!     --trust-anchor keys/signing.pub --gateway vehicle_gateway \
+//!     --sovd-ecus os1 --helper-url http://localhost:9100 --helper-token dev-secret-123
+//!
+//! Flash a single L2 image manifest:
+//!   sumo-campaign flash os1 manifest.suit --server http://localhost:4000 \
+//!     --gateway vehicle_gateway --helper-url http://localhost:9100 --helper-token dev-secret-123
 
 use std::process;
 
@@ -54,6 +54,12 @@ struct Cli {
     /// Security helper bearer token
     #[arg(long, default_value = "dev-secret-123", global = true)]
     helper_token: String,
+
+    /// Drive each ECU through the Validated state explicitly via
+    /// validate() → activate() after transfer_exit. Demonstrates the
+    /// new opt-in lifecycle; default is the classic flow.
+    #[arg(long, global = true)]
+    validated: bool,
 }
 
 #[derive(Subcommand)]
@@ -194,6 +200,7 @@ async fn main() {
             url: cli.helper_url,
             token: cli.helper_token,
         },
+        use_validated_flow: cli.validated,
     });
 
     let result = match cli.command {
