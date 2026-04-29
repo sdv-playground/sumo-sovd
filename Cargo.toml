@@ -6,15 +6,3 @@ members = ["crates/orchestrator", "crates/campaign-cli"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-
-# Temporary: pick up the local SOVDd checkout while iterating on the
-# FlashState rename (AwaitingExit→AwaitingActivation, AwaitingReset→
-# AwaitingReboot). Patch all three sovd-* crates so the FlashState enum
-# is the same one everywhere (patching only sovd-client leaves sovd-core
-# and sovd-api at git HEAD, so two copies end up in the build).
-# Remove once SOVDd is committed + pushed.
-[patch."https://github.com/sdv-playground/SOVDd.git"]
-sovd-core = { path = "../SOVDd/crates/sovd-core" }
-sovd-api = { path = "../SOVDd/crates/sovd-api" }
-sovd-client = { path = "../SOVDd/crates/sovd-client" }
-
