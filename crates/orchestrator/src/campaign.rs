@@ -21,7 +21,7 @@ use tracing::{info, error, warn};
 
 use crate::ecu::{self, EcuFlashConfig, UpdateType};
 use crate::error::OrchestratorError;
-use crate::security_helper::SecurityHelperConfig;
+use crate::security_helper::{ComputeKeyRequest, SecurityHelperClient, SecurityHelperConfig};
 
 /// Configuration for a campaign deployment.
 pub struct CampaignConfig {
@@ -82,11 +82,21 @@ pub struct EcuTarget {
 /// Orchestrates multi-ECU firmware campaigns.
 pub struct CampaignOrchestrator {
     config: CampaignConfig,
+    helper: SecurityHelperClient,
 }
 
 impl CampaignOrchestrator {
     pub fn new(config: CampaignConfig) -> Self {
-        Self { config }
+        let helper = SecurityHelperClient::new(config.security_helper.clone());
+        Self { config, helper }
+    }
+
+    /// Pooled security-helper client. Used internally for unlock during
+    /// commit/rollback; exposed publicly so callers (e.g. `sumo-deploy`)
+    /// can probe `/info` or perform extra unlocks without spinning up
+    /// their own client.
+    pub fn helper(&self) -> &SecurityHelperClient {
+        &self.helper
     }
 
     /// Stage all ECU targets — flash each to staging (AwaitingReboot).
@@ -120,15 +130,39 @@ impl CampaignOrchestrator {
             info!(component = %comp, progress = format!("{}/{}", i + 1, total), "staging ECU");
             statuses[i].state = EcuState::Flashing;
 
+            // Unlock first — orchestrator owns session/security state.
+            // The ECU module's flash protocol assumes already-unlocked.
+            if let Err(e) = self
+                .unlock_for_flash(comp, target.gateway_id.as_deref())
+                .await
+            {
+                statuses[i].state = EcuState::Failed;
+                statuses[i].error = Some(format!("{e}"));
+                error!(component = %comp, error = %e, "ECU unlock failed");
+                if !staged.is_empty() {
+                    warn!(count = staged.len(), "rolling back staged ECUs");
+                    for rc in &staged {
+                        let gw = statuses
+                            .iter()
+                            .find(|s| &s.component_id == rc)
+                            .and_then(|s| s.gateway_id.as_deref());
+                        if self.rollback_one(rc, gw).await.is_ok() {
+                            if let Some(s) = statuses.iter_mut().find(|s| &s.component_id == rc) {
+                                s.state = EcuState::RolledBack;
+                            }
+                        }
+                    }
+                }
+                return Err(e);
+            }
+
             match ecu::flash_ecu_to_staging(
                 EcuFlashConfig {
                     component_id: comp.clone(),
                     server_url: self.config.server_url.clone(),
                     gateway_id: target.gateway_id.clone(),
-                    security_level: self.config.security_level,
                     manifest: target.manifest.clone(),
                     payloads: target.payloads.clone(),
-                    security_helper: self.config.security_helper.clone(),
                     use_validated_flow: self.config.use_validated_flow,
                 },
                 &self.config.trust_anchor,
@@ -409,9 +443,13 @@ impl CampaignOrchestrator {
         })
     }
 
-    /// Re-establish programming session + security unlock for an ECU.
-    /// Needed after ECU reset (ISO 14229 resets session to default).
-    async fn ensure_access(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+    /// Establish programming session + security unlock for an ECU.
+    ///
+    /// Called both before staging (initial unlock) and after each ECU
+    /// reset (ISO 14229 resets session/security to default — needed
+    /// before commit/rollback). The ECU module never touches session
+    /// or security state itself; that's an orchestrator concern.
+    async fn unlock_for_flash(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
         let client = SovdClient::new(&self.config.server_url)
             .map_err(|e| OrchestratorError::Sovd {
                 component: component_id.to_string(),
@@ -450,9 +488,14 @@ impl CampaignOrchestrator {
                 .and_then(|s| s.as_str())
                 .or_else(|| seed_val.as_str())
                 .unwrap_or("");
-            let key_hex = crate::security_helper::compute_key(
-                &self.config.security_helper, seed_str, self.config.security_level, component_id,
-            ).await?;
+            let key_hex = self
+                .helper()
+                .compute_key(&ComputeKeyRequest::new(
+                    seed_str,
+                    self.config.security_level,
+                    component_id,
+                ))
+                .await?;
             client.set_mode_targeted(
                 mode_component, "security",
                 serde_json::json!({"value": format!("level{}", self.config.security_level), "key": key_hex}),
@@ -468,7 +511,7 @@ impl CampaignOrchestrator {
 
     async fn commit_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
         // Re-establish access (ECU reset clears session per ISO 14229)
-        self.ensure_access(component_id, gateway_id).await?;
+        self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client.commit_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),
@@ -477,7 +520,7 @@ impl CampaignOrchestrator {
     }
 
     async fn rollback_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
-        self.ensure_access(component_id, gateway_id).await?;
+        self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client.rollback_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),

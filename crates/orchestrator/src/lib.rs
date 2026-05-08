@@ -43,7 +43,9 @@ pub mod error;
 pub mod ecu;
 pub mod security_helper;
 pub mod sovd_ops;
+pub mod targets;
 
 pub use campaign::CampaignOrchestrator;
 pub use ecu::UpdateType;
 pub use error::OrchestratorError;
+pub use targets::{parse_l1_campaign, MultiflashEcu, MultiflashSpec};

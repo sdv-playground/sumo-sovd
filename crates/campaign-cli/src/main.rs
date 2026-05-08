@@ -18,8 +18,7 @@ use sumo_sovd_orchestrator::campaign::{
     CampaignConfig, CampaignOrchestrator, EcuTarget,
 };
 use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
-use sumo_onboard::Validator;
-use sumo_crypto::RustCryptoBackend;
+use sumo_sovd_orchestrator::targets::{parse_l1_campaign, MultiflashSpec};
 
 // =============================================================================
 // CLI
@@ -138,91 +137,6 @@ enum Command {
     },
 }
 
-#[derive(serde::Deserialize)]
-struct MultiflashSpec {
-    ecus: Vec<MultiflashEcu>,
-}
-
-#[derive(serde::Deserialize)]
-struct MultiflashEcu {
-    component_id: String,
-    manifest: String,
-    #[serde(default)]
-    payloads: Vec<(String, String)>,
-}
-
-// =============================================================================
-// Campaign parsing
-// =============================================================================
-
-fn parse_campaign(
-    envelope: &[u8],
-    trust_anchor: &[u8],
-    gateway_id: Option<String>,
-    sovd_ecus: &[String],
-) -> Result<Vec<EcuTarget>, String> {
-    let crypto = RustCryptoBackend::new();
-    let validator = Validator::new(trust_anchor, None);
-
-    let manifest = validator
-        .validate_envelope(envelope, &crypto, 0)
-        .map_err(|e| format!("validate L1 envelope: {e:?}"))?;
-
-    if !manifest.is_campaign() {
-        return Err("not a campaign manifest (no dependencies)".into());
-    }
-
-    let dep_count = manifest.dependency_count();
-    let mut targets = Vec::new();
-
-    for i in 0..dep_count {
-        let dep_uri = manifest.dependency_uri(i)
-            .ok_or_else(|| format!("no URI for dependency {i}"))?;
-
-        let l2_envelope = if dep_uri.starts_with('#') {
-            manifest.integrated_payload(dep_uri)
-                .ok_or_else(|| format!("payload not found: {dep_uri}"))?
-                .to_vec()
-        } else {
-            return Err(format!("external dependency URIs not yet supported: {dep_uri}"));
-        };
-
-        let l2_manifest = validator
-            .validate_envelope(&l2_envelope, &crypto, 0)
-            .map_err(|e| format!("validate L2 dep {i}: {e:?}"))?;
-
-        // SUIT manifests for our ECUs use ["<ecu>", "<sub>"] (e.g.
-        // ["vm1", "kernel"]) — the first segment identifies the ECU,
-        // remaining segments are sub-components within it. Route by
-        // the ECU id.
-        let component_id = l2_manifest
-            .component_id(0)
-            .and_then(|segs| segs.first())
-            .and_then(|s| std::str::from_utf8(s).ok())
-            .ok_or_else(|| format!("L2 dep {i}: no component ID"))?
-            .to_string();
-
-        // SOVD ECUs (vm-mgr) get the full L2 SUIT envelope;
-        // UDS ECUs get raw firmware extracted from the L2
-        let package = if sovd_ecus.iter().any(|e| e == &component_id) {
-            l2_envelope
-        } else {
-            l2_manifest.integrated_payload("#firmware")
-                .ok_or_else(|| format!("L2 dep {i} ({component_id}): no integrated firmware"))?
-                .to_vec()
-        };
-
-        targets.push(EcuTarget {
-            component_id,
-            gateway_id: gateway_id.clone(),
-            manifest: package, // deploy path: integrated envelope
-            payloads: Vec::new(),
-        });
-    }
-
-    Ok(targets)
-}
-
 // =============================================================================
 // Main
 // =============================================================================
@@ -293,7 +207,8 @@ async fn run_deploy(
         .map_err(|e| format!("read {manifest_path}: {e}"))?;
 
     info!("parsing L1 campaign from {manifest_path}");
-    let targets = parse_campaign(&envelope, &trust_anchor, gateway, sovd_ecus)?;
+    let targets = parse_l1_campaign(&envelope, &trust_anchor, gateway, sovd_ecus)
+        .map_err(|e| format!("{e}"))?;
 
     info!("campaign has {} target(s):", targets.len());
     for t in &targets {
@@ -400,23 +315,16 @@ async fn run_multiflash(
         return Err("multiflash spec has no ECUs".into());
     }
 
-    let mut targets = Vec::with_capacity(spec.ecus.len());
-    for ecu in spec.ecus {
-        let manifest = std::fs::read(&ecu.manifest)
-            .map_err(|e| format!("read manifest {}: {e}", ecu.manifest))?;
-        let payloads: Vec<(String, std::path::PathBuf)> = ecu.payloads.into_iter()
-            .map(|(uri, path)| (uri, std::path::PathBuf::from(path)))
-            .collect();
+    let targets = spec
+        .into_targets(gateway)
+        .map_err(|e| format!("read multiflash artefacts: {e}"))?;
+    for t in &targets {
         info!(
             "  {} ({}B manifest, {} payloads)",
-            ecu.component_id, manifest.len(), payloads.len()
+            t.component_id,
+            t.manifest.len(),
+            t.payloads.len()
         );
-        targets.push(EcuTarget {
-            component_id: ecu.component_id,
-            gateway_id: gateway.clone(),
-            manifest,
-            payloads,
-        });
     }
 
     info!("flashing {} ECUs in one campaign...", targets.len());

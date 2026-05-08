@@ -6,26 +6,27 @@
 //! Policy:   session → security → upload → apply (immediate, no trial)
 
 use sovd_client::flash::FlashClient;
-use sovd_client::SovdClient;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
 use tracing::{info, debug};
 
 use crate::error::OrchestratorError;
-use crate::security_helper::{self, SecurityHelperConfig};
 
 /// Configuration for a single ECU update.
+///
+/// The ECU module is the SOVD flash protocol — it does **not** touch
+/// session or security state. The caller (orchestrator) is responsible
+/// for putting the ECU into a programming session with security
+/// unlocked before invoking [`flash_ecu_to_staging`].
 pub struct EcuFlashConfig {
     pub component_id: String,
     pub server_url: String,
     pub gateway_id: Option<String>,
-    pub security_level: u8,
     /// SUIT manifest bytes (small, ~1KB, no integrated payloads).
     pub manifest: Vec<u8>,
     /// Payload files in component order: [(URI, path), ...].
     /// Order must match the manifest's component sequence.
     pub payloads: Vec<(String, std::path::PathBuf)>,
-    pub security_helper: SecurityHelperConfig,
     /// If true, after `transfer_exit` the orchestrator drives the ECU
     /// through `validate()` → `activate()` so the lifecycle visibly
     /// passes through the `Validated` checkpoint. Useful for multi-cycle
@@ -77,6 +78,11 @@ fn classify_manifest(
 /// Does NOT reset the ECU. The orchestrator decides when to reset
 /// (e.g. after all ECUs are staged, or waiting for external power cycle).
 ///
+/// **Precondition:** the caller (orchestrator) has already put the ECU
+/// into a programming session with security access unlocked. This
+/// module is the SOVD flash protocol; it does not touch session or
+/// security state.
+///
 /// For Policy updates: applied immediately (no staging/reset needed).
 pub async fn flash_ecu_to_staging(
     config: EcuFlashConfig,
@@ -93,67 +99,9 @@ pub async fn flash_ecu_to_staging(
             UpdateType::Firmware
         }
     };
-    info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU update");
+    info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU flash (assumes already unlocked)");
 
-    let client = SovdClient::new(&config.server_url)
-        .map_err(|e| OrchestratorError::Sovd {
-            component: comp.clone(),
-            message: format!("connect: {e}"),
-        })?;
-
-    let (mode_component, mode_target) = if let Some(gw_id) = gw {
-        (gw_id, Some(comp.as_str()))
-    } else {
-        (comp.as_str(), None)
-    };
-
-    // 1. Switch to programming session
-    info!(component = %comp, "switching to programming session");
-    client.set_mode_targeted(
-        mode_component, "session",
-        serde_json::json!({"value": "programming"}),
-        mode_target,
-    ).await.map_err(|e| OrchestratorError::Sovd {
-        component: comp.clone(),
-        message: format!("set_session: {e}"),
-    })?;
-
-    // 2. Security unlock
-    info!(component = %comp, level = config.security_level, "requesting security seed");
-    let seed_resp = client.set_mode_targeted(
-        mode_component, "security",
-        serde_json::json!({"value": format!("level{}_requestseed", config.security_level)}),
-        mode_target,
-    ).await.map_err(|e| OrchestratorError::SecurityFailed {
-        component: comp.clone(),
-        message: format!("request seed: {e}"),
-    })?;
-
-    if let Some(seed_val) = seed_resp.seed.as_ref() {
-        let seed_str = seed_val
-            .get("Request_Seed")
-            .and_then(|s| s.as_str())
-            .or_else(|| seed_val.as_str())
-            .unwrap_or("");
-
-        // Compute key via security helper
-        let key_hex = security_helper::compute_key(
-            &config.security_helper, seed_str, config.security_level, comp,
-        )
-        .await?;
-
-        info!(component = %comp, "sending security key");
-        client.set_mode_targeted(
-            mode_component, "security",
-            serde_json::json!({"value": format!("level{}", config.security_level), "key": key_hex}),
-            mode_target,
-        ).await.map_err(|e| OrchestratorError::SecurityFailed {
-            component: comp.clone(),
-            message: format!("send key: {e}"),
-        })?;
-    }
-
-    // 3. Create flash client
+    // Create flash client (session/security unlock is the orchestrator's job)
     let flash_client = if let Some(gw_id) = gw {
         FlashClient::for_sovd_sub_entity(&config.server_url, gw_id, comp)
     } else {
@@ -163,7 +111,7 @@ pub async fn flash_ecu_to_staging(
         message: format!("flash client: {e}"),
     })?;
 
-    // 4. Start flash session
+    // 1. Start flash session
     info!(component = %comp, "starting flash session");
     let transfer = flash_client.start_flash().await
         .map_err(|e| OrchestratorError::FlashFailed {
@@ -171,16 +119,15 @@ pub async fn flash_ecu_to_staging(
             message: format!("start flash: {e}"),
         })?;
 
-    // 5. Upload manifest (tiny, first in sequence)
+    // 2. Upload manifest (tiny, first in sequence; processed synchronously)
     info!(component = %comp, size = config.manifest.len(), "uploading manifest");
-    // 5. Upload manifest (processed synchronously — no poll needed)
     flash_client.upload_file(&config.manifest).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("manifest upload: {e}"),
         })?;
 
-    // 6. Upload each payload in component order (each streamed to bank synchronously)
+    // 3. Upload each payload in component order (each streamed to bank synchronously)
     for (uri, path) in &config.payloads {
         let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
