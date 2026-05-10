@@ -121,24 +121,44 @@ pub async fn flash_ecu_to_staging(
 
     // 2. Upload manifest (tiny, first in sequence; processed synchronously)
     info!(component = %comp, size = config.manifest.len(), "uploading manifest");
+    let manifest_started = std::time::Instant::now();
     flash_client.upload_file(&config.manifest).await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("manifest upload: {e}"),
         })?;
+    info!(
+        component = %comp,
+        bytes = config.manifest.len(),
+        elapsed_ms = manifest_started.elapsed().as_millis() as u64,
+        "manifest uploaded"
+    );
 
-    // 3. Upload each payload in component order (each streamed to bank synchronously)
+    // 3. Upload each payload in component order (each streamed to bank synchronously).
+    //    Completion log carries throughput so slow uploads stand out.
     for (uri, path) in &config.payloads {
         let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
             component: comp.clone(),
             message: format!("read payload {}: {e}", path.display()),
         })?;
-        info!(component = %comp, uri = %uri, size = data.len(), "uploading payload");
+        let bytes = data.len();
+        info!(component = %comp, uri = %uri, size = bytes, "uploading payload");
+        let started = std::time::Instant::now();
         flash_client.upload_file(&data).await
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: comp.clone(),
                 message: format!("payload upload ({uri}): {e}"),
             })?;
+        let elapsed = started.elapsed();
+        let mb = bytes as f64 / 1_048_576.0;
+        let secs = elapsed.as_secs_f64();
+        let mb_per_sec = if secs > 0.0 { mb / secs } else { 0.0 };
+        info!(
+            component = %comp, uri = %uri,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "payload uploaded: {:.2} MB at {:.2} MB/s",
+            mb, mb_per_sec
+        );
     }
 
     match update_type {
