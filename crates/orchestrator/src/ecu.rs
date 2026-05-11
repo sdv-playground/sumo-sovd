@@ -8,7 +8,7 @@
 use sovd_client::flash::FlashClient;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::error::OrchestratorError;
 
@@ -106,72 +106,122 @@ pub async fn flash_ecu_to_staging(
         FlashClient::for_sovd_sub_entity(&config.server_url, gw_id, comp)
     } else {
         FlashClient::for_sovd(&config.server_url, comp)
-    }.map_err(|e| OrchestratorError::Sovd {
+    }
+    .map_err(|e| OrchestratorError::Sovd {
         component: comp.clone(),
         message: format!("flash client: {e}"),
     })?;
 
-    // 1. Start flash session
-    info!(component = %comp, "starting flash session");
-    let transfer = flash_client.start_flash().await
-        .map_err(|e| OrchestratorError::FlashFailed {
-            component: comp.clone(),
-            message: format!("start flash: {e}"),
-        })?;
-
-    // 2. Upload manifest (tiny, first in sequence; processed synchronously)
-    info!(component = %comp, size = config.manifest.len(), "uploading manifest");
-    let manifest_started = std::time::Instant::now();
-    flash_client.upload_file(&config.manifest).await
-        .map_err(|e| OrchestratorError::FlashFailed {
-            component: comp.clone(),
-            message: format!("manifest upload: {e}"),
-        })?;
-    info!(
-        component = %comp,
-        bytes = config.manifest.len(),
-        elapsed_ms = manifest_started.elapsed().as_millis() as u64,
-        "manifest uploaded"
-    );
-
-    // 3. Upload each payload in component order (each streamed to bank synchronously).
-    //    Completion log carries throughput so slow uploads stand out.
-    for (uri, path) in &config.payloads {
-        let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
-            component: comp.clone(),
-            message: format!("read payload {}: {e}", path.display()),
-        })?;
-        let bytes = data.len();
-        info!(component = %comp, uri = %uri, size = bytes, "uploading payload");
+    let transfer = if opaque_firmware && gw.is_some() {
+        // UDS-backed ECUs require upload + verify before the flash transfer starts.
+        info!(component = %comp, size = config.manifest.len(), "uploading opaque firmware");
         let started = std::time::Instant::now();
-        flash_client.upload_file(&data).await
+        let upload = flash_client
+            .upload_file(&config.manifest)
+            .await
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: comp.clone(),
-                message: format!("payload upload ({uri}): {e}"),
+                message: format!("firmware upload: {e}"),
             })?;
-        let elapsed = started.elapsed();
-        let mb = bytes as f64 / 1_048_576.0;
-        let secs = elapsed.as_secs_f64();
-        let mb_per_sec = if secs > 0.0 { mb / secs } else { 0.0 };
         info!(
-            component = %comp, uri = %uri,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "payload uploaded: {:.2} MB at {:.2} MB/s",
-            mb, mb_per_sec
+            component = %comp,
+            bytes = config.manifest.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "opaque firmware uploaded"
         );
-    }
+
+        flash_client
+            .verify_file(&upload.upload_id)
+            .await
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: comp.clone(),
+                message: format!("firmware verify: {e}"),
+            })?;
+
+        info!(component = %comp, "starting flash session");
+        flash_client
+            .start_flash()
+            .await
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: comp.clone(),
+                message: format!("start flash: {e}"),
+            })?
+    } else {
+        // SUIT-backed vm-mgr ECUs accept the classic flow: open transfer first,
+        // then upload the manifest and any detached payloads into that session.
+        info!(component = %comp, "starting flash session");
+        let transfer =
+            flash_client
+                .start_flash()
+                .await
+                .map_err(|e| OrchestratorError::FlashFailed {
+                    component: comp.clone(),
+                    message: format!("start flash: {e}"),
+                })?;
+
+        info!(component = %comp, size = config.manifest.len(), "uploading manifest");
+        let manifest_started = std::time::Instant::now();
+        flash_client
+            .upload_file(&config.manifest)
+            .await
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: comp.clone(),
+                message: format!("manifest upload: {e}"),
+            })?;
+        info!(
+            component = %comp,
+            bytes = config.manifest.len(),
+            elapsed_ms = manifest_started.elapsed().as_millis() as u64,
+            "manifest uploaded"
+        );
+
+        // Upload each payload in component order (each streamed to bank synchronously).
+        // Completion log carries throughput so slow uploads stand out.
+        for (uri, path) in &config.payloads {
+            let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
+                component: comp.clone(),
+                message: format!("read payload {}: {e}", path.display()),
+            })?;
+            let bytes = data.len();
+            info!(component = %comp, uri = %uri, size = bytes, "uploading payload");
+            let started = std::time::Instant::now();
+            flash_client
+                .upload_file(&data)
+                .await
+                .map_err(|e| OrchestratorError::FlashFailed {
+                    component: comp.clone(),
+                    message: format!("payload upload ({uri}): {e}"),
+                })?;
+            let elapsed = started.elapsed();
+            let mb = bytes as f64 / 1_048_576.0;
+            let secs = elapsed.as_secs_f64();
+            let mb_per_sec = if secs > 0.0 { mb / secs } else { 0.0 };
+            info!(
+                component = %comp, uri = %uri,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "payload uploaded: {:.2} MB at {:.2} MB/s",
+                mb, mb_per_sec
+            );
+        }
+
+        transfer
+    };
 
     match update_type {
         UpdateType::Firmware => {
             // Flash → finalize → stop here (AwaitingReboot)
-            flash_client.poll_flash_complete_simple(&transfer.transfer_id).await
+            flash_client
+                .poll_flash_complete_simple(&transfer.transfer_id)
+                .await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.clone(),
                     message: format!("flash progress: {e}"),
                 })?;
 
             info!(component = %comp, "finalizing transfer");
-            flash_client.transfer_exit().await
+            flash_client
+                .transfer_exit()
+                .await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.clone(),
                     message: format!("finalize: {e}"),
@@ -185,18 +235,20 @@ pub async fn flash_ecu_to_staging(
                 // the new ops will surface an HTTP error here so the caller
                 // knows to either upgrade them or disable the flag.
                 info!(component = %comp, "validating staged artifact");
-                flash_client.validate_flash().await
-                    .map_err(|e| OrchestratorError::FlashFailed {
+                flash_client.validate_flash().await.map_err(|e| {
+                    OrchestratorError::FlashFailed {
                         component: comp.clone(),
                         message: format!("validate: {e}"),
-                    })?;
+                    }
+                })?;
 
                 info!(component = %comp, "activating");
-                flash_client.activate_flash().await
-                    .map_err(|e| OrchestratorError::FlashFailed {
+                flash_client.activate_flash().await.map_err(|e| {
+                    OrchestratorError::FlashFailed {
                         component: comp.clone(),
                         message: format!("activate: {e}"),
-                    })?;
+                    }
+                })?;
             }
 
             info!(component = %comp, "staged — awaiting reset");
@@ -232,13 +284,16 @@ pub async fn reset_and_activate(
         FlashClient::for_sovd_sub_entity(server_url, gw, component_id)
     } else {
         FlashClient::for_sovd(server_url, component_id)
-    }.map_err(|e| OrchestratorError::Sovd {
+    }
+    .map_err(|e| OrchestratorError::Sovd {
         component: component_id.to_string(),
         message: format!("flash client: {e}"),
     })?;
 
     info!(component = %component_id, "resetting ECU");
-    flash_client.ecu_reset().await
+    flash_client
+        .ecu_reset()
+        .await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),
             message: format!("reset: {e}"),
