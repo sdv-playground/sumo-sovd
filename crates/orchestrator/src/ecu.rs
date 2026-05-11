@@ -92,11 +92,11 @@ pub async fn flash_ecu_to_staging(
     let gw = config.gateway_id.as_deref();
 
     // Classify the manifest
-    let update_type = match classify_manifest(&config.manifest, trust_anchor) {
-        Ok((ut, _)) => ut,
+    let (update_type, opaque_firmware) = match classify_manifest(&config.manifest, trust_anchor) {
+        Ok((ut, _)) => (ut, false),
         Err(_) => {
             debug!(component = %comp, "package is not a SUIT envelope — treating as opaque firmware");
-            UpdateType::Firmware
+            (UpdateType::Firmware, true)
         }
     };
     info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU flash (assumes already unlocked)");

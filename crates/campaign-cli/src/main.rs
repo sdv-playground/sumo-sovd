@@ -3,20 +3,18 @@
 //! Deploy an L1 campaign manifest (multi-ECU):
 //!   sumo-campaign deploy campaign.suit --server http://localhost:4000 \
 //!     --trust-anchor keys/signing.pub --gateway vehicle_gateway \
-//!     --sovd-ecus os1 --helper-url http://localhost:9100 --helper-token dev-secret-123
+//!     --sovd-ecus vm1 --helper-url http://localhost:9100 --helper-token dev-secret-123
 //!
 //! Flash a single L2 image manifest:
-//!   sumo-campaign flash os1 manifest.suit --server http://localhost:4000 \
+//!   sumo-campaign flash vm1 manifest.suit --server http://localhost:4000 \
 //!     --gateway vehicle_gateway --helper-url http://localhost:9100 --helper-token dev-secret-123
 
 use std::process;
 
 use clap::{Parser, Subcommand};
-use tracing::{info, error};
+use tracing::{error, info};
 
-use sumo_sovd_orchestrator::campaign::{
-    CampaignConfig, CampaignOrchestrator, EcuTarget,
-};
+use sumo_sovd_orchestrator::campaign::{CampaignConfig, CampaignOrchestrator, EcuTarget};
 use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
 use sumo_sovd_orchestrator::targets::{parse_l1_campaign, MultiflashSpec};
 
@@ -25,7 +23,10 @@ use sumo_sovd_orchestrator::targets::{parse_l1_campaign, MultiflashSpec};
 // =============================================================================
 
 #[derive(Parser)]
-#[command(name = "sumo-campaign", about = "Deploy SUIT firmware campaigns via SOVD")]
+#[command(
+    name = "sumo-campaign",
+    about = "Deploy SUIT firmware campaigns via SOVD"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -154,11 +155,15 @@ async fn main() {
 
     let orchestrator = CampaignOrchestrator::new(CampaignConfig {
         server_url: cli.server,
-        trust_anchor: cli.trust_anchor.as_ref()
-            .map(|p| std::fs::read(p).unwrap_or_else(|e| {
-                eprintln!("error: read trust anchor {p}: {e}");
-                process::exit(1);
-            }))
+        trust_anchor: cli
+            .trust_anchor
+            .as_ref()
+            .map(|p| {
+                std::fs::read(p).unwrap_or_else(|e| {
+                    eprintln!("error: read trust anchor {p}: {e}");
+                    process::exit(1);
+                })
+            })
             .unwrap_or_default(),
         security_level: cli.security_level,
         security_helper: SecurityHelperConfig {
@@ -169,18 +174,46 @@ async fn main() {
     });
 
     let result = match cli.command {
-        Command::Deploy { manifest, sovd_ecus, no_commit, rollback } => {
-            run_deploy(&orchestrator, &manifest, cli.trust_anchor.as_deref(),
-                       cli.gateway, &sovd_ecus, no_commit, rollback).await
+        Command::Deploy {
+            manifest,
+            sovd_ecus,
+            no_commit,
+            rollback,
+        } => {
+            run_deploy(
+                &orchestrator,
+                &manifest,
+                cli.trust_anchor.as_deref(),
+                cli.gateway,
+                &sovd_ecus,
+                no_commit,
+                rollback,
+            )
+            .await
         }
-        Command::Flash { component_id, manifest, payload, no_commit, rollback } => {
-            run_flash(&orchestrator, &component_id, &manifest, &payload,
-                      cli.gateway, no_commit, rollback).await
+        Command::Flash {
+            component_id,
+            manifest,
+            payload,
+            no_commit,
+            rollback,
+        } => {
+            run_flash(
+                &orchestrator,
+                &component_id,
+                &manifest,
+                &payload,
+                cli.gateway,
+                no_commit,
+                rollback,
+            )
+            .await
         }
-        Command::Multiflash { config, no_commit, rollback } => {
-            run_multiflash(&orchestrator, &config, cli.gateway,
-                           no_commit, rollback).await
-        }
+        Command::Multiflash {
+            config,
+            no_commit,
+            rollback,
+        } => run_multiflash(&orchestrator, &config, cli.gateway, no_commit, rollback).await,
     };
 
     if let Err(e) = result {
@@ -198,13 +231,12 @@ async fn run_deploy(
     no_commit: bool,
     rollback: bool,
 ) -> Result<(), String> {
-    let trust_anchor_path = trust_anchor_path
-        .ok_or("--trust-anchor required for deploy")?;
-    let trust_anchor = std::fs::read(trust_anchor_path)
-        .map_err(|e| format!("read trust anchor: {e}"))?;
+    let trust_anchor_path = trust_anchor_path.ok_or("--trust-anchor required for deploy")?;
+    let trust_anchor =
+        std::fs::read(trust_anchor_path).map_err(|e| format!("read trust anchor: {e}"))?;
 
-    let envelope = std::fs::read(manifest_path)
-        .map_err(|e| format!("read {manifest_path}: {e}"))?;
+    let envelope =
+        std::fs::read(manifest_path).map_err(|e| format!("read {manifest_path}: {e}"))?;
 
     info!("parsing L1 campaign from {manifest_path}");
     let targets = parse_l1_campaign(&envelope, &trust_anchor, gateway, sovd_ecus)
@@ -212,11 +244,18 @@ async fn run_deploy(
 
     info!("campaign has {} target(s):", targets.len());
     for t in &targets {
-        info!("  {} ({}B manifest, {} payloads)", t.component_id, t.manifest.len(), t.payloads.len());
+        info!(
+            "  {} ({}B manifest, {} payloads)",
+            t.component_id,
+            t.manifest.len(),
+            t.payloads.len()
+        );
     }
 
     info!("flashing all ECUs...");
-    let phase = orchestrator.flash_all(targets).await
+    let phase = orchestrator
+        .flash_all(targets)
+        .await
         .map_err(|e| format!("flash failed: {e}"))?;
 
     for ecu in &phase.ecus {
@@ -230,12 +269,16 @@ async fn run_deploy(
 
     if rollback {
         info!("rolling back...");
-        orchestrator.rollback_all(&phase.ecus).await
+        orchestrator
+            .rollback_all(&phase.ecus)
+            .await
             .map_err(|e| format!("rollback failed: {e}"))?;
         info!("rollback complete");
     } else {
         info!("committing...");
-        orchestrator.commit_all(&phase.ecus).await
+        orchestrator
+            .commit_all(&phase.ecus)
+            .await
             .map_err(|e| format!("commit failed: {e}"))?;
         info!("campaign committed successfully");
     }
@@ -252,28 +295,33 @@ async fn run_flash(
     no_commit: bool,
     rollback: bool,
 ) -> Result<(), String> {
-    let manifest = std::fs::read(manifest_path)
-        .map_err(|e| format!("read {manifest_path}: {e}"))?;
+    let manifest =
+        std::fs::read(manifest_path).map_err(|e| format!("read {manifest_path}: {e}"))?;
 
     // Parse payload args: "URI=path" pairs (order matters — must match manifest components)
     let mut payloads = Vec::new();
     for arg in payload_args {
-        let (uri, path) = arg.split_once('=')
+        let (uri, path) = arg
+            .split_once('=')
             .ok_or_else(|| format!("invalid --payload: {arg} (expected URI=path)"))?;
         payloads.push((uri.to_string(), std::path::PathBuf::from(path)));
     }
 
     info!(
         "flashing {component_id} with {manifest_path} ({}B manifest, {} payloads)",
-        manifest.len(), payloads.len()
+        manifest.len(),
+        payloads.len()
     );
 
-    let phase = orchestrator.flash_all(vec![EcuTarget {
-        component_id: component_id.into(),
-        gateway_id: gateway,
-        manifest,
-        payloads,
-    }]).await.map_err(|e| format!("flash failed: {e}"))?;
+    let phase = orchestrator
+        .flash_all(vec![EcuTarget {
+            component_id: component_id.into(),
+            gateway_id: gateway,
+            manifest,
+            payloads,
+        }])
+        .await
+        .map_err(|e| format!("flash failed: {e}"))?;
 
     for ecu in &phase.ecus {
         info!("  {} → {:?}", ecu.component_id, ecu.state);
@@ -286,12 +334,16 @@ async fn run_flash(
 
     if rollback {
         info!("rolling back {component_id}...");
-        orchestrator.rollback_all(&phase.ecus).await
+        orchestrator
+            .rollback_all(&phase.ecus)
+            .await
             .map_err(|e| format!("rollback failed: {e}"))?;
         info!("rollback complete");
     } else {
         info!("committing {component_id}...");
-        orchestrator.commit_all(&phase.ecus).await
+        orchestrator
+            .commit_all(&phase.ecus)
+            .await
             .map_err(|e| format!("commit failed: {e}"))?;
         info!("{component_id} committed");
     }
@@ -306,10 +358,10 @@ async fn run_multiflash(
     no_commit: bool,
     rollback: bool,
 ) -> Result<(), String> {
-    let config_bytes = std::fs::read(config_path)
-        .map_err(|e| format!("read {config_path}: {e}"))?;
-    let spec: MultiflashSpec = serde_json::from_slice(&config_bytes)
-        .map_err(|e| format!("parse {config_path}: {e}"))?;
+    let config_bytes =
+        std::fs::read(config_path).map_err(|e| format!("read {config_path}: {e}"))?;
+    let spec: MultiflashSpec =
+        serde_json::from_slice(&config_bytes).map_err(|e| format!("parse {config_path}: {e}"))?;
 
     if spec.ecus.is_empty() {
         return Err("multiflash spec has no ECUs".into());
@@ -328,7 +380,9 @@ async fn run_multiflash(
     }
 
     info!("flashing {} ECUs in one campaign...", targets.len());
-    let phase = orchestrator.flash_all(targets).await
+    let phase = orchestrator
+        .flash_all(targets)
+        .await
         .map_err(|e| format!("flash failed: {e}"))?;
 
     for ecu in &phase.ecus {
@@ -342,12 +396,16 @@ async fn run_multiflash(
 
     if rollback {
         info!("rolling back...");
-        orchestrator.rollback_all(&phase.ecus).await
+        orchestrator
+            .rollback_all(&phase.ecus)
+            .await
             .map_err(|e| format!("rollback failed: {e}"))?;
         info!("rollback complete");
     } else {
         info!("committing...");
-        orchestrator.commit_all(&phase.ecus).await
+        orchestrator
+            .commit_all(&phase.ecus)
+            .await
             .map_err(|e| format!("commit failed: {e}"))?;
         info!("campaign committed successfully");
     }
