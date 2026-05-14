@@ -5,12 +5,60 @@
 //!           (reset is a campaign-level decision, not per-ECU)
 //! Policy:   session → security → upload → apply (immediate, no trial)
 
-use sovd_client::flash::FlashClient;
+use sovd_client::flash::{FlashClient, FlashError, StartFlashResponse};
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
 use tracing::{debug, info};
 
 use crate::error::OrchestratorError;
+
+/// Start a flash session, auto-rolling-back any pending trial first.
+///
+/// The vm-mgr backend refuses `start_flash` while the bank set is in
+/// trial mode (uncommitted), to keep the state machine consistent — a
+/// new upgrade would otherwise clobber the in-trial bank. When the
+/// orchestrator sees the resulting server error containing "trial
+/// mode" in the body, we treat it as "the previous trial wasn't
+/// committed; abort it and start fresh" and retry once. Any other
+/// error propagates.
+///
+/// Match by message content, not status code: the server error round-
+/// trips through Machine-adapter as `PolicyRejected` and lands as
+/// HTTP 400 "bad_request" rather than the 409 you'd expect for a
+/// Busy semantic, so the only stable signal is the message text.
+async fn start_flash_or_rollback_pending(
+    flash_client: &FlashClient,
+    comp: &str,
+) -> Result<StartFlashResponse, OrchestratorError> {
+    match flash_client.start_flash().await {
+        Ok(t) => Ok(t),
+        Err(FlashError::Server { ref message, .. }) if message.contains("trial mode") => {
+            tracing::info!(
+                component = %comp,
+                detail = %message,
+                "previous upgrade still in trial — auto-rolling back before new flash"
+            );
+            flash_client
+                .rollback_flash()
+                .await
+                .map_err(|e| OrchestratorError::FlashFailed {
+                    component: comp.to_string(),
+                    message: format!("auto-rollback of pending trial: {e}"),
+                })?;
+            flash_client
+                .start_flash()
+                .await
+                .map_err(|e| OrchestratorError::FlashFailed {
+                    component: comp.to_string(),
+                    message: format!("start flash after rollback: {e}"),
+                })
+        }
+        Err(e) => Err(OrchestratorError::FlashFailed {
+            component: comp.to_string(),
+            message: format!("start flash: {e}"),
+        }),
+    }
+}
 
 /// Configuration for a single ECU update.
 ///
@@ -139,25 +187,12 @@ pub async fn flash_ecu_to_staging(
             })?;
 
         info!(component = %comp, "starting flash session");
-        flash_client
-            .start_flash()
-            .await
-            .map_err(|e| OrchestratorError::FlashFailed {
-                component: comp.clone(),
-                message: format!("start flash: {e}"),
-            })?
+        start_flash_or_rollback_pending(&flash_client, comp).await?
     } else {
         // SUIT-backed vm-mgr ECUs accept the classic flow: open transfer first,
         // then upload the manifest and any detached payloads into that session.
         info!(component = %comp, "starting flash session");
-        let transfer =
-            flash_client
-                .start_flash()
-                .await
-                .map_err(|e| OrchestratorError::FlashFailed {
-                    component: comp.clone(),
-                    message: format!("start flash: {e}"),
-                })?;
+        let transfer = start_flash_or_rollback_pending(&flash_client, comp).await?;
 
         info!(component = %comp, size = config.manifest.len(), "uploading manifest");
         let manifest_started = std::time::Instant::now();
