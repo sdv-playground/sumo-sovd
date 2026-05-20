@@ -77,6 +77,10 @@ enum Command {
         #[arg(long)]
         no_commit: bool,
 
+        /// Stop after staging, before ECU reset/activation
+        #[arg(long)]
+        staging_only: bool,
+
         /// Rollback after flash instead of committing
         #[arg(long)]
         rollback: bool,
@@ -97,6 +101,10 @@ enum Command {
         /// Don't commit after flash
         #[arg(long)]
         no_commit: bool,
+
+        /// Stop after staging, before ECU reset/activation
+        #[arg(long)]
+        staging_only: bool,
 
         /// Rollback after flash
         #[arg(long)]
@@ -131,6 +139,10 @@ enum Command {
         /// Don't commit after flash
         #[arg(long)]
         no_commit: bool,
+
+        /// Stop after staging, before ECU reset/activation
+        #[arg(long)]
+        staging_only: bool,
 
         /// Rollback after flash
         #[arg(long)]
@@ -178,6 +190,7 @@ async fn main() {
             manifest,
             sovd_ecus,
             no_commit,
+            staging_only,
             rollback,
         } => {
             run_deploy(
@@ -187,6 +200,7 @@ async fn main() {
                 cli.gateway,
                 &sovd_ecus,
                 no_commit,
+                staging_only,
                 rollback,
             )
             .await
@@ -196,6 +210,7 @@ async fn main() {
             manifest,
             payload,
             no_commit,
+            staging_only,
             rollback,
         } => {
             run_flash(
@@ -205,6 +220,7 @@ async fn main() {
                 &payload,
                 cli.gateway,
                 no_commit,
+                staging_only,
                 rollback,
             )
             .await
@@ -212,8 +228,19 @@ async fn main() {
         Command::Multiflash {
             config,
             no_commit,
+            staging_only,
             rollback,
-        } => run_multiflash(&orchestrator, &config, cli.gateway, no_commit, rollback).await,
+        } => {
+            run_multiflash(
+                &orchestrator,
+                &config,
+                cli.gateway,
+                no_commit,
+                staging_only,
+                rollback,
+            )
+            .await
+        }
     };
 
     if let Err(e) = result {
@@ -229,6 +256,7 @@ async fn run_deploy(
     gateway: Option<String>,
     sovd_ecus: &[String],
     no_commit: bool,
+    staging_only: bool,
     rollback: bool,
 ) -> Result<(), String> {
     let trust_anchor_path = trust_anchor_path.ok_or("--trust-anchor required for deploy")?;
@@ -250,6 +278,21 @@ async fn run_deploy(
             t.manifest.len(),
             t.payloads.len()
         );
+    }
+
+    if staging_only {
+        info!("staging all ECUs (--staging-only)...");
+        let phase = orchestrator
+            .stage_all(targets)
+            .await
+            .map_err(|e| format!("stage failed: {e}"))?;
+
+        for ecu in &phase.ecus {
+            info!("  {} → {:?}", ecu.component_id, ecu.state);
+        }
+
+        info!("ECUs staged (--staging-only). Reset/activation/commit skipped.");
+        return Ok(());
     }
 
     info!("flashing all ECUs...");
@@ -293,6 +336,7 @@ async fn run_flash(
     payload_args: &[String],
     gateway: Option<String>,
     no_commit: bool,
+    staging_only: bool,
     rollback: bool,
 ) -> Result<(), String> {
     let manifest =
@@ -313,13 +357,29 @@ async fn run_flash(
         payloads.len()
     );
 
+    let targets = vec![EcuTarget {
+        component_id: component_id.into(),
+        gateway_id: gateway,
+        manifest,
+        payloads,
+    }];
+
+    if staging_only {
+        let phase = orchestrator
+            .stage_all(targets)
+            .await
+            .map_err(|e| format!("stage failed: {e}"))?;
+
+        for ecu in &phase.ecus {
+            info!("  {} → {:?}", ecu.component_id, ecu.state);
+        }
+
+        info!("{component_id} staged (--staging-only). Reset/activation/commit skipped.");
+        return Ok(());
+    }
+
     let phase = orchestrator
-        .flash_all(vec![EcuTarget {
-            component_id: component_id.into(),
-            gateway_id: gateway,
-            manifest,
-            payloads,
-        }])
+        .flash_all(targets)
         .await
         .map_err(|e| format!("flash failed: {e}"))?;
 
@@ -356,6 +416,7 @@ async fn run_multiflash(
     config_path: &str,
     gateway: Option<String>,
     no_commit: bool,
+    staging_only: bool,
     rollback: bool,
 ) -> Result<(), String> {
     let config_bytes =
@@ -377,6 +438,24 @@ async fn run_multiflash(
             t.manifest.len(),
             t.payloads.len()
         );
+    }
+
+    if staging_only {
+        info!(
+            "staging {} ECUs in one campaign (--staging-only)...",
+            targets.len()
+        );
+        let phase = orchestrator
+            .stage_all(targets)
+            .await
+            .map_err(|e| format!("stage failed: {e}"))?;
+
+        for ecu in &phase.ecus {
+            info!("  {} → {:?}", ecu.component_id, ecu.state);
+        }
+
+        info!("ECUs staged (--staging-only). Reset/activation/commit skipped.");
+        return Ok(());
     }
 
     info!("flashing {} ECUs in one campaign...", targets.len());
