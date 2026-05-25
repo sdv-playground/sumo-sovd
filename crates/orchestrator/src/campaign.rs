@@ -245,7 +245,16 @@ impl CampaignOrchestrator {
         for (comp, gw) in to_reset {
             let url = server_url.clone();
             set.spawn(async move {
-                let result = ecu::reset_and_activate(&url, &comp, gw.as_deref(), 60).await;
+                // 180s budget covers managed-cvc's worst-case
+                // reset → activate cycle:
+                //   - up to 60s for vm-service graceful shutdown (Linux
+                //     systemd shutdown can take 5-30s; conservative cap)
+                //   - up to 35s for IVD verify of a 600 MB rootfs
+                //   - cold-boot Linux + first-time vhsm-daemon ENROLL_ASSISTED
+                //     (adds ~5s of upstream round-trips)
+                // Was 60s; observed timeouts on the first OTA cycle for
+                // a new vm_id where ENROLL extends the boot path.
+                let result = ecu::reset_and_activate(&url, &comp, gw.as_deref(), 180).await;
                 (comp, result)
             });
         }
