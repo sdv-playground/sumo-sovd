@@ -11,13 +11,13 @@
 //! 4. Commit all or rollback all
 
 use async_trait::async_trait;
+use sovd_client::flash::FlashClient;
+use sovd_client::SovdClient;
 use sumo_codec::commands::CommandValue;
 use sumo_codec::labels::*;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
-use sovd_client::flash::FlashClient;
-use sovd_client::SovdClient;
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 use crate::ecu::{self, EcuFlashConfig, UpdateType};
 use crate::error::OrchestratorError;
@@ -51,8 +51,8 @@ pub struct EcuStatus {
 pub enum EcuState {
     Pending,
     Flashing,
-    Staged,     // AwaitingReboot — flash done, waiting for reset
-    Activated,  // Trial mode — reset done, running new firmware
+    Staged,    // AwaitingReboot — flash done, waiting for reset
+    Activated, // Trial mode — reset done, running new firmware
     Committed,
     RolledBack,
     Failed,
@@ -173,7 +173,7 @@ impl CampaignOrchestrator {
                     statuses[i].update_type = result.update_type;
                     statuses[i].state = match result.update_type {
                         UpdateType::Firmware => EcuState::Staged,
-                        UpdateType::Policy => EcuState::Committed,
+                        UpdateType::Application | UpdateType::Policy => EcuState::Committed,
                     };
                     statuses[i].active_version = result.active_version;
                     statuses[i].previous_version = result.previous_version;
@@ -191,12 +191,15 @@ impl CampaignOrchestrator {
                     if !staged.is_empty() {
                         warn!(count = staged.len(), "rolling back staged ECUs");
                         for rc in &staged {
-                            let gw = statuses.iter()
+                            let gw = statuses
+                                .iter()
                                 .find(|s| &s.component_id == rc)
                                 .and_then(|s| s.gateway_id.as_deref());
                             match self.rollback_one(rc, gw).await {
                                 Ok(()) => {
-                                    if let Some(s) = statuses.iter_mut().find(|s| &s.component_id == rc) {
+                                    if let Some(s) =
+                                        statuses.iter_mut().find(|s| &s.component_id == rc)
+                                    {
                                         s.state = EcuState::RolledBack;
                                     }
                                 }
@@ -214,8 +217,15 @@ impl CampaignOrchestrator {
         }
 
         let fw_count = staged.len();
-        let policy_count = statuses.iter().filter(|e| e.update_type == UpdateType::Policy).count();
-        info!(firmware = fw_count, policy = policy_count, "stage phase complete — all ECUs awaiting reset");
+        let immediate_count = statuses
+            .iter()
+            .filter(|e| matches!(e.update_type, UpdateType::Application | UpdateType::Policy))
+            .count();
+        info!(
+            firmware = fw_count,
+            immediate = immediate_count,
+            "stage phase complete"
+        );
 
         Ok(StagePhaseResult { ecus: statuses })
     }
@@ -238,7 +248,10 @@ impl CampaignOrchestrator {
             return Ok(());
         }
 
-        info!(ecus = to_reset.len(), "resetting all staged ECUs (parallel)");
+        info!(
+            ecus = to_reset.len(),
+            "resetting all staged ECUs (parallel)"
+        );
 
         let server_url = self.config.server_url.clone();
         let mut set = tokio::task::JoinSet::new();
@@ -280,9 +293,9 @@ impl CampaignOrchestrator {
                 Err(join_err) => {
                     error!(error = %join_err, "ECU activation task panicked");
                     if first_err.is_none() {
-                        first_err = Some(OrchestratorError::Internal(
-                            format!("task panic: {join_err}"),
-                        ));
+                        first_err = Some(OrchestratorError::Internal(format!(
+                            "task panic: {join_err}"
+                        )));
                     }
                 }
             }
@@ -321,7 +334,8 @@ impl CampaignOrchestrator {
 
         for ecu in &to_commit {
             info!(component = %ecu.component_id, "committing");
-            self.commit_one(&ecu.component_id, ecu.gateway_id.as_deref()).await?;
+            self.commit_one(&ecu.component_id, ecu.gateway_id.as_deref())
+                .await?;
         }
 
         info!("campaign committed");
@@ -339,7 +353,10 @@ impl CampaignOrchestrator {
 
         for ecu in &to_rollback {
             warn!(component = %ecu.component_id, "rolling back");
-            match self.rollback_one(&ecu.component_id, ecu.gateway_id.as_deref()).await {
+            match self
+                .rollback_one(&ecu.component_id, ecu.gateway_id.as_deref())
+                .await
+            {
                 Ok(()) => info!(component = %ecu.component_id, "rolled back"),
                 Err(e) => error!(component = %ecu.component_id, error = %e, "rollback failed"),
             }
@@ -368,13 +385,21 @@ impl CampaignOrchestrator {
             .map_err(|e| OrchestratorError::Manifest(format!("{e:?}")))?;
 
         if !manifest.is_campaign() {
-            return Err(OrchestratorError::Manifest("not a campaign manifest".into()));
+            return Err(OrchestratorError::Manifest(
+                "not a campaign manifest".into(),
+            ));
         }
 
         // Read install sequence to determine ECU ordering
         let envelope = manifest.envelope();
-        let install_seq = envelope.manifest.severable.install.as_ref()
-            .ok_or_else(|| OrchestratorError::Manifest("campaign has no install sequence".into()))?;
+        let install_seq = envelope
+            .manifest
+            .severable
+            .install
+            .as_ref()
+            .ok_or_else(|| {
+                OrchestratorError::Manifest("campaign has no install sequence".into())
+            })?;
 
         // Extract component indices from install sequence's process-dependency directives
         let mut dep_indices: Vec<usize> = Vec::new();
@@ -395,7 +420,8 @@ impl CampaignOrchestrator {
             dependencies = dep_indices.len(),
             has_validate = envelope.manifest.validate.is_some(),
             has_invoke = envelope.manifest.invoke.is_some(),
-            "campaign: install sequence declares {} ECUs", dep_indices.len()
+            "campaign: install sequence declares {} ECUs",
+            dep_indices.len()
         );
 
         // Resolve each dependency into an EcuTarget
@@ -406,8 +432,11 @@ impl CampaignOrchestrator {
             })?;
 
             let l2_envelope = if dep_uri.starts_with('#') {
-                manifest.integrated_payload(dep_uri)
-                    .ok_or_else(|| OrchestratorError::Manifest(format!("payload not found: {dep_uri}")))?
+                manifest
+                    .integrated_payload(dep_uri)
+                    .ok_or_else(|| {
+                        OrchestratorError::Manifest(format!("payload not found: {dep_uri}"))
+                    })?
                     .to_vec()
             } else {
                 resolver.fetch_manifest(dep_uri).await?
@@ -421,7 +450,9 @@ impl CampaignOrchestrator {
                 .component_id(0)
                 .and_then(|segs| segs.last())
                 .and_then(|s| std::str::from_utf8(s).ok())
-                .ok_or_else(|| OrchestratorError::Manifest(format!("L2 dep {dep_idx}: no component ID")))?
+                .ok_or_else(|| {
+                    OrchestratorError::Manifest(format!("L2 dep {dep_idx}: no component ID"))
+                })?
                 .to_string();
 
             let package = resolver
@@ -440,7 +471,11 @@ impl CampaignOrchestrator {
         self.flash_all(targets).await
     }
 
-    fn make_flash_client(&self, component_id: &str, gateway_id: Option<&str>) -> Result<FlashClient, OrchestratorError> {
+    fn make_flash_client(
+        &self,
+        component_id: &str,
+        gateway_id: Option<&str>,
+    ) -> Result<FlashClient, OrchestratorError> {
         let client = if let Some(gw) = gateway_id {
             FlashClient::for_sovd_sub_entity(&self.config.server_url, gw, component_id)
         } else {
@@ -458,9 +493,13 @@ impl CampaignOrchestrator {
     /// reset (ISO 14229 resets session/security to default — needed
     /// before commit/rollback). The ECU module never touches session
     /// or security state itself; that's an orchestrator concern.
-    async fn unlock_for_flash(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
-        let client = SovdClient::new(&self.config.server_url)
-            .map_err(|e| OrchestratorError::Sovd {
+    async fn unlock_for_flash(
+        &self,
+        component_id: &str,
+        gateway_id: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
+        let client =
+            SovdClient::new(&self.config.server_url).map_err(|e| OrchestratorError::Sovd {
                 component: component_id.to_string(),
                 message: format!("{e}"),
             })?;
@@ -472,14 +511,18 @@ impl CampaignOrchestrator {
         };
 
         // Session → programming
-        client.set_mode_targeted(
-            mode_component, "session",
-            serde_json::json!({"value": "programming"}),
-            mode_target,
-        ).await.map_err(|e| OrchestratorError::Sovd {
-            component: component_id.to_string(),
-            message: format!("set_session: {e}"),
-        })?;
+        client
+            .set_mode_targeted(
+                mode_component,
+                "session",
+                serde_json::json!({"value": "programming"}),
+                mode_target,
+            )
+            .await
+            .map_err(|e| OrchestratorError::Sovd {
+                component: component_id.to_string(),
+                message: format!("set_session: {e}"),
+            })?;
 
         // Security unlock
         let seed_resp = client.set_mode_targeted(
@@ -518,23 +561,39 @@ impl CampaignOrchestrator {
         Ok(())
     }
 
-    async fn commit_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+    async fn commit_one(
+        &self,
+        component_id: &str,
+        gateway_id: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
         // Re-establish access (ECU reset clears session per ISO 14229)
         self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
-        flash_client.commit_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
-            component: component_id.to_string(),
-            message: format!("commit: {e}"),
-        })
+        flash_client
+            .commit_flash()
+            .await
+            .map(|_| ())
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: component_id.to_string(),
+                message: format!("commit: {e}"),
+            })
     }
 
-    async fn rollback_one(&self, component_id: &str, gateway_id: Option<&str>) -> Result<(), OrchestratorError> {
+    async fn rollback_one(
+        &self,
+        component_id: &str,
+        gateway_id: Option<&str>,
+    ) -> Result<(), OrchestratorError> {
         self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
-        flash_client.rollback_flash().await.map(|_| ()).map_err(|e| OrchestratorError::FlashFailed {
-            component: component_id.to_string(),
-            message: format!("rollback: {e}"),
-        })
+        flash_client
+            .rollback_flash()
+            .await
+            .map(|_| ())
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: component_id.to_string(),
+                message: format!("rollback: {e}"),
+            })
     }
 }
 

@@ -16,7 +16,7 @@ use tracing::{error, info};
 
 use sumo_sovd_orchestrator::campaign::{CampaignConfig, CampaignOrchestrator, EcuTarget};
 use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
-use sumo_sovd_orchestrator::targets::{parse_l1_campaign, MultiflashSpec};
+use sumo_sovd_orchestrator::targets::{parse_l1_campaign_with_payloads, MultiflashSpec};
 
 // =============================================================================
 // CLI
@@ -72,6 +72,10 @@ enum Command {
         /// ECU IDs that accept SUIT envelopes (vm-mgr ECUs). Others get raw firmware extracted from L2.
         #[arg(long, value_delimiter = ',')]
         sovd_ecus: Vec<String>,
+
+        /// Detached payload files: "URI=path" (repeatable, e.g., "#container-image"=image.tar.gz)
+        #[arg(long, short)]
+        payload: Vec<String>,
 
         /// Don't commit after flash — leave ECUs in trial mode
         #[arg(long)]
@@ -189,6 +193,7 @@ async fn main() {
         Command::Deploy {
             manifest,
             sovd_ecus,
+            payload,
             no_commit,
             staging_only,
             rollback,
@@ -199,6 +204,7 @@ async fn main() {
                 cli.trust_anchor.as_deref(),
                 cli.gateway,
                 &sovd_ecus,
+                &payload,
                 no_commit,
                 staging_only,
                 rollback,
@@ -255,6 +261,7 @@ async fn run_deploy(
     trust_anchor_path: Option<&str>,
     gateway: Option<String>,
     sovd_ecus: &[String],
+    payload_args: &[String],
     no_commit: bool,
     staging_only: bool,
     rollback: bool,
@@ -265,10 +272,12 @@ async fn run_deploy(
 
     let envelope =
         std::fs::read(manifest_path).map_err(|e| format!("read {manifest_path}: {e}"))?;
+    let payloads = parse_payload_args(payload_args)?;
 
     info!("parsing L1 campaign from {manifest_path}");
-    let targets = parse_l1_campaign(&envelope, &trust_anchor, gateway, sovd_ecus)
-        .map_err(|e| format!("{e}"))?;
+    let targets =
+        parse_l1_campaign_with_payloads(&envelope, &trust_anchor, gateway, sovd_ecus, &payloads)
+            .map_err(|e| format!("{e}"))?;
 
     info!("campaign has {} target(s):", targets.len());
     for t in &targets {
@@ -342,14 +351,7 @@ async fn run_flash(
     let manifest =
         std::fs::read(manifest_path).map_err(|e| format!("read {manifest_path}: {e}"))?;
 
-    // Parse payload args: "URI=path" pairs (order matters — must match manifest components)
-    let mut payloads = Vec::new();
-    for arg in payload_args {
-        let (uri, path) = arg
-            .split_once('=')
-            .ok_or_else(|| format!("invalid --payload: {arg} (expected URI=path)"))?;
-        payloads.push((uri.to_string(), std::path::PathBuf::from(path)));
-    }
+    let payloads = parse_payload_args(payload_args)?;
 
     info!(
         "flashing {component_id} with {manifest_path} ({}B manifest, {} payloads)",
@@ -409,6 +411,19 @@ async fn run_flash(
     }
 
     Ok(())
+}
+
+fn parse_payload_args(
+    payload_args: &[String],
+) -> Result<Vec<(String, std::path::PathBuf)>, String> {
+    let mut payloads = Vec::new();
+    for arg in payload_args {
+        let (uri, path) = arg
+            .split_once('=')
+            .ok_or_else(|| format!("invalid --payload: {arg} (expected URI=path)"))?;
+        payloads.push((uri.to_string(), std::path::PathBuf::from(path)));
+    }
+    Ok(payloads)
 }
 
 async fn run_multiflash(

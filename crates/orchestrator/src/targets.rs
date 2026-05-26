@@ -14,6 +14,7 @@
 
 use serde::Deserialize;
 use sumo_crypto::RustCryptoBackend;
+use sumo_onboard::Manifest;
 use sumo_onboard::Validator;
 
 use crate::campaign::EcuTarget;
@@ -42,6 +43,18 @@ pub fn parse_l1_campaign(
     trust_anchor: &[u8],
     gateway_id: Option<String>,
     sovd_ecus: &[String],
+) -> Result<Vec<EcuTarget>, OrchestratorError> {
+    parse_l1_campaign_with_payloads(envelope, trust_anchor, gateway_id, sovd_ecus, &[])
+}
+
+/// Parse a signed L1 campaign envelope and attach explicit detached payload files
+/// to SOVD-backed targets whose L2 manifests reference matching payload URIs.
+pub fn parse_l1_campaign_with_payloads(
+    envelope: &[u8],
+    trust_anchor: &[u8],
+    gateway_id: Option<String>,
+    sovd_ecus: &[String],
+    detached_payloads: &[(String, std::path::PathBuf)],
 ) -> Result<Vec<EcuTarget>, OrchestratorError> {
     let crypto = RustCryptoBackend::new();
     let validator = Validator::new(trust_anchor, None);
@@ -79,9 +92,7 @@ pub fn parse_l1_campaign(
 
         let l2_manifest = validator
             .validate_envelope(&l2_envelope, &crypto, 0)
-            .map_err(|e| {
-                OrchestratorError::Manifest(format!("validate L2 dep {i}: {e:?}"))
-            })?;
+            .map_err(|e| OrchestratorError::Manifest(format!("validate L2 dep {i}: {e:?}")))?;
 
         // SUIT manifests for our ECUs use ["<ecu>", "<sub>"]
         // (e.g. ["vm1", "kernel"]) — first segment is the ECU id.
@@ -89,12 +100,11 @@ pub fn parse_l1_campaign(
             .component_id(0)
             .and_then(|segs| segs.first())
             .and_then(|s| std::str::from_utf8(s).ok())
-            .ok_or_else(|| {
-                OrchestratorError::Manifest(format!("L2 dep {i}: no component ID"))
-            })?
+            .ok_or_else(|| OrchestratorError::Manifest(format!("L2 dep {i}: no component ID")))?
             .to_string();
 
-        let package = if sovd_ecus.iter().any(|e| e == &component_id) {
+        let is_sovd_ecu = sovd_ecus.iter().any(|e| e == &component_id);
+        let package = if is_sovd_ecu {
             l2_envelope
         } else {
             l2_manifest
@@ -106,16 +116,39 @@ pub fn parse_l1_campaign(
                 })?
                 .to_vec()
         };
+        let payloads = if is_sovd_ecu {
+            detached_payloads_for_manifest(&l2_manifest, detached_payloads)
+        } else {
+            Vec::new()
+        };
 
         targets.push(EcuTarget {
             component_id,
             gateway_id: gateway_id.clone(),
             manifest: package,
-            payloads: Vec::new(),
+            payloads,
         });
     }
 
     Ok(targets)
+}
+
+fn detached_payloads_for_manifest(
+    manifest: &Manifest,
+    detached_payloads: &[(String, std::path::PathBuf)],
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut payloads = Vec::new();
+    for component in 0..manifest.component_count() {
+        if let Some(uri) = manifest.uri(component) {
+            if let Some((_, path)) = detached_payloads
+                .iter()
+                .find(|(candidate, _)| candidate == uri)
+            {
+                payloads.push((uri.to_string(), path.clone()));
+            }
+        }
+    }
+    payloads
 }
 
 // ---------------------------------------------------------------------------
@@ -146,10 +179,7 @@ impl MultiflashSpec {
     /// flash logic streams them at upload time).
     ///
     /// `gateway_id` is stamped onto every target — campaign-level.
-    pub fn into_targets(
-        self,
-        gateway_id: Option<String>,
-    ) -> std::io::Result<Vec<EcuTarget>> {
+    pub fn into_targets(self, gateway_id: Option<String>) -> std::io::Result<Vec<EcuTarget>> {
         let mut targets = Vec::with_capacity(self.ecus.len());
         for ecu in self.ecus {
             let manifest = std::fs::read(&ecu.manifest)?;

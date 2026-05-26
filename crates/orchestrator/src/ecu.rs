@@ -89,6 +89,8 @@ pub struct EcuFlashConfig {
 pub enum UpdateType {
     /// Full firmware update — needs flash + reset + trial + commit
     Firmware,
+    /// Application/container update — needs upload + finalize, but no ECU reset/trial
+    Application,
     /// Policy-only (CRL, config) — applied immediately, no trial
     Policy,
 }
@@ -112,13 +114,24 @@ fn classify_manifest(
         .validate_envelope(envelope, &crypto, 0)
         .map_err(|e| OrchestratorError::Manifest(format!("{e:?}")))?;
 
-    let update_type = if manifest.has_install() || manifest.has_invoke() {
+    let update_type = if is_container_image_manifest(&manifest) {
+        UpdateType::Application
+    } else if manifest.has_install() || manifest.has_invoke() {
         UpdateType::Firmware
     } else {
         UpdateType::Policy
     };
 
     Ok((update_type, manifest))
+}
+
+fn is_container_image_manifest(manifest: &sumo_onboard::Manifest) -> bool {
+    manifest
+        .component_id(0)
+        .is_some_and(|segments| match segments {
+            [_, component, ..] => component.as_slice() == b"container_image",
+            _ => false,
+        })
 }
 
 /// Flash one ECU to staging — ends at AwaitingReboot for firmware updates.
@@ -243,7 +256,7 @@ pub async fn flash_ecu_to_staging(
     };
 
     match update_type {
-        UpdateType::Firmware => {
+        UpdateType::Firmware | UpdateType::Application => {
             // Flash → finalize → stop here (AwaitingReboot)
             flash_client
                 .poll_flash_complete_simple(&transfer.transfer_id)
@@ -262,7 +275,7 @@ pub async fn flash_ecu_to_staging(
                     message: format!("finalize: {e}"),
                 })?;
 
-            if config.use_validated_flow {
+            if update_type == UpdateType::Firmware && config.use_validated_flow {
                 // Drive lifecycle through Validated as a checkpoint —
                 // backend.validate() accepts AwaitingReboot and downshifts,
                 // backend.activate() then returns to AwaitingReboot. Useful
@@ -286,7 +299,13 @@ pub async fn flash_ecu_to_staging(
                 })?;
             }
 
-            info!(component = %comp, "staged — awaiting reset");
+            match update_type {
+                UpdateType::Firmware => info!(component = %comp, "staged — awaiting reset"),
+                UpdateType::Application => {
+                    info!(component = %comp, "application update applied (no reset needed)")
+                }
+                UpdateType::Policy => unreachable!("handled in separate match arm"),
+            }
         }
         UpdateType::Policy => {
             // Policy-only: applied on start_flash, nothing more to do
