@@ -334,16 +334,22 @@ pub async fn reset_and_activate(
     gateway_id: Option<&str>,
     timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
-    let flash_client = if let Some(gw) = gateway_id {
-        FlashClient::for_sovd_sub_entity(server_url, gw, component_id)
-    } else {
-        FlashClient::for_sovd(server_url, component_id)
-    }
-    .map_err(|e| OrchestratorError::Sovd {
-        component: component_id.to_string(),
-        message: format!("flash client: {e}"),
-    })?;
+    trigger_local_restart(server_url, component_id, gateway_id).await?;
+    wait_for_activation(server_url, component_id, gateway_id, timeout_secs).await
+}
 
+/// Trigger a per-component restart via the spec's `PUT
+/// components/{id}/status/restart`. Used by `reset_and_activate` for
+/// `ResetKind::Local` components and standalone callers.
+///
+/// Does NOT wait for activation — pair with `wait_for_activation` if you
+/// need the full lifecycle.
+pub async fn trigger_local_restart(
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+) -> Result<(), OrchestratorError> {
+    let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
     info!(component = %component_id, "resetting ECU");
     flash_client
         .ecu_reset()
@@ -352,7 +358,23 @@ pub async fn reset_and_activate(
             component: component_id.to_string(),
             message: format!("reset: {e}"),
         })?;
+    Ok(())
+}
 
+/// Poll `activation_state` until a component reports `activated` or
+/// `committed`, or until the timeout elapses. Returns `Ok(())` on
+/// success; `FlashFailed` if activation reaches `rolled_back`/`failed`;
+/// `Timeout` after `timeout_secs`.
+///
+/// Survives the ECU being unreachable during reboot — transient poll
+/// errors are logged at debug and retried.
+pub async fn wait_for_activation(
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(), OrchestratorError> {
+    let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
     info!(component = %component_id, "waiting for activation");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
@@ -387,4 +409,40 @@ pub async fn reset_and_activate(
             });
         }
     }
+}
+
+/// Read a component's `ActivationState` and return its declared reset_kind
+/// (defaults to `Local` if the server hasn't migrated to Phase 2 of the
+/// reset-kind work — pre-Phase-2 servers omit the field, sovd-client
+/// deserialises to `Local`).
+pub async fn fetch_reset_kind(
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+) -> Result<sovd_core::ResetKind, OrchestratorError> {
+    let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
+    let state = flash_client
+        .get_activation_state()
+        .await
+        .map_err(|e| OrchestratorError::Sovd {
+            component: component_id.to_string(),
+            message: format!("activation_state: {e}"),
+        })?;
+    Ok(state.reset_kind)
+}
+
+fn build_flash_client(
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+) -> Result<FlashClient, OrchestratorError> {
+    if let Some(gw) = gateway_id {
+        FlashClient::for_sovd_sub_entity(server_url, gw, component_id)
+    } else {
+        FlashClient::for_sovd(server_url, component_id)
+    }
+    .map_err(|e| OrchestratorError::Sovd {
+        component: component_id.to_string(),
+        message: format!("flash client: {e}"),
+    })
 }

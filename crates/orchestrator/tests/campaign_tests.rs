@@ -237,6 +237,7 @@ impl DiagnosticBackend for TestBackend {
             state: *self.flash_state.read(),
             active_version: Some("1.0.0".into()),
             previous_version: Some("0.9.0".into()),
+            reset_kind: sovd_core::ResetKind::Local,
         })
     }
 

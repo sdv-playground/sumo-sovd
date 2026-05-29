@@ -52,6 +52,10 @@ pub enum EcuState {
     Pending,
     Flashing,
     Staged,    // AwaitingReboot — flash done, waiting for reset
+    /// Flash finalised + an ECU-level restart has been issued for the
+    /// parent ECU (because at least one staged component declared
+    /// `reset_kind: requires_ecu_reset`). Polling for `Activated`.
+    AwaitingSystemReboot,
     Activated, // Trial mode — reset done, running new firmware
     Committed,
     RolledBack,
@@ -232,73 +236,128 @@ impl CampaignOrchestrator {
 
     /// Reset all staged ECUs and wait for activation (trial mode).
     ///
-    /// All resets fan out concurrently — components own their own
-    /// post-reset health gating via the `Verifying → Activated`
-    /// transition, so total wall-clock time is `max(activation)`,
-    /// not `sum(activation)`.
+    /// Per ISO 17978-3 §7.19 the orchestrator partitions the staged set
+    /// by `(parent_ECU, reset_kind)`:
+    ///
+    /// - `ResetKind::Local`   → `PUT components/{id}/status/restart` per
+    ///   component, fanned out in parallel.
+    /// - `ResetKind::RequiresEcuReset` → ONE `PUT {ecu-path}/status/restart`
+    ///   per affected parent ECU, then poll all `RequiresEcuReset`
+    ///   components in parallel. (M7 firmware via m7loader; host-OS IFS.)
+    ///
+    /// Components own their post-reset health gating via the
+    /// `Verifying → Activated` transition, so wall-clock time is
+    /// `max(activation)`, not `sum(activation)`.
     pub async fn reset_all(&self, ecus: &mut [EcuStatus]) -> Result<(), OrchestratorError> {
-        let to_reset: Vec<(String, Option<String>)> = ecus
+        // 1. Find staged components.
+        let staged: Vec<(String, Option<String>)> = ecus
             .iter()
             .filter(|e| e.state == EcuState::Staged)
             .map(|e| (e.component_id.clone(), e.gateway_id.clone()))
             .collect();
 
-        if to_reset.is_empty() {
+        if staged.is_empty() {
             info!("no ECUs need reset");
             return Ok(());
         }
 
-        info!(
-            ecus = to_reset.len(),
-            "resetting all staged ECUs (parallel)"
-        );
-
+        // 2. Fetch each staged component's declared reset_kind from
+        //    ActivationState (added to the wire in SOVDd 7245abc). Older
+        //    servers that omit the field deserialise to Local.
         let server_url = self.config.server_url.clone();
-        let mut set = tokio::task::JoinSet::new();
-        for (comp, gw) in to_reset {
-            let url = server_url.clone();
-            set.spawn(async move {
-                // 180s budget covers managed-cvc's worst-case
-                // reset → activate cycle:
-                //   - up to 60s for vm-service graceful shutdown (Linux
-                //     systemd shutdown can take 5-30s; conservative cap)
-                //   - up to 35s for IVD verify of a 600 MB rootfs
-                //   - cold-boot Linux + first-time vhsm-daemon ENROLL_ASSISTED
-                //     (adds ~5s of upstream round-trips)
-                // Was 60s; observed timeouts on the first OTA cycle for
-                // a new vm_id where ENROLL extends the boot path.
-                let result = ecu::reset_and_activate(&url, &comp, gw.as_deref(), 180).await;
-                (comp, result)
-            });
-        }
-
-        let mut first_err: Option<OrchestratorError> = None;
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok((comp, Ok(()))) => {
-                    if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
-                        s.state = EcuState::Activated;
-                    }
+        let mut local: Vec<(String, Option<String>)> = Vec::new();
+        let mut by_ecu: std::collections::BTreeMap<Option<String>, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (comp, gw) in &staged {
+            let kind = ecu::fetch_reset_kind(&server_url, comp, gw.as_deref()).await?;
+            match kind {
+                sovd_core::ResetKind::None | sovd_core::ResetKind::Local => {
+                    local.push((comp.clone(), gw.clone()));
                 }
-                Ok((comp, Err(e))) => {
-                    error!(component = %comp, error = %e, "ECU activation failed");
-                    if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
-                        s.state = EcuState::Failed;
-                        s.error = Some(format!("{e}"));
-                    }
-                    if first_err.is_none() {
-                        first_err = Some(e);
-                    }
-                }
-                Err(join_err) => {
-                    error!(error = %join_err, "ECU activation task panicked");
-                    if first_err.is_none() {
-                        first_err = Some(OrchestratorError::Internal(format!(
-                            "task panic: {join_err}"
-                        )));
-                    }
+                sovd_core::ResetKind::RequiresEcuReset => {
+                    by_ecu.entry(gw.clone()).or_default().push(comp.clone());
                 }
             }
+        }
+
+        info!(
+            local = local.len(),
+            requires_ecu_reset = by_ecu.values().map(|v| v.len()).sum::<usize>(),
+            ecus_to_reboot = by_ecu.len(),
+            "resetting all staged ECUs"
+        );
+
+        // 3. Local: existing concurrent per-component restart.
+        let mut first_err: Option<OrchestratorError> = None;
+        if !local.is_empty() {
+            let mut set = tokio::task::JoinSet::new();
+            for (comp, gw) in local {
+                let url = server_url.clone();
+                set.spawn(async move {
+                    // 180s budget covers managed-cvc's worst-case
+                    // per-VM reset → verify → Activated cycle.
+                    let result = ecu::reset_and_activate(&url, &comp, gw.as_deref(), 180).await;
+                    (comp, result)
+                });
+            }
+            collect_results(&mut set, ecus, EcuState::Activated, &mut first_err).await;
+        }
+
+        // 4. RequiresEcuReset: one entity-root restart per affected ECU,
+        //    then poll all RequiresEcuReset components in that ECU group
+        //    in parallel with a longer timeout (the host reboot + supernova
+        //    respawn + VMs auto-start typically takes ~120-180s on a CVC).
+        for (gateway_id, comps) in by_ecu {
+            // Mark affected components AwaitingSystemReboot so any
+            // observer of `EcuStatus` sees the intent before the host
+            // goes down.
+            for comp_id in &comps {
+                if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
+                    s.state = EcuState::AwaitingSystemReboot;
+                }
+            }
+            info!(
+                gateway = ?gateway_id,
+                components = ?comps,
+                "issuing ECU-level restart (coalesced for RequiresEcuReset)"
+            );
+            if let Err(e) = sovd_client::flash::system_restart(
+                &server_url,
+                gateway_id.as_deref(),
+                "hard",
+            )
+            .await
+            {
+                let err = OrchestratorError::FlashFailed {
+                    component: comps.first().cloned().unwrap_or_default(),
+                    message: format!("ECU restart: {e}"),
+                };
+                error!(error = %err, "ECU-level restart failed — staged components remain unactivated");
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+                // Mark all in this group as Failed so the campaign report is accurate.
+                for comp_id in &comps {
+                    if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
+                        s.state = EcuState::Failed;
+                        s.error = Some(format!("ECU restart failed: {e}"));
+                    }
+                }
+                continue;
+            }
+
+            // Poll all components in this ECU group concurrently.
+            let mut set = tokio::task::JoinSet::new();
+            for comp_id in comps {
+                let url = server_url.clone();
+                let gw = gateway_id.clone();
+                set.spawn(async move {
+                    let result =
+                        ecu::wait_for_activation(&url, &comp_id, gw.as_deref(), 300).await;
+                    (comp_id, result)
+                });
+            }
+            collect_results(&mut set, ecus, EcuState::Activated, &mut first_err).await;
         }
 
         if let Some(e) = first_err {
@@ -594,6 +653,44 @@ impl CampaignOrchestrator {
                 component: component_id.to_string(),
                 message: format!("rollback: {e}"),
             })
+    }
+}
+
+/// Drain a JoinSet of `(component_id, Result)` tuples produced by the
+/// reset_all parallel loops, updating each component's `EcuStatus` and
+/// surfacing the first error seen.
+async fn collect_results(
+    set: &mut tokio::task::JoinSet<(String, Result<(), OrchestratorError>)>,
+    ecus: &mut [EcuStatus],
+    on_success: EcuState,
+    first_err: &mut Option<OrchestratorError>,
+) {
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((comp, Ok(()))) => {
+                if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
+                    s.state = on_success.clone();
+                }
+            }
+            Ok((comp, Err(e))) => {
+                error!(component = %comp, error = %e, "ECU activation failed");
+                if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
+                    s.state = EcuState::Failed;
+                    s.error = Some(format!("{e}"));
+                }
+                if first_err.is_none() {
+                    *first_err = Some(e);
+                }
+            }
+            Err(join_err) => {
+                error!(error = %join_err, "ECU activation task panicked");
+                if first_err.is_none() {
+                    *first_err = Some(OrchestratorError::Internal(format!(
+                        "task panic: {join_err}"
+                    )));
+                }
+            }
+        }
     }
 }
 
