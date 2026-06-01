@@ -633,13 +633,17 @@ impl CampaignOrchestrator {
                 component: component_id.to_string(),
                 message: format!("attach: {e}"),
             })?;
+        // ISO 17978-3 spec wire (Phase B vendor verb):
+        // `PUT /updates/{id}/x-sumo-commit` posts the verdict to the
+        // paused execute task; FlashClient.spec_commit polls /status
+        // until the entry reaches execute/completed.
         flash_client
-            .commit()
+            .spec_commit()
             .await
             .map(|_| ())
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: component_id.to_string(),
-                message: format!("commit: {e}"),
+                message: format!("spec_commit: {e}"),
             })
     }
 
@@ -658,12 +662,12 @@ impl CampaignOrchestrator {
                 message: format!("attach: {e}"),
             })?;
         flash_client
-            .rollback()
+            .spec_rollback()
             .await
             .map(|_| ())
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: component_id.to_string(),
-                message: format!("rollback: {e}"),
+                message: format!("spec_rollback: {e}"),
             })
     }
 }

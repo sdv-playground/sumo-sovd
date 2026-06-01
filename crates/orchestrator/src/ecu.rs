@@ -41,6 +41,15 @@ async fn open_update_or_rollback_pending(
                 detail = %message,
                 "previous upgrade still in trial — auto-rolling back before new flash"
             );
+            // Auto-recovery: the previous trial's wire entry is past
+            // awaiting-verdict (left at finalized or similar), so
+            // spec_rollback's 409-unless-paused guard would reject.
+            // The legacy /executions{rollback} unconditionally calls
+            // backend.rollback_flash(), which is what we want here —
+            // unstick whatever trial is holding the bank.  Keep it
+            // on the deprecated wire until the server adds an
+            // unconditional /x-sumo-force-rollback verb.
+            #[allow(deprecated)]
             flash_client
                 .rollback()
                 .await
@@ -105,6 +114,12 @@ pub struct EcuFlashResult {
     pub update_type: UpdateType,
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
+    /// `true` when `execute()` paused at `substate=awaiting-verdict`
+    /// (banked + orchestrated mode) — the campaign must drive reset
+    /// then `spec_commit`/`spec_rollback`.  `false` when execute
+    /// auto-completed (singleshot, application, or Phase A
+    /// unorchestrated banked) — no further action needed.
+    pub awaiting_verdict: bool,
 }
 
 /// Classify a manifest by inspecting its SUIT command sequences.
@@ -231,32 +246,80 @@ pub async fn flash_ecu_to_staging(
 
     match update_type {
         UpdateType::Firmware | UpdateType::Application => {
-            // /updates verify: server runs verify_package per part +
-            // backend.start_flash and waits for the UDS download to
-            // settle.  After this returns, /updates state is
-            // "verified" and the backend is at AwaitingActivation.
-            info!(component = %comp, "running /executions{{verify}}");
-            flash_client
-                .verify()
-                .await
-                .map_err(|e| OrchestratorError::FlashFailed {
+            // ISO 17978-3 §7.18.5 prepare: server runs verify_part per
+            // part + waits for the staging pipeline to settle.  Async
+            // 202+poll — FlashClient.prepare() blocks until the wire
+            // status reaches prepare/completed.
+            info!(component = %comp, "running PUT /prepare");
+            let prepared =
+                flash_client
+                    .prepare()
+                    .await
+                    .map_err(|e| OrchestratorError::FlashFailed {
+                        component: comp.clone(),
+                        message: format!("prepare: {e}"),
+                    })?;
+            if prepared.status != "completed" {
+                return Err(OrchestratorError::FlashFailed {
                     component: comp.clone(),
-                    message: format!("verify: {e}"),
-                })?;
+                    message: format!(
+                        "prepare ended at {}/{}: {}",
+                        prepared.phase,
+                        prepared.status,
+                        prepared
+                            .error
+                            .map(|e| e.message)
+                            .unwrap_or_else(|| "no error detail".into())
+                    ),
+                });
+            }
 
-            // /executions{finalize}: server chains finalize_flash +
-            // validate + activate.  After this returns, the backend
-            // is at AwaitingReboot (dual-bank) or Activated
-            // (single-bank).  `use_validated_flow` is a no-op now —
-            // /updates always sequences validate inside finalize.
-            info!(component = %comp, "running /executions{{finalize}}");
-            flash_client
-                .finalize()
-                .await
-                .map_err(|e| OrchestratorError::FlashFailed {
+            // ISO 17978-3 §7.18.6 execute: server-side
+            // finalize_flash (+validate+activate for banked).
+            //
+            // Always opt into orchestrated mode for Firmware updates.
+            // The server enforces shape semantics: banked components
+            // pause at substate=awaiting-verdict; singleshot
+            // components silently ignore the flag and auto-complete
+            // (commit_flash included).  Application updates use
+            // unorchestrated mode — they have no trial phase.
+            let want_orchestrated = matches!(update_type, UpdateType::Firmware);
+            info!(
+                component = %comp,
+                orchestrated = want_orchestrated,
+                "running PUT /execute"
+            );
+            let executed = flash_client.execute(want_orchestrated).await.map_err(|e| {
+                OrchestratorError::FlashFailed {
                     component: comp.clone(),
-                    message: format!("finalize: {e}"),
-                })?;
+                    message: format!("execute: {e}"),
+                }
+            })?;
+            let awaiting_verdict = match (executed.status.as_str(), executed.substate.as_deref()) {
+                ("completed", _) => {
+                    info!(component = %comp, "execute completed (singleshot or unorchestrated)");
+                    false
+                }
+                ("inProgress", Some("awaiting-verdict")) => {
+                    info!(component = %comp, "execute paused at awaiting-verdict");
+                    true
+                }
+                _ => {
+                    return Err(OrchestratorError::FlashFailed {
+                        component: comp.clone(),
+                        message: format!(
+                            "execute ended at {}/{} substate={:?}: {}",
+                            executed.phase,
+                            executed.status,
+                            executed.substate,
+                            executed
+                                .error
+                                .map(|e| e.message)
+                                .unwrap_or_else(|| "no error detail".into())
+                        ),
+                    });
+                }
+            };
 
             match update_type {
                 UpdateType::Firmware => info!(component = %comp, "staged — awaiting reset"),
@@ -265,6 +328,14 @@ pub async fn flash_ecu_to_staging(
                 }
                 UpdateType::Policy => unreachable!("handled in separate match arm"),
             }
+
+            return Ok(EcuFlashResult {
+                component_id: comp.clone(),
+                update_type,
+                active_version: None,
+                previous_version: None,
+                awaiting_verdict,
+            });
         }
         UpdateType::Policy => {
             // Policy-only: applied on start_flash, nothing more to do
@@ -277,6 +348,7 @@ pub async fn flash_ecu_to_staging(
         update_type,
         active_version: None,
         previous_version: None,
+        awaiting_verdict: false,
     })
 }
 
@@ -335,34 +407,72 @@ pub async fn wait_for_activation(
 ) -> Result<(), OrchestratorError> {
     let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
     info!(component = %component_id, "waiting for activation");
+    // Re-attach to the most-recent /updates entry so spec_status has
+    // a session id to query.  This loops because the device may be
+    // mid-reboot — the GET /updates collection comes back as soon as
+    // the SOVD server is back up.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        // Use `latest_status` rather than `status`: the FlashClient
-        // built here doesn't carry the update_id from the original
-        // flash session (the caller may be a freshly-constructed
-        // orchestrator task after reboot).  `latest_status` re-derives
-        // it from the server's /updates collection.
-        match flash_client.latest_status().await {
-            Ok(status) => match status.state.as_str() {
-                // /updates "finalized" + "committed" both mean the new
-                // image is active on the device.
-                "finalized" | "committed" => {
-                    info!(component = %component_id, state = %status.state, "flash state activated");
+        if flash_client.attach_to_latest().await.is_ok() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(OrchestratorError::Timeout {
+                component: component_id.to_string(),
+                operation: "activation (attach_to_latest)".into(),
+            });
+        }
+    }
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match flash_client.spec_status().await {
+            Ok(body) => match (
+                body.phase.as_str(),
+                body.status.as_str(),
+                body.substate.as_deref(),
+            ) {
+                // Orchestrated banked: pause point post-activate.  Once
+                // we observe this, the device is reachable and the
+                // execute task is alive — ready to commit.
+                ("execute", "inProgress", Some("awaiting-verdict")) => {
+                    info!(component = %component_id, "execute paused at awaiting-verdict — ready to commit");
                     return Ok(());
                 }
-                "rolledback" | "failed" | "aborted" => {
+                // Standard banked (auto-commit) or singleshot: already
+                // terminal-completed.  Nothing to wait for; the campaign
+                // commit_all step becomes a no-op or hits 409 (handled
+                // upstream).
+                ("execute", "completed", _) => {
+                    info!(component = %component_id, "execute completed (auto-committed)");
+                    return Ok(());
+                }
+                ("execute", "failed", _) => {
                     return Err(OrchestratorError::FlashFailed {
                         component: component_id.to_string(),
-                        message: format!("activation reached {} after reset", status.state),
+                        message: format!(
+                            "execute failed during/after reset: {}",
+                            body.error.map(|e| e.message).unwrap_or_default()
+                        ),
                     });
                 }
-                // verified / uploading / registered → keep polling
-                _ => {}
+                _ => {
+                    // Still in earlier phase (prepare/uploading/etc) —
+                    // shouldn't normally happen after execute() returned,
+                    // but tolerate it during the device-rebooting window.
+                    debug!(
+                        component = %component_id,
+                        phase = %body.phase,
+                        status = %body.status,
+                        substate = ?body.substate,
+                        "wait_for_activation: still in flight"
+                    );
+                }
             },
             Err(_) => {
                 // ECU may be rebooting — retry
-                debug!(component = %component_id, "status poll failed, retrying");
+                debug!(component = %component_id, "spec_status poll failed, retrying");
             }
         }
         if tokio::time::Instant::now() > deadline {
