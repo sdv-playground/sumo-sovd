@@ -175,16 +175,31 @@ impl CampaignOrchestrator {
             {
                 Ok(result) => {
                     statuses[i].update_type = result.update_type;
-                    statuses[i].state = match result.update_type {
-                        UpdateType::Firmware => EcuState::Staged,
-                        UpdateType::Application | UpdateType::Policy => EcuState::Committed,
+                    // If execute auto-completed (singleshot, or the
+                    // server's standard banked auto-commit branch),
+                    // there's nothing left for reset_all / commit_all
+                    // to do — record Committed directly so they skip.
+                    // Only banked components that paused at
+                    // awaiting-verdict enter the Staged → reset →
+                    // commit pipeline.
+                    statuses[i].state = match (result.update_type, result.awaiting_verdict) {
+                        (UpdateType::Firmware, true) => EcuState::Staged,
+                        (UpdateType::Firmware, false) => EcuState::Committed,
+                        (UpdateType::Application, _) | (UpdateType::Policy, _) => {
+                            EcuState::Committed
+                        }
                     };
                     statuses[i].active_version = result.active_version;
                     statuses[i].previous_version = result.previous_version;
-                    if result.update_type == UpdateType::Firmware {
+                    if result.update_type == UpdateType::Firmware && result.awaiting_verdict {
                         staged.push(comp.clone());
                     }
-                    info!(component = %comp, update_type = ?result.update_type, "ECU staged");
+                    info!(
+                        component = %comp,
+                        update_type = ?result.update_type,
+                        awaiting_verdict = result.awaiting_verdict,
+                        "ECU staged"
+                    );
                 }
                 Err(e) => {
                     statuses[i].state = EcuState::Failed;
