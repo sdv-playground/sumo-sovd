@@ -39,8 +39,8 @@
 //!   from seeds (pluggable per deployment).
 
 pub mod campaign;
-pub mod error;
 pub mod ecu;
+pub mod error;
 pub mod security_helper;
 pub mod sovd_ops;
 pub mod targets;

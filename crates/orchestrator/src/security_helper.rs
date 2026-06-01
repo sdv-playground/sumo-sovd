@@ -139,10 +139,7 @@ impl SecurityHelperClient {
         body.insert("level".into(), req.level.into());
         body.insert("ecu".into(), serde_json::Value::Object(ecu));
         if let Some(vin) = req.vin {
-            body.insert(
-                "vehicle".into(),
-                serde_json::json!({ "vin": vin }),
-            );
+            body.insert("vehicle".into(), serde_json::json!({ "vin": vin }));
         }
 
         debug!(url = %self.config.url, component = %req.component_id, "calling security helper");
@@ -170,10 +167,12 @@ impl SecurityHelperClient {
         }
 
         let result: serde_json::Value =
-            resp.json().await.map_err(|e| OrchestratorError::SecurityFailed {
-                component: req.component_id.to_string(),
-                message: format!("helper response: {e}"),
-            })?;
+            resp.json()
+                .await
+                .map_err(|e| OrchestratorError::SecurityFailed {
+                    component: req.component_id.to_string(),
+                    message: format!("helper response: {e}"),
+                })?;
 
         // Helper protocol can return {"success": false, "error": "..."} with a 200.
         if result.get("success") == Some(&serde_json::Value::Bool(false)) {
@@ -201,9 +200,12 @@ impl SecurityHelperClient {
     /// `GET /info` — pre-flight probe of helper liveness + capability.
     pub async fn info(&self) -> Result<HelperInfo, OrchestratorError> {
         let url = format!("{}/info", self.config.url.trim_end_matches('/'));
-        let resp = self.http.get(&url).send().await.map_err(|e| {
-            OrchestratorError::Internal(format!("helper /info request: {e}"))
-        })?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Internal(format!("helper /info request: {e}")))?;
         if !resp.status().is_success() {
             return Err(OrchestratorError::Internal(format!(
                 "helper /info returned {}",

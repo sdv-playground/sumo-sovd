@@ -5,7 +5,7 @@
 //!           (reset is a campaign-level decision, not per-ECU)
 //! Policy:   session → security → upload → apply (immediate, no trial)
 
-use sovd_client::flash::{FlashClient, FlashError, StartFlashResponse};
+use sovd_client::flash::{FlashClient, FlashError};
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
 use tracing::{debug, info};
@@ -26,12 +26,15 @@ use crate::error::OrchestratorError;
 /// trips through Machine-adapter as `PolicyRejected` and lands as
 /// HTTP 400 "bad_request" rather than the 409 you'd expect for a
 /// Busy semantic, so the only stable signal is the message text.
-async fn start_flash_or_rollback_pending(
+/// Open a fresh /updates session, auto-rolling back any pending trial
+/// the backend may still be holding (vm-mgr refuses `start_flash`
+/// while the bank set is mid-trial).  Returns the new update_id.
+async fn open_update_or_rollback_pending(
     flash_client: &FlashClient,
     comp: &str,
-) -> Result<StartFlashResponse, OrchestratorError> {
-    match flash_client.start_flash().await {
-        Ok(t) => Ok(t),
+) -> Result<String, OrchestratorError> {
+    match flash_client.open_update().await {
+        Ok(t) => Ok(t.update_id),
         Err(FlashError::Server { ref message, .. }) if message.contains("trial mode") => {
             tracing::info!(
                 component = %comp,
@@ -39,23 +42,24 @@ async fn start_flash_or_rollback_pending(
                 "previous upgrade still in trial — auto-rolling back before new flash"
             );
             flash_client
-                .rollback_flash()
+                .rollback()
                 .await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.to_string(),
                     message: format!("auto-rollback of pending trial: {e}"),
                 })?;
             flash_client
-                .start_flash()
+                .open_update()
                 .await
+                .map(|t| t.update_id)
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.to_string(),
-                    message: format!("start flash after rollback: {e}"),
+                    message: format!("open_update after rollback: {e}"),
                 })
         }
         Err(e) => Err(OrchestratorError::FlashFailed {
             component: comp.to_string(),
-            message: format!("start flash: {e}"),
+            message: format!("open_update: {e}"),
         }),
     }
 }
@@ -173,58 +177,31 @@ pub async fn flash_ecu_to_staging(
         message: format!("flash client: {e}"),
     })?;
 
-    let transfer = if opaque_firmware && gw.is_some() {
-        // UDS-backed ECUs require upload + verify before the flash transfer starts.
-        info!(component = %comp, size = config.manifest.len(), "uploading opaque firmware");
-        let started = std::time::Instant::now();
-        let upload = flash_client
-            .upload_file(&config.manifest)
-            .await
-            .map_err(|e| OrchestratorError::FlashFailed {
-                component: comp.clone(),
-                message: format!("firmware upload: {e}"),
-            })?;
-        info!(
-            component = %comp,
-            bytes = config.manifest.len(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "opaque firmware uploaded"
-        );
+    // /updates flow: open session → upload all parts → /executions
+    // verify → /executions finalize.  Same shape for opaque firmware
+    // (single "manifest" part) and SUIT-backed (manifest + payload
+    // parts).
+    let update_id = open_update_or_rollback_pending(&flash_client, comp).await?;
+    info!(component = %comp, update_id = %update_id, "opened /updates session");
 
-        flash_client
-            .verify_file(&upload.upload_id)
-            .await
-            .map_err(|e| OrchestratorError::FlashFailed {
-                component: comp.clone(),
-                message: format!("firmware verify: {e}"),
-            })?;
+    info!(component = %comp, size = config.manifest.len(), "uploading manifest");
+    let manifest_started = std::time::Instant::now();
+    flash_client
+        .upload_part("manifest", &config.manifest)
+        .await
+        .map_err(|e| OrchestratorError::FlashFailed {
+            component: comp.clone(),
+            message: format!("manifest upload: {e}"),
+        })?;
+    info!(
+        component = %comp,
+        bytes = config.manifest.len(),
+        elapsed_ms = manifest_started.elapsed().as_millis() as u64,
+        "manifest uploaded"
+    );
 
-        info!(component = %comp, "starting flash session");
-        start_flash_or_rollback_pending(&flash_client, comp).await?
-    } else {
-        // SUIT-backed vm-mgr ECUs accept the classic flow: open transfer first,
-        // then upload the manifest and any detached payloads into that session.
-        info!(component = %comp, "starting flash session");
-        let transfer = start_flash_or_rollback_pending(&flash_client, comp).await?;
-
-        info!(component = %comp, size = config.manifest.len(), "uploading manifest");
-        let manifest_started = std::time::Instant::now();
-        flash_client
-            .upload_file(&config.manifest)
-            .await
-            .map_err(|e| OrchestratorError::FlashFailed {
-                component: comp.clone(),
-                message: format!("manifest upload: {e}"),
-            })?;
-        info!(
-            component = %comp,
-            bytes = config.manifest.len(),
-            elapsed_ms = manifest_started.elapsed().as_millis() as u64,
-            "manifest uploaded"
-        );
-
-        // Upload each payload in component order (each streamed to bank synchronously).
-        // Completion log carries throughput so slow uploads stand out.
+    if !opaque_firmware {
+        // SUIT-backed: also upload detached payloads in component order.
         for (uri, path) in &config.payloads {
             let data = std::fs::read(path).map_err(|e| OrchestratorError::FlashFailed {
                 component: comp.clone(),
@@ -233,13 +210,12 @@ pub async fn flash_ecu_to_staging(
             let bytes = data.len();
             info!(component = %comp, uri = %uri, size = bytes, "uploading payload");
             let started = std::time::Instant::now();
-            flash_client
-                .upload_file(&data)
-                .await
-                .map_err(|e| OrchestratorError::FlashFailed {
+            flash_client.upload_part(uri, &data).await.map_err(|e| {
+                OrchestratorError::FlashFailed {
                     component: comp.clone(),
                     message: format!("payload upload ({uri}): {e}"),
-                })?;
+                }
+            })?;
             let elapsed = started.elapsed();
             let mb = bytes as f64 / 1_048_576.0;
             let secs = elapsed.as_secs_f64();
@@ -251,53 +227,36 @@ pub async fn flash_ecu_to_staging(
                 mb, mb_per_sec
             );
         }
-
-        transfer
-    };
+    }
 
     match update_type {
         UpdateType::Firmware | UpdateType::Application => {
-            // Flash → finalize → stop here (AwaitingReboot)
+            // /updates verify: server runs verify_package per part +
+            // backend.start_flash and waits for the UDS download to
+            // settle.  After this returns, /updates state is
+            // "verified" and the backend is at AwaitingActivation.
+            info!(component = %comp, "running /executions{{verify}}");
             flash_client
-                .poll_flash_complete_simple(&transfer.transfer_id)
+                .verify()
                 .await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.clone(),
-                    message: format!("flash progress: {e}"),
+                    message: format!("verify: {e}"),
                 })?;
 
-            info!(component = %comp, "finalizing transfer");
+            // /executions{finalize}: server chains finalize_flash +
+            // validate + activate.  After this returns, the backend
+            // is at AwaitingReboot (dual-bank) or Activated
+            // (single-bank).  `use_validated_flow` is a no-op now —
+            // /updates always sequences validate inside finalize.
+            info!(component = %comp, "running /executions{{finalize}}");
             flash_client
-                .transfer_exit()
+                .finalize()
                 .await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.clone(),
                     message: format!("finalize: {e}"),
                 })?;
-
-            if update_type == UpdateType::Firmware && config.use_validated_flow {
-                // Drive lifecycle through Validated as a checkpoint —
-                // backend.validate() accepts AwaitingReboot and downshifts,
-                // backend.activate() then returns to AwaitingReboot. Useful
-                // for multi-cycle campaigns; backends that don't support
-                // the new ops will surface an HTTP error here so the caller
-                // knows to either upgrade them or disable the flag.
-                info!(component = %comp, "validating staged artifact");
-                flash_client.validate_flash().await.map_err(|e| {
-                    OrchestratorError::FlashFailed {
-                        component: comp.clone(),
-                        message: format!("validate: {e}"),
-                    }
-                })?;
-
-                info!(component = %comp, "activating");
-                flash_client.activate_flash().await.map_err(|e| {
-                    OrchestratorError::FlashFailed {
-                        component: comp.clone(),
-                        message: format!("activate: {e}"),
-                    }
-                })?;
-            }
 
             match update_type {
                 UpdateType::Firmware => info!(component = %comp, "staged — awaiting reset"),
@@ -352,7 +311,7 @@ pub async fn trigger_local_restart(
     let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
     info!(component = %component_id, "resetting ECU");
     flash_client
-        .ecu_reset()
+        .ecu_reset("hard")
         .await
         .map_err(|e| OrchestratorError::FlashFailed {
             component: component_id.to_string(),
@@ -379,27 +338,31 @@ pub async fn wait_for_activation(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        match flash_client.get_activation_state().await {
-            Ok(state) => {
-                let s = state.state.to_lowercase().replace('_', "");
-                match s.as_str() {
-                    "activated" | "committed" => {
-                        info!(component = %component_id, state = %state.state, "flash state activated");
-                        return Ok(());
-                    }
-                    "rolledback" | "failed" => {
-                        return Err(OrchestratorError::FlashFailed {
-                            component: component_id.to_string(),
-                            message: format!("activation reached {} after reset", state.state),
-                        });
-                    }
-                    // awaitingreboot / verifying / awaitingreset → keep polling
-                    _ => {}
+        // Use `latest_status` rather than `status`: the FlashClient
+        // built here doesn't carry the update_id from the original
+        // flash session (the caller may be a freshly-constructed
+        // orchestrator task after reboot).  `latest_status` re-derives
+        // it from the server's /updates collection.
+        match flash_client.latest_status().await {
+            Ok(status) => match status.state.as_str() {
+                // /updates "finalized" + "committed" both mean the new
+                // image is active on the device.
+                "finalized" | "committed" => {
+                    info!(component = %component_id, state = %status.state, "flash state activated");
+                    return Ok(());
                 }
-            }
+                "rolledback" | "failed" | "aborted" => {
+                    return Err(OrchestratorError::FlashFailed {
+                        component: component_id.to_string(),
+                        message: format!("activation reached {} after reset", status.state),
+                    });
+                }
+                // verified / uploading / registered → keep polling
+                _ => {}
+            },
             Err(_) => {
                 // ECU may be rebooting — retry
-                debug!(component = %component_id, "activation poll failed, retrying");
+                debug!(component = %component_id, "status poll failed, retrying");
             }
         }
         if tokio::time::Instant::now() > deadline {
@@ -411,24 +374,19 @@ pub async fn wait_for_activation(
     }
 }
 
-/// Read a component's `ActivationState` and return its declared reset_kind
-/// (defaults to `Local` if the server hasn't migrated to Phase 2 of the
-/// reset-kind work — pre-Phase-2 servers omit the field, sovd-client
-/// deserialises to `Local`).
+/// Read a component's `ActivationState` and return its declared reset_kind.
+///
+/// F.D8b: /updates doesn't surface reset_kind on the wire — that lives
+/// on the legacy `/flash/activation` endpoint which is retired.  Until
+/// `/updates` adds a `reset_kind` field (it should — campaign work
+/// needs it), default to `Local`.  Callers that need the real value
+/// should query the per-component status sub-resource directly.
 pub async fn fetch_reset_kind(
-    server_url: &str,
-    component_id: &str,
-    gateway_id: Option<&str>,
+    _server_url: &str,
+    _component_id: &str,
+    _gateway_id: Option<&str>,
 ) -> Result<sovd_core::ResetKind, OrchestratorError> {
-    let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
-    let state = flash_client
-        .get_activation_state()
-        .await
-        .map_err(|e| OrchestratorError::Sovd {
-            component: component_id.to_string(),
-            message: format!("activation_state: {e}"),
-        })?;
-    Ok(state.reset_kind)
+    Ok(sovd_core::ResetKind::default())
 }
 
 fn build_flash_client(

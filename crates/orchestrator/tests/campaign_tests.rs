@@ -3,26 +3,23 @@
 /// Uses sovd-api + sovd-core to spin up a real HTTP server with a test backend
 /// that simulates the flash lifecycle. The orchestrator talks to it via sovd-client
 /// over localhost — no mocks of the client layer.
-
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use sovd_core::error::{BackendError, BackendResult};
-use sovd_core::{
-    ActivationState, DiagnosticBackend, FlashProgress, FlashState, FlashStatus,
-    PackageInfo, PackageStatus, VerifyResult,
-};
 use sovd_core::models::{
     Capabilities, DataValue, EntityInfo, FaultFilter, FaultsResult, OperationExecution,
     OperationInfo, ParameterInfo, SecurityMode, SecurityState, SessionMode,
 };
-
-use sumo_sovd_orchestrator::campaign::{
-    CampaignConfig, CampaignOrchestrator, EcuState, EcuTarget,
+use sovd_core::{
+    ActivationState, DiagnosticBackend, FlashProgress, FlashState, FlashStatus, PackageInfo,
+    PackageStatus, VerifyResult,
 };
+
+use sumo_sovd_orchestrator::campaign::{CampaignConfig, CampaignOrchestrator, EcuState, EcuTarget};
 use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
 
 // =============================================================================
@@ -86,14 +83,21 @@ impl DiagnosticBackend for TestBackend {
     }
 
     async fn get_faults(&self, _filter: Option<&FaultFilter>) -> BackendResult<FaultsResult> {
-        Ok(FaultsResult { faults: vec![], status_availability_mask: None })
+        Ok(FaultsResult {
+            faults: vec![],
+            status_availability_mask: None,
+        })
     }
 
     async fn list_operations(&self) -> BackendResult<Vec<OperationInfo>> {
         Ok(vec![])
     }
 
-    async fn start_operation(&self, _op_id: &str, _params: &[u8]) -> BackendResult<OperationExecution> {
+    async fn start_operation(
+        &self,
+        _op_id: &str,
+        _params: &[u8],
+    ) -> BackendResult<OperationExecution> {
         Err(BackendError::NotSupported("start_operation".into()))
     }
 
@@ -147,7 +151,11 @@ impl DiagnosticBackend for TestBackend {
         let unlocked = *self.security_unlocked.read();
         Ok(SecurityMode {
             mode: "security".into(),
-            state: if unlocked { SecurityState::Unlocked } else { SecurityState::Locked },
+            state: if unlocked {
+                SecurityState::Unlocked
+            } else {
+                SecurityState::Locked
+            },
             level: if unlocked { Some(1) } else { None },
             available_levels: Some(vec![1]),
             seed: None,
@@ -162,9 +170,12 @@ impl DiagnosticBackend for TestBackend {
 
     async fn get_package(&self, package_id: &str) -> BackendResult<PackageInfo> {
         let packages = self.packages.read();
-        let (id, data) = packages.iter()
+        let (id, data) = packages
+            .iter()
             .find(|(id, _)| id == package_id)
-            .ok_or_else(|| BackendError::InvalidRequest(format!("package not found: {package_id}")))?;
+            .ok_or_else(|| {
+                BackendError::InvalidRequest(format!("package not found: {package_id}"))
+            })?;
         Ok(PackageInfo {
             id: id.clone(),
             size: data.len(),
@@ -185,7 +196,9 @@ impl DiagnosticBackend for TestBackend {
                 error: None,
             })
         } else {
-            Err(BackendError::InvalidRequest(format!("package not found: {package_id}")))
+            Err(BackendError::InvalidRequest(format!(
+                "package not found: {package_id}"
+            )))
         }
     }
 
@@ -193,7 +206,10 @@ impl DiagnosticBackend for TestBackend {
         if let Some(msg) = self.fail_flash.read().as_ref() {
             return Err(BackendError::Internal(msg.clone()));
         }
-        let tid = format!("xfer-{}", self.transfer_counter.fetch_add(1, Ordering::SeqCst));
+        let tid = format!(
+            "xfer-{}",
+            self.transfer_counter.fetch_add(1, Ordering::SeqCst)
+        );
         *self.flash_state.write() = FlashState::AwaitingActivation;
         Ok(tid)
     }
@@ -261,7 +277,7 @@ impl DiagnosticBackend for TestBackend {
 /// will return Err on our non-SUIT test packages, which is caught gracefully.
 fn dummy_trust_anchor() -> Vec<u8> {
     let mut key = vec![
-        0xA3,       // map(3)
+        0xA3, // map(3)
         0x01, 0x01, // kty: OKP (1)
         0x20, 0x06, // crv: Ed25519 (6)
         0x21, 0x58, 0x20, // x: bstr(32)
@@ -292,9 +308,12 @@ async fn setup(backend: Arc<dyn DiagnosticBackend>) -> TestFixture {
 
     let helper_app = {
         use axum::{routing::post, Json, Router};
-        Router::new().route("/calculate", post(|Json(_body): Json<serde_json::Value>| async move {
-            Json(serde_json::json!({"key": "aabb"}))
-        }))
+        Router::new().route(
+            "/calculate",
+            post(|Json(_body): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({"key": "aabb"}))
+            }),
+        )
     };
     let helper_handle = tokio::spawn(async move {
         axum::serve(helper_listener, helper_app).await.unwrap();
@@ -335,9 +354,12 @@ async fn setup_multi(backends: HashMap<String, Arc<dyn DiagnosticBackend>>) -> T
 
     let helper_app = {
         use axum::{routing::post, Json, Router};
-        Router::new().route("/calculate", post(|Json(_body): Json<serde_json::Value>| async move {
-            Json(serde_json::json!({"key": "aabb"}))
-        }))
+        Router::new().route(
+            "/calculate",
+            post(|Json(_body): Json<serde_json::Value>| async move {
+                Json(serde_json::json!({"key": "aabb"}))
+            }),
+        )
     };
     let helper_handle = tokio::spawn(async move {
         axum::serve(helper_listener, helper_app).await.unwrap();
@@ -372,12 +394,16 @@ async fn test_flash_and_commit() {
     let backend = Arc::new(TestBackend::new("ecu1"));
     let fix = setup(backend.clone()).await;
 
-    let result = fix.orchestrator.flash_all(vec![EcuTarget {
-        component_id: "ecu1".into(),
-        gateway_id: None,
-        manifest: vec![0xDE, 0xAD],
-        payloads: vec![],
-    }]).await.unwrap();
+    let result = fix
+        .orchestrator
+        .flash_all(vec![EcuTarget {
+            component_id: "ecu1".into(),
+            gateway_id: None,
+            manifest: vec![0xDE, 0xAD],
+            payloads: vec![],
+        }])
+        .await
+        .unwrap();
 
     assert_eq!(result.ecus.len(), 1);
     assert_eq!(result.ecus[0].state, EcuState::Activated);
@@ -392,12 +418,16 @@ async fn test_flash_and_rollback() {
     let backend = Arc::new(TestBackend::new("ecu1"));
     let fix = setup(backend.clone()).await;
 
-    let result = fix.orchestrator.flash_all(vec![EcuTarget {
-        component_id: "ecu1".into(),
-        gateway_id: None,
-        manifest: vec![0xDE, 0xAD],
-        payloads: vec![],
-    }]).await.unwrap();
+    let result = fix
+        .orchestrator
+        .flash_all(vec![EcuTarget {
+            component_id: "ecu1".into(),
+            gateway_id: None,
+            manifest: vec![0xDE, 0xAD],
+            payloads: vec![],
+        }])
+        .await
+        .unwrap();
 
     assert_eq!(result.ecus[0].state, EcuState::Activated);
     fix.orchestrator.rollback_all(&result.ecus).await.unwrap();
@@ -410,14 +440,34 @@ async fn test_multi_ecu_flash_and_commit() {
     let backend2 = Arc::new(TestBackend::new("ecu2"));
 
     let mut backends = HashMap::new();
-    backends.insert("ecu1".to_string(), backend1.clone() as Arc<dyn DiagnosticBackend>);
-    backends.insert("ecu2".to_string(), backend2.clone() as Arc<dyn DiagnosticBackend>);
+    backends.insert(
+        "ecu1".to_string(),
+        backend1.clone() as Arc<dyn DiagnosticBackend>,
+    );
+    backends.insert(
+        "ecu2".to_string(),
+        backend2.clone() as Arc<dyn DiagnosticBackend>,
+    );
     let fix = setup_multi(backends).await;
 
-    let result = fix.orchestrator.flash_all(vec![
-        EcuTarget { component_id: "ecu1".into(), gateway_id: None, manifest: vec![0x01], payloads: vec![] },
-        EcuTarget { component_id: "ecu2".into(), gateway_id: None, manifest: vec![0x02], payloads: vec![] },
-    ]).await.unwrap();
+    let result = fix
+        .orchestrator
+        .flash_all(vec![
+            EcuTarget {
+                component_id: "ecu1".into(),
+                gateway_id: None,
+                manifest: vec![0x01],
+                payloads: vec![],
+            },
+            EcuTarget {
+                component_id: "ecu2".into(),
+                gateway_id: None,
+                manifest: vec![0x02],
+                payloads: vec![],
+            },
+        ])
+        .await
+        .unwrap();
 
     assert_eq!(result.ecus.len(), 2);
     assert_eq!(result.ecus[0].state, EcuState::Activated);
@@ -435,14 +485,33 @@ async fn test_flash_failure_triggers_rollback() {
     *backend2.fail_flash.write() = Some("simulated flash failure".into());
 
     let mut backends = HashMap::new();
-    backends.insert("ecu1".to_string(), backend1.clone() as Arc<dyn DiagnosticBackend>);
-    backends.insert("ecu2".to_string(), backend2.clone() as Arc<dyn DiagnosticBackend>);
+    backends.insert(
+        "ecu1".to_string(),
+        backend1.clone() as Arc<dyn DiagnosticBackend>,
+    );
+    backends.insert(
+        "ecu2".to_string(),
+        backend2.clone() as Arc<dyn DiagnosticBackend>,
+    );
     let fix = setup_multi(backends).await;
 
-    let err = fix.orchestrator.flash_all(vec![
-        EcuTarget { component_id: "ecu1".into(), gateway_id: None, manifest: vec![0x01], payloads: vec![] },
-        EcuTarget { component_id: "ecu2".into(), gateway_id: None, manifest: vec![0x02], payloads: vec![] },
-    ]).await;
+    let err = fix
+        .orchestrator
+        .flash_all(vec![
+            EcuTarget {
+                component_id: "ecu1".into(),
+                gateway_id: None,
+                manifest: vec![0x01],
+                payloads: vec![],
+            },
+            EcuTarget {
+                component_id: "ecu2".into(),
+                gateway_id: None,
+                manifest: vec![0x02],
+                payloads: vec![],
+            },
+        ])
+        .await;
 
     assert!(err.is_err(), "flash_all should fail when ecu2 fails");
     assert_eq!(*backend1.flash_state.read(), FlashState::RolledBack);
@@ -453,12 +522,16 @@ async fn test_commit_skips_already_committed() {
     let backend = Arc::new(TestBackend::new("ecu1"));
     let fix = setup(backend.clone()).await;
 
-    let result = fix.orchestrator.flash_all(vec![EcuTarget {
-        component_id: "ecu1".into(),
-        gateway_id: None,
-        manifest: vec![0xDE, 0xAD],
-        payloads: vec![],
-    }]).await.unwrap();
+    let result = fix
+        .orchestrator
+        .flash_all(vec![EcuTarget {
+            component_id: "ecu1".into(),
+            gateway_id: None,
+            manifest: vec![0xDE, 0xAD],
+            payloads: vec![],
+        }])
+        .await
+        .unwrap();
 
     let mut ecus = result.ecus;
     ecus[0].state = EcuState::Committed;

@@ -255,6 +255,7 @@ async fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_deploy(
     orchestrator: &CampaignOrchestrator,
     manifest_path: &str,
@@ -338,6 +339,7 @@ async fn run_deploy(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_flash(
     orchestrator: &CampaignOrchestrator,
     component_id: &str,

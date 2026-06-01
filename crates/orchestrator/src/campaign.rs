@@ -51,7 +51,7 @@ pub struct EcuStatus {
 pub enum EcuState {
     Pending,
     Flashing,
-    Staged,    // AwaitingReboot — flash done, waiting for reset
+    Staged, // AwaitingReboot — flash done, waiting for reset
     /// Flash finalised + an ECU-level restart has been issued for the
     /// parent ECU (because at least one staged component declared
     /// `reset_kind: requires_ecu_reset`). Polling for `Activated`.
@@ -321,12 +321,8 @@ impl CampaignOrchestrator {
                 components = ?comps,
                 "issuing ECU-level restart (coalesced for RequiresEcuReset)"
             );
-            if let Err(e) = sovd_client::flash::system_restart(
-                &server_url,
-                gateway_id.as_deref(),
-                "hard",
-            )
-            .await
+            if let Err(e) =
+                sovd_client::flash::system_restart(&server_url, gateway_id.as_deref(), "hard").await
             {
                 let err = OrchestratorError::FlashFailed {
                     component: comps.first().cloned().unwrap_or_default(),
@@ -352,8 +348,7 @@ impl CampaignOrchestrator {
                 let url = server_url.clone();
                 let gw = gateway_id.clone();
                 set.spawn(async move {
-                    let result =
-                        ecu::wait_for_activation(&url, &comp_id, gw.as_deref(), 300).await;
+                    let result = ecu::wait_for_activation(&url, &comp_id, gw.as_deref(), 300).await;
                     (comp_id, result)
                 });
             }
@@ -628,8 +623,18 @@ impl CampaignOrchestrator {
         // Re-establish access (ECU reset clears session per ISO 14229)
         self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
+        // The FlashClient is fresh — the post-reset orchestrator
+        // doesn't carry the original session.  Reattach to the
+        // server-side /updates entry before committing.
         flash_client
-            .commit_flash()
+            .attach_to_latest()
+            .await
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: component_id.to_string(),
+                message: format!("attach: {e}"),
+            })?;
+        flash_client
+            .commit()
             .await
             .map(|_| ())
             .map_err(|e| OrchestratorError::FlashFailed {
@@ -646,7 +651,14 @@ impl CampaignOrchestrator {
         self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client
-            .rollback_flash()
+            .attach_to_latest()
+            .await
+            .map_err(|e| OrchestratorError::FlashFailed {
+                component: component_id.to_string(),
+                message: format!("attach: {e}"),
+            })?;
+        flash_client
+            .rollback()
             .await
             .map(|_| ())
             .map_err(|e| OrchestratorError::FlashFailed {

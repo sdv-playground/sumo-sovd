@@ -15,7 +15,10 @@ pub enum OrchestratorError {
     FlashFailed { component: String, message: String },
 
     #[error("timeout waiting for {component}: {operation}")]
-    Timeout { component: String, operation: String },
+    Timeout {
+        component: String,
+        operation: String,
+    },
 
     #[error("rollback triggered for {component}: {reason}")]
     RollbackTriggered { component: String, reason: String },
