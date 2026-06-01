@@ -44,18 +44,15 @@ async fn open_update_or_rollback_pending(
             // Auto-recovery: the previous trial's wire entry is past
             // awaiting-verdict (left at finalized or similar), so
             // spec_rollback's 409-unless-paused guard would reject.
-            // The legacy /executions{rollback} unconditionally calls
-            // backend.rollback_flash(), which is what we want here —
-            // unstick whatever trial is holding the bank.  Keep it
-            // on the deprecated wire until the server adds an
-            // unconditional /x-sumo-force-rollback verb.
-            #[allow(deprecated)]
+            // force_rollback is the dedicated vendor verb for this
+            // edge case — it unconditionally calls
+            // backend.rollback_flash() to unstick the bank.
             flash_client
-                .rollback()
+                .force_rollback()
                 .await
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.to_string(),
-                    message: format!("auto-rollback of pending trial: {e}"),
+                    message: format!("force_rollback of pending trial: {e}"),
                 })?;
             flash_client
                 .open_update()
