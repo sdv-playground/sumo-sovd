@@ -32,18 +32,15 @@ use crate::error::OrchestratorError;
 async fn open_update_or_rollback_pending(
     flash_client: &FlashClient,
     comp: &str,
+    name: &str,
+    version: &str,
 ) -> Result<String, OrchestratorError> {
-    // NOTE (meaningful catalog ids): this opens with a server-minted UUID. To
-    // make `GET /updates` list a spec-exemplar id and §7.18 Table 261 carry a
-    // human name, thread the L2 SUIT manifest's text fields in — name from
-    // `manifest.text_model_name(0)` (else `text_vendor_name(0)`), version from
-    // `text_version(0)` — and call `flash_client.open_update_with(name,
-    // version)` instead of `open_update()` (here and at the post-rollback
-    // re-open below). It returns the *derived* id, which is deterministic, so
-    // the post-reset `attach()` can re-form it from the same name+version.
-    // Left as a UUID until the campaign threads the manifest through to here.
-    match flash_client.open_update().await {
-        Ok(t) => Ok(t.update_id),
+    // Declare a meaningful package identity (name + version from the SUIT
+    // manifest) so `GET /updates` lists a spec-exemplar id and §7.18 Table 261
+    // carries a human name. The returned id is deterministic and is captured
+    // into `EcuStatus.update_id` for the post-reset `attach()`.
+    match flash_client.open_update_with(name, version).await {
+        Ok(id) => Ok(id),
         Err(FlashError::Server { ref message, .. }) if message.contains("trial mode") => {
             tracing::info!(
                 component = %comp,
@@ -64,9 +61,8 @@ async fn open_update_or_rollback_pending(
                     message: format!("force_rollback of pending trial: {e}"),
                 })?;
             flash_client
-                .open_update()
+                .open_update_with(name, version)
                 .await
-                .map(|t| t.update_id)
                 .map_err(|e| OrchestratorError::FlashFailed {
                     component: comp.to_string(),
                     message: format!("open_update after rollback: {e}"),
@@ -181,14 +177,31 @@ pub async fn flash_ecu_to_staging(
     let comp = &config.component_id;
     let gw = config.gateway_id.as_deref();
 
-    // Classify the manifest
-    let (update_type, opaque_firmware) = match classify_manifest(&config.manifest, trust_anchor) {
-        Ok((ut, _)) => (ut, false),
+    // Classify the manifest (keep the parsed envelope to name the package).
+    let (update_type, opaque_firmware, manifest) = match classify_manifest(
+        &config.manifest,
+        trust_anchor,
+    ) {
+        Ok((ut, m)) => (ut, false, Some(m)),
         Err(_) => {
             debug!(component = %comp, "package is not a SUIT envelope — treating as opaque firmware");
-            (UpdateType::Firmware, true)
+            (UpdateType::Firmware, true, None)
         }
     };
+
+    // Derive a meaningful package identity for the /updates catalog from the
+    // SUIT model/vendor name + text-version, falling back to the component id
+    // and an empty version (opaque firmware carries no SUIT text).
+    let pkg_name = manifest
+        .as_ref()
+        .and_then(|m| m.text_model_name(0).or_else(|| m.text_vendor_name(0)))
+        .unwrap_or(comp.as_str())
+        .to_string();
+    let pkg_version = manifest
+        .as_ref()
+        .and_then(|m| m.text_version(0))
+        .unwrap_or_default()
+        .to_string();
     info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU flash (assumes already unlocked)");
 
     // Create flash client (session/security unlock is the orchestrator's job)
@@ -206,7 +219,8 @@ pub async fn flash_ecu_to_staging(
     // verify → /executions finalize.  Same shape for opaque firmware
     // (single "manifest" part) and SUIT-backed (manifest + payload
     // parts).
-    let update_id = open_update_or_rollback_pending(&flash_client, comp).await?;
+    let update_id =
+        open_update_or_rollback_pending(&flash_client, comp, &pkg_name, &pkg_version).await?;
     info!(component = %comp, update_id = %update_id, "opened /updates session");
 
     info!(component = %comp, size = config.manifest.len(), "uploading manifest");
