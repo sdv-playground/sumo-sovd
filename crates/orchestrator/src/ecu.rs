@@ -33,6 +33,15 @@ async fn open_update_or_rollback_pending(
     flash_client: &FlashClient,
     comp: &str,
 ) -> Result<String, OrchestratorError> {
+    // NOTE (meaningful catalog ids): this opens with a server-minted UUID. To
+    // make `GET /updates` list a spec-exemplar id and §7.18 Table 261 carry a
+    // human name, thread the L2 SUIT manifest's text fields in — name from
+    // `manifest.text_model_name(0)` (else `text_vendor_name(0)`), version from
+    // `text_version(0)` — and call `flash_client.open_update_with(name,
+    // version)` instead of `open_update()` (here and at the post-rollback
+    // re-open below). It returns the *derived* id, which is deterministic, so
+    // the post-reset `attach()` can re-form it from the same name+version.
+    // Left as a UUID until the campaign threads the manifest through to here.
     match flash_client.open_update().await {
         Ok(t) => Ok(t.update_id),
         Err(FlashError::Server { ref message, .. }) if message.contains("trial mode") => {
