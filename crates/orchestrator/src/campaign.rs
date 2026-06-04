@@ -45,6 +45,11 @@ pub struct EcuStatus {
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
     pub error: Option<String>,
+    /// The `/updates` package id opened when this ECU was staged.
+    /// `None` until staging produces it; carried so reset/commit/
+    /// rollback can re-`attach` a post-reset FlashClient to the
+    /// surviving server-side entry.
+    pub update_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +129,7 @@ impl CampaignOrchestrator {
                 active_version: None,
                 previous_version: None,
                 error: None,
+                update_id: None,
             })
             .collect();
 
@@ -146,11 +152,20 @@ impl CampaignOrchestrator {
                 if !staged.is_empty() {
                     warn!(count = staged.len(), "rolling back staged ECUs");
                     for rc in &staged {
-                        let gw = statuses
+                        let (gw, update_id) = statuses
                             .iter()
                             .find(|s| &s.component_id == rc)
-                            .and_then(|s| s.gateway_id.as_deref());
-                        if self.rollback_one(rc, gw).await.is_ok() {
+                            .map(|s| (s.gateway_id.clone(), s.update_id.clone()))
+                            .unwrap_or((None, None));
+                        let Some(update_id) = update_id else {
+                            warn!(component = %rc, "rollback skipped — no update_id");
+                            continue;
+                        };
+                        if self
+                            .rollback_one(rc, gw.as_deref(), &update_id)
+                            .await
+                            .is_ok()
+                        {
                             if let Some(s) = statuses.iter_mut().find(|s| &s.component_id == rc) {
                                 s.state = EcuState::RolledBack;
                             }
@@ -175,6 +190,7 @@ impl CampaignOrchestrator {
             {
                 Ok(result) => {
                     statuses[i].update_type = result.update_type;
+                    statuses[i].update_id = Some(result.update_id.clone());
                     // If execute auto-completed (singleshot, or the
                     // server's standard banked auto-commit branch),
                     // there's nothing left for reset_all / commit_all
@@ -210,11 +226,16 @@ impl CampaignOrchestrator {
                     if !staged.is_empty() {
                         warn!(count = staged.len(), "rolling back staged ECUs");
                         for rc in &staged {
-                            let gw = statuses
+                            let (gw, update_id) = statuses
                                 .iter()
                                 .find(|s| &s.component_id == rc)
-                                .and_then(|s| s.gateway_id.as_deref());
-                            match self.rollback_one(rc, gw).await {
+                                .map(|s| (s.gateway_id.clone(), s.update_id.clone()))
+                                .unwrap_or((None, None));
+                            let Some(update_id) = update_id else {
+                                warn!(component = %rc, "rollback skipped — no update_id");
+                                continue;
+                            };
+                            match self.rollback_one(rc, gw.as_deref(), &update_id).await {
                                 Ok(()) => {
                                     if let Some(s) =
                                         statuses.iter_mut().find(|s| &s.component_id == rc)
@@ -264,12 +285,21 @@ impl CampaignOrchestrator {
     /// `Verifying → Activated` transition, so wall-clock time is
     /// `max(activation)`, not `sum(activation)`.
     pub async fn reset_all(&self, ecus: &mut [EcuStatus]) -> Result<(), OrchestratorError> {
-        // 1. Find staged components.
-        let staged: Vec<(String, Option<String>)> = ecus
-            .iter()
-            .filter(|e| e.state == EcuState::Staged)
-            .map(|e| (e.component_id.clone(), e.gateway_id.clone()))
-            .collect();
+        // 1. Find staged components.  A staged firmware component always
+        //    carries the update_id stage_all captured; surface a clear
+        //    error rather than silently dropping it (post-reset commit
+        //    needs it to re-attach).
+        let mut staged: Vec<(String, Option<String>, String)> = Vec::new();
+        for e in ecus.iter().filter(|e| e.state == EcuState::Staged) {
+            let update_id = e
+                .update_id
+                .clone()
+                .ok_or_else(|| OrchestratorError::FlashFailed {
+                    component: e.component_id.clone(),
+                    message: "staged component has no update_id (staging bug)".into(),
+                })?;
+            staged.push((e.component_id.clone(), e.gateway_id.clone(), update_id));
+        }
 
         if staged.is_empty() {
             info!("no ECUs need reset");
@@ -280,17 +310,21 @@ impl CampaignOrchestrator {
         //    ActivationState (added to the wire in SOVDd 7245abc). Older
         //    servers that omit the field deserialise to Local.
         let server_url = self.config.server_url.clone();
-        let mut local: Vec<(String, Option<String>)> = Vec::new();
-        let mut by_ecu: std::collections::BTreeMap<Option<String>, Vec<String>> =
+        let mut local: Vec<(String, Option<String>, String)> = Vec::new();
+        // gateway → [(component, update_id)]
+        let mut by_ecu: std::collections::BTreeMap<Option<String>, Vec<(String, String)>> =
             std::collections::BTreeMap::new();
-        for (comp, gw) in &staged {
+        for (comp, gw, update_id) in &staged {
             let kind = ecu::fetch_reset_kind(&server_url, comp, gw.as_deref()).await?;
             match kind {
                 sovd_core::ResetKind::None | sovd_core::ResetKind::Local => {
-                    local.push((comp.clone(), gw.clone()));
+                    local.push((comp.clone(), gw.clone(), update_id.clone()));
                 }
                 sovd_core::ResetKind::RequiresEcuReset => {
-                    by_ecu.entry(gw.clone()).or_default().push(comp.clone());
+                    by_ecu
+                        .entry(gw.clone())
+                        .or_default()
+                        .push((comp.clone(), update_id.clone()));
                 }
             }
         }
@@ -306,12 +340,13 @@ impl CampaignOrchestrator {
         let mut first_err: Option<OrchestratorError> = None;
         if !local.is_empty() {
             let mut set = tokio::task::JoinSet::new();
-            for (comp, gw) in local {
+            for (comp, gw, update_id) in local {
                 let url = server_url.clone();
                 set.spawn(async move {
                     // 180s budget covers managed-cvc's worst-case
                     // per-VM reset → verify → Activated cycle.
-                    let result = ecu::reset_and_activate(&url, &comp, gw.as_deref(), 180).await;
+                    let result =
+                        ecu::reset_and_activate(&url, &comp, gw.as_deref(), &update_id, 180).await;
                     (comp, result)
                 });
             }
@@ -326,21 +361,21 @@ impl CampaignOrchestrator {
             // Mark affected components AwaitingSystemReboot so any
             // observer of `EcuStatus` sees the intent before the host
             // goes down.
-            for comp_id in &comps {
+            for (comp_id, _) in &comps {
                 if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
                     s.state = EcuState::AwaitingSystemReboot;
                 }
             }
             info!(
                 gateway = ?gateway_id,
-                components = ?comps,
+                components = ?comps.iter().map(|(c, _)| c).collect::<Vec<_>>(),
                 "issuing ECU-level restart (coalesced for RequiresEcuReset)"
             );
             if let Err(e) =
                 sovd_client::flash::system_restart(&server_url, gateway_id.as_deref(), "hard").await
             {
                 let err = OrchestratorError::FlashFailed {
-                    component: comps.first().cloned().unwrap_or_default(),
+                    component: comps.first().map(|(c, _)| c.clone()).unwrap_or_default(),
                     message: format!("ECU restart: {e}"),
                 };
                 error!(error = %err, "ECU-level restart failed — staged components remain unactivated");
@@ -348,7 +383,7 @@ impl CampaignOrchestrator {
                     first_err = Some(err);
                 }
                 // Mark all in this group as Failed so the campaign report is accurate.
-                for comp_id in &comps {
+                for (comp_id, _) in &comps {
                     if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
                         s.state = EcuState::Failed;
                         s.error = Some(format!("ECU restart failed: {e}"));
@@ -359,11 +394,13 @@ impl CampaignOrchestrator {
 
             // Poll all components in this ECU group concurrently.
             let mut set = tokio::task::JoinSet::new();
-            for comp_id in comps {
+            for (comp_id, update_id) in comps {
                 let url = server_url.clone();
                 let gw = gateway_id.clone();
                 set.spawn(async move {
-                    let result = ecu::wait_for_activation(&url, &comp_id, gw.as_deref(), 300).await;
+                    let result =
+                        ecu::wait_for_activation(&url, &comp_id, gw.as_deref(), &update_id, 300)
+                            .await;
                     (comp_id, result)
                 });
             }
@@ -403,7 +440,14 @@ impl CampaignOrchestrator {
 
         for ecu in &to_commit {
             info!(component = %ecu.component_id, "committing");
-            self.commit_one(&ecu.component_id, ecu.gateway_id.as_deref())
+            let update_id =
+                ecu.update_id
+                    .as_deref()
+                    .ok_or_else(|| OrchestratorError::FlashFailed {
+                        component: ecu.component_id.clone(),
+                        message: "commit: component has no update_id (staging bug)".into(),
+                    })?;
+            self.commit_one(&ecu.component_id, ecu.gateway_id.as_deref(), update_id)
                 .await?;
         }
 
@@ -422,8 +466,12 @@ impl CampaignOrchestrator {
 
         for ecu in &to_rollback {
             warn!(component = %ecu.component_id, "rolling back");
+            let Some(update_id) = ecu.update_id.as_deref() else {
+                error!(component = %ecu.component_id, "rollback: component has no update_id (staging bug)");
+                continue;
+            };
             match self
-                .rollback_one(&ecu.component_id, ecu.gateway_id.as_deref())
+                .rollback_one(&ecu.component_id, ecu.gateway_id.as_deref(), update_id)
                 .await
             {
                 Ok(()) => info!(component = %ecu.component_id, "rolled back"),
@@ -634,15 +682,17 @@ impl CampaignOrchestrator {
         &self,
         component_id: &str,
         gateway_id: Option<&str>,
+        update_id: &str,
     ) -> Result<(), OrchestratorError> {
         // Re-establish access (ECU reset clears session per ISO 14229)
         self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
         // The FlashClient is fresh — the post-reset orchestrator
-        // doesn't carry the original session.  Reattach to the
-        // server-side /updates entry before committing.
+        // doesn't carry the original session.  Re-attach to the
+        // server-side /updates entry (by the id captured at staging)
+        // before committing.
         flash_client
-            .attach_to_latest()
+            .attach(update_id)
             .await
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: component_id.to_string(),
@@ -666,11 +716,12 @@ impl CampaignOrchestrator {
         &self,
         component_id: &str,
         gateway_id: Option<&str>,
+        update_id: &str,
     ) -> Result<(), OrchestratorError> {
         self.unlock_for_flash(component_id, gateway_id).await?;
         let flash_client = self.make_flash_client(component_id, gateway_id)?;
         flash_client
-            .attach_to_latest()
+            .attach(update_id)
             .await
             .map_err(|e| OrchestratorError::FlashFailed {
                 component: component_id.to_string(),

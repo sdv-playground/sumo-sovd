@@ -108,6 +108,10 @@ pub enum UpdateType {
 /// Result of staging one ECU (before reset).
 pub struct EcuFlashResult {
     pub component_id: String,
+    /// The `/updates` package id opened for this stage.  Captured so the
+    /// campaign can re-`attach` a fresh post-reset FlashClient to the
+    /// surviving server-side entry for commit/rollback.
+    pub update_id: String,
     pub update_type: UpdateType,
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
@@ -328,6 +332,7 @@ pub async fn flash_ecu_to_staging(
 
             return Ok(EcuFlashResult {
                 component_id: comp.clone(),
+                update_id,
                 update_type,
                 active_version: None,
                 previous_version: None,
@@ -342,6 +347,7 @@ pub async fn flash_ecu_to_staging(
 
     Ok(EcuFlashResult {
         component_id: comp.clone(),
+        update_id,
         update_type,
         active_version: None,
         previous_version: None,
@@ -360,10 +366,18 @@ pub async fn reset_and_activate(
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
+    update_id: &str,
     timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
     trigger_local_restart(server_url, component_id, gateway_id).await?;
-    wait_for_activation(server_url, component_id, gateway_id, timeout_secs).await
+    wait_for_activation(
+        server_url,
+        component_id,
+        gateway_id,
+        update_id,
+        timeout_secs,
+    )
+    .await
 }
 
 /// Trigger a per-component restart via the spec's `PUT
@@ -400,28 +414,24 @@ pub async fn wait_for_activation(
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
+    update_id: &str,
     timeout_secs: u64,
 ) -> Result<(), OrchestratorError> {
     let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
-    info!(component = %component_id, "waiting for activation");
-    // Re-attach to the most-recent /updates entry so spec_status has
-    // a session id to query.  This loops because the device may be
-    // mid-reboot — the GET /updates collection comes back as soon as
-    // the SOVD server is back up.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if flash_client.attach_to_latest().await.is_ok() {
-            break;
-        }
-        if tokio::time::Instant::now() > deadline {
-            return Err(OrchestratorError::Timeout {
-                component: component_id.to_string(),
-                operation: "activation (attach_to_latest)".into(),
-            });
-        }
-    }
+    info!(component = %component_id, update_id = %update_id, "waiting for activation");
+    // Bind the fresh client to the update_id captured at staging so
+    // spec_status has an entry to query.  attach is local/infallible;
+    // the device-reachability wait happens in the spec_status poll
+    // below (the server-side entry survives the reset).
+    flash_client
+        .attach(update_id)
+        .await
+        .map_err(|e| OrchestratorError::FlashFailed {
+            component: component_id.to_string(),
+            message: format!("attach: {e}"),
+        })?;
 
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         match flash_client.spec_status().await {
