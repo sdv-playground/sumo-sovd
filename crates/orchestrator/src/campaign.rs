@@ -315,7 +315,7 @@ impl CampaignOrchestrator {
         let mut by_ecu: std::collections::BTreeMap<Option<String>, Vec<(String, String)>> =
             std::collections::BTreeMap::new();
         for (comp, gw, update_id) in &staged {
-            let kind = ecu::fetch_reset_kind(&server_url, comp, gw.as_deref()).await?;
+            let kind = ecu::fetch_reset_kind(&server_url, comp, gw.as_deref(), update_id).await?;
             match kind {
                 sovd_core::ResetKind::None | sovd_core::ResetKind::Local => {
                     local.push((comp.clone(), gw.clone(), update_id.clone()));

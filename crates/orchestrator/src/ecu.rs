@@ -514,19 +514,37 @@ pub async fn wait_for_activation(
     }
 }
 
-/// Read a component's `ActivationState` and return its declared reset_kind.
+/// Read a component's declared reset_kind off the `/updates` wire.
 ///
-/// F.D8b: /updates doesn't surface reset_kind on the wire — that lives
-/// on the legacy `/flash/activation` endpoint which is retired.  Until
-/// `/updates` adds a `reset_kind` field (it should — campaign work
-/// needs it), default to `Local`.  Callers that need the real value
-/// should query the per-component status sub-resource directly.
+/// SOVDd captures each component's `ActivationState.reset_kind` at
+/// register time and surfaces it as the `x-sumo-reset-kind` vendor field
+/// on the update's status body (ISO 17978-3 §5.4.5 permits `x-<ext>-`
+/// fields).  We attach a fresh `FlashClient` to the staged `update_id`
+/// and read it back via `spec_status()`.  Servers that haven't migrated
+/// omit the field → `unwrap_or_default()` yields `Local`, matching their
+/// pre-existing behaviour.
 pub async fn fetch_reset_kind(
-    _server_url: &str,
-    _component_id: &str,
-    _gateway_id: Option<&str>,
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+    update_id: &str,
 ) -> Result<sovd_core::ResetKind, OrchestratorError> {
-    Ok(sovd_core::ResetKind::default())
+    let flash_client = build_flash_client(server_url, component_id, gateway_id)?;
+    flash_client
+        .attach(update_id)
+        .await
+        .map_err(|e| OrchestratorError::FlashFailed {
+            component: component_id.to_string(),
+            message: format!("attach: {e}"),
+        })?;
+    let status = flash_client
+        .spec_status()
+        .await
+        .map_err(|e| OrchestratorError::FlashFailed {
+            component: component_id.to_string(),
+            message: format!("spec_status: {e}"),
+        })?;
+    Ok(status.reset_kind.unwrap_or_default())
 }
 
 fn build_flash_client(
