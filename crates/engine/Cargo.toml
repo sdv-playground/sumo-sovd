@@ -1,0 +1,32 @@
+[package]
+name = "sumo-sovd-flash-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Device-buildable SOVD flash execution engine (FlashPlan → guard → stage → reset → verdict)"
+
+[dependencies]
+# SUIT manifest classification (firmware vs application vs policy)
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+
+# SOVD REST wire — the engine talks to the device only through this client.
+sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+thiserror = "1"
+async-trait = "0.1"
+# Stream a `PayloadSource::File` into the upload body without buffering it whole.
+# reqwest::Body is only constructed here and handed to sovd-client — the engine
+# never makes an HTTP call of its own.
+tokio-util = { version = "0.7", features = ["io"] }
+reqwest = { version = "0.12", features = ["stream"] }
+
+[dev-dependencies]
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+axum = "0.8"
+parking_lot = "0.12"

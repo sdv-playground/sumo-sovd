@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/orchestrator", "crates/campaign-cli", "crates/sumo-map"]
+members = ["crates/engine", "crates/orchestrator", "crates/campaign-cli", "crates/sumo-map"]
 
 [workspace.package]
 version = "0.1.0"
