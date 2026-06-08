@@ -21,7 +21,8 @@ use sovd_core::{
 };
 
 use sumo_sovd_flash_engine::{
-    EcuState, EcuStatus, EngineTimeouts, FlashEngine, FlashJob, FlashPlan, NoAuth,
+    EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob, FlashPlan, NoAuth,
+    UpdateType,
 };
 
 // =============================================================================
@@ -36,6 +37,8 @@ struct TestBackend {
     packages: RwLock<Vec<(String, Vec<u8>)>>,
     flash_state: RwLock<FlashState>,
     transfer_counter: AtomicU32,
+    reset_count: AtomicU32,
+    update_mode: RwLock<Option<(bool, String)>>,
     fail_flash: RwLock<Option<String>>,
 }
 
@@ -61,8 +64,20 @@ impl TestBackend {
             packages: RwLock::new(Vec::new()),
             flash_state: RwLock::new(FlashState::Complete),
             transfer_counter: AtomicU32::new(0),
+            reset_count: AtomicU32::new(0),
+            update_mode: RwLock::new(None),
             fail_flash: RwLock::new(None),
         }
+    }
+
+    /// Make this backend report `x-sumo-update-mode` (supports_rollback +
+    /// reset_kind) — for the no-mix guard + committed-singleshot reset tests.
+    fn set_update_mode(&self, supports_rollback: bool, reset_kind: &str) {
+        *self.update_mode.write() = Some((supports_rollback, reset_kind.to_string()));
+    }
+
+    fn reset_count(&self) -> u32 {
+        self.reset_count.load(Ordering::SeqCst)
     }
 }
 
@@ -77,7 +92,20 @@ impl DiagnosticBackend for TestBackend {
     async fn list_parameters(&self) -> BackendResult<Vec<ParameterInfo>> {
         Ok(vec![])
     }
-    async fn read_data(&self, _param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
+    async fn read_data(&self, param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
+        if param_ids.iter().any(|p| p == "x-sumo-update-mode") {
+            if let Some((supports_rollback, reset_kind)) = self.update_mode.read().clone() {
+                return Ok(vec![DataValue::new(
+                    "x-sumo-update-mode",
+                    "x-sumo-update-mode",
+                    serde_json::json!({
+                        "update_mode": if supports_rollback { "banked" } else { "singleshot" },
+                        "supports_rollback": supports_rollback,
+                        "reset_kind": reset_kind,
+                    }),
+                )]);
+            }
+        }
         Ok(vec![])
     }
     async fn get_faults(&self, _filter: Option<&FaultFilter>) -> BackendResult<FaultsResult> {
@@ -225,6 +253,7 @@ impl DiagnosticBackend for TestBackend {
         Ok(())
     }
     async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
+        self.reset_count.fetch_add(1, Ordering::SeqCst);
         *self.session.write() = "default".into();
         *self.security_unlocked.write() = false;
         *self.flash_state.write() = FlashState::Activated;
@@ -377,4 +406,79 @@ async fn engine_stage_failure_triggers_rollback() {
     assert!(err.is_err(), "stage_all should fail when ecu2 fails");
     // ecu1 staged first, then the engine rolled it back when ecu2 failed.
     assert_eq!(*b1.flash_state.read(), FlashState::RolledBack);
+}
+
+#[tokio::test]
+async fn engine_reboots_committed_singleshot_with_reset_kind() {
+    // A singleshot component (e.g. RT/M7) commits in stage_all but still needs a
+    // reboot to RUN the new firmware. reset_all must reset it — driven by the
+    // reset_kind it declares on x-sumo-update-mode — with no trial/verdict.
+    let backend = Arc::new(TestBackend::new("rt"));
+    backend.set_update_mode(false, "local");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), backend.clone());
+    let (url, _h) = serve(backends).await;
+    let eng = engine(&url);
+
+    // As stage_all leaves a singleshot component: Committed, carrying its update_id.
+    let mut ecus = vec![EcuStatus {
+        component_id: "rt".into(),
+        gateway_id: None,
+        state: EcuState::Committed,
+        update_type: UpdateType::Firmware,
+        active_version: None,
+        previous_version: None,
+        error: None,
+        update_id: Some("xfer-0".into()),
+    }];
+    eng.reset_all(&mut ecus).await.unwrap();
+
+    assert!(
+        backend.reset_count() >= 1,
+        "committed singleshot with reset_kind must be rebooted by reset_all"
+    );
+    assert_eq!(
+        ecus[0].state,
+        EcuState::Committed,
+        "singleshot stays committed — no trial/verdict"
+    );
+}
+
+#[tokio::test]
+async fn engine_guard_rejects_mixed_rollbackable_and_irreversible() {
+    // A banked (rollbackable) component bundled with a singleshot (irreversible)
+    // one — a partial rollback would strand the irreversible write. guard rejects.
+    let banked = Arc::new(TestBackend::new("vm1"));
+    banked.set_update_mode(true, "requires_ecu_reset");
+    let singleshot = Arc::new(TestBackend::new("rt"));
+    singleshot.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), banked);
+    backends.insert("rt".into(), singleshot);
+    let (url, _h) = serve(backends).await;
+    let eng = engine(&url);
+
+    let err = eng.guard(&plan(&[("vm1", &[0x01]), ("rt", &[0x02])])).await;
+    assert!(
+        matches!(err, Err(EngineError::MixedUpdateModes { .. })),
+        "guard must reject a mixed banked + singleshot plan, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn engine_guard_allows_all_rollbackable() {
+    let b1 = Arc::new(TestBackend::new("vm1"));
+    b1.set_update_mode(true, "local");
+    let b2 = Arc::new(TestBackend::new("vm2"));
+    b2.set_update_mode(true, "local");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), b1);
+    backends.insert("vm2".into(), b2);
+    let (url, _h) = serve(backends).await;
+    let eng = engine(&url);
+
+    assert!(eng
+        .guard(&plan(&[("vm1", &[0x01]), ("vm2", &[0x02])]))
+        .await
+        .is_ok());
 }

@@ -16,11 +16,14 @@ use crate::types::{
     CampaignReport, EcuState, EcuStatus, EngineTimeouts, FlashPlan, TokenSource, UpdateType,
 };
 
-/// Subset of the device's `x-sumo-update-mode` payload the no-mix guard needs.
+/// Subset of the device's `x-sumo-update-mode` payload the engine reads: the
+/// no-mix guard uses `supports_rollback`; the singleshot reset uses `reset_kind`.
 #[derive(serde::Deserialize)]
 struct UpdateModeProbe {
     #[serde(default)]
     supports_rollback: bool,
+    #[serde(default)]
+    reset_kind: String,
 }
 
 pub struct FlashEngine {
@@ -180,7 +183,26 @@ impl FlashEngine {
             staged.push((e.component_id.clone(), e.gateway_id.clone(), update_id));
         }
 
-        if staged.is_empty() {
+        // Committed singleshot components (e.g. RT/M7) still need a reboot to RUN
+        // the firmware just written, when they declare a reset_kind — there is no
+        // trial/verdict (already committed). reset_kind comes off the stable
+        // `x-sumo-update-mode` (no live update to attach for a committed component).
+        let mut ss_local: Vec<(String, Option<String>)> = Vec::new();
+        let mut ss_by_ecu: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+        for e in ecus.iter().filter(|e| e.state == EcuState::Committed) {
+            match self.component_reset_kind(&e.component_id).await {
+                sovd_core::ResetKind::Local => {
+                    ss_local.push((e.component_id.clone(), e.gateway_id.clone()))
+                }
+                sovd_core::ResetKind::RequiresEcuReset => ss_by_ecu
+                    .entry(e.gateway_id.clone())
+                    .or_default()
+                    .push(e.component_id.clone()),
+                sovd_core::ResetKind::None => {}
+            }
+        }
+
+        if staged.is_empty() && ss_local.is_empty() && ss_by_ecu.is_empty() {
             info!("no ECUs need reset");
             return Ok(());
         }
@@ -297,10 +319,71 @@ impl FlashEngine {
             collect_results(&mut set, ecus, EcuState::Activated, &mut first_err).await;
         }
 
+        // 5. Reboot committed singleshot components that declared a reset_kind,
+        //    then confirm the node is reachable again — no trial/verdict (the
+        //    write is already committed; there is nothing to roll back).
+        if !ss_local.is_empty() || !ss_by_ecu.is_empty() {
+            info!(
+                local = ss_local.len(),
+                requires_ecu_reset = ss_by_ecu.values().map(|v| v.len()).sum::<usize>(),
+                "rebooting committed singleshot components to run new firmware"
+            );
+        }
+        for (comp, gw) in ss_local {
+            let token = self.token.token(&comp).await?;
+            let outcome =
+                match ecu::trigger_local_restart(&self.server_url, &comp, gw.as_deref(), &token)
+                    .await
+                {
+                    Ok(()) => {
+                        self.wait_reachable(&comp, self.timeouts.local_reset_secs)
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+            if let Err(err) = outcome {
+                if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
+                    s.state = EcuState::Failed;
+                    s.error = Some(format!("{err}"));
+                }
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        for (gateway_id, comps) in ss_by_ecu {
+            let restart_key = gateway_id.as_deref().unwrap_or("");
+            info!(gateway = ?gateway_id, components = ?comps, "rebooting node for committed singleshot (RequiresEcuReset)");
+            let outcome = match self.sovd_client(restart_key).await {
+                Ok(client) => match client.system_restart(gateway_id.as_deref(), "hard").await {
+                    Ok(_) => {
+                        self.wait_reachable(restart_key, self.timeouts.ecu_reset_activation_secs)
+                            .await
+                    }
+                    Err(e) => Err(EngineError::FlashFailed {
+                        component: comps.first().cloned().unwrap_or_default(),
+                        message: format!("ECU restart: {e}"),
+                    }),
+                },
+                Err(e) => Err(e),
+            };
+            if let Err(err) = outcome {
+                for comp_id in &comps {
+                    if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
+                        s.state = EcuState::Failed;
+                        s.error = Some(format!("{err}"));
+                    }
+                }
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+
         if let Some(e) = first_err {
             return Err(e);
         }
-        info!("all ECUs activated (trial mode)");
+        info!("all ECUs reset");
         Ok(())
     }
 
@@ -447,6 +530,47 @@ impl FlashEngine {
                     }
                 }
                 Err(re) => warn!(component = %rc, error = %re, "rollback failed"),
+            }
+        }
+    }
+
+    /// Read a component's `reset_kind` from the stable `x-sumo-update-mode`
+    /// capability — available without a live update (unlike the per-update
+    /// `/updates` status that `fetch_reset_kind` reads). Unknown / unreported /
+    /// unreachable → `None` (no reboot).
+    async fn component_reset_kind(&self, comp: &str) -> sovd_core::ResetKind {
+        let Ok(client) = self.sovd_client(comp).await else {
+            return sovd_core::ResetKind::None;
+        };
+        let Ok(resp) = client.read_data(comp, "x-sumo-update-mode").await else {
+            return sovd_core::ResetKind::None;
+        };
+        match serde_json::from_value::<UpdateModeProbe>(resp.value) {
+            Ok(mode) => match mode.reset_kind.as_str() {
+                "requires_ecu_reset" => sovd_core::ResetKind::RequiresEcuReset,
+                "local" => sovd_core::ResetKind::Local,
+                _ => sovd_core::ResetKind::None,
+            },
+            Err(_) => sovd_core::ResetKind::None,
+        }
+    }
+
+    /// Poll the device's SOVD API until it answers again after a reboot. A
+    /// committed singleshot reset has no trial/verdict to wait on — this just
+    /// confirms the node came back (its API serves `/components`).
+    async fn wait_reachable(&self, key: &str, timeout_secs: u64) -> Result<(), EngineError> {
+        let client = self.sovd_client(key).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if client.list_components().await.is_ok() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err(EngineError::Timeout {
+                    component: key.to_string(),
+                    operation: "reboot (singleshot)".into(),
+                });
             }
         }
     }
