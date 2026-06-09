@@ -312,6 +312,50 @@ pub async fn reset_and_activate(
     .await
 }
 
+/// Issue a node-level verdict — the entity-root vendor operation that commits
+/// (or rolls back) **every component currently in trial on the node** in one
+/// call. This is how a node-reboot campaign step finalizes: the per-component
+/// `/updates` sessions are gone after the reboot, so the orchestrator never
+/// re-attaches per component — it issues ONE verdict and the node fans it out
+/// from NV (the update *session* is the commit unit). The op is synchronous;
+/// a 2xx is success, a failed fan-out returns 5xx with the per-component
+/// errors in the body. Wire: `POST /vehicle/v1/operations/{op_id}/executions`
+/// (ISO 17978-3 §7.14, at the entity root).
+async fn node_verdict(server_url: &str, op_id: &str, token: &str) -> Result<(), EngineError> {
+    let url = format!(
+        "{}/vehicle/v1/operations/{op_id}/executions",
+        server_url.trim_end_matches('/')
+    );
+    let mut req = reqwest::Client::new().post(&url);
+    if !token.is_empty() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
+        component: "node".to_string(),
+        message: format!("{op_id}: {e}"),
+    })?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(EngineError::FlashFailed {
+            component: "node".to_string(),
+            message: format!("{op_id}: HTTP {status}: {body}"),
+        });
+    }
+    info!(op = op_id, %body, "node-level verdict applied");
+    Ok(())
+}
+
+/// Commit every in-trial component on the node in one verdict.
+pub async fn commit_node_trials(server_url: &str, token: &str) -> Result<(), EngineError> {
+    node_verdict(server_url, "x-sumo-commit-trials", token).await
+}
+
+/// Roll back every in-trial component on the node in one verdict.
+pub async fn rollback_node_trials(server_url: &str, token: &str) -> Result<(), EngineError> {
+    node_verdict(server_url, "x-sumo-rollback-trials", token).await
+}
+
 /// Trigger a per-component restart via `PUT components/{id}/status/restart`
 /// (used for `ResetKind::Local`). Does NOT wait for activation.
 pub async fn trigger_local_restart(

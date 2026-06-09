@@ -328,58 +328,40 @@ impl FlashEngine {
                 continue;
             }
 
-            // Confirm the node actually rebooted (orchestrator-held boot_count,
-            // the SOVD way) before trusting the post-reset /updates state — rejects
-            // "rebooted too soon". Per-component; skipped when the device reports no
-            // boot_count (falls through to the activation poll).
-            let mut reboot_failed = false;
-            for (comp_id, _) in &comps {
-                if let Some(baseline) = baselines.get(comp_id) {
-                    match self
-                        .wait_rebooted(comp_id, *baseline, self.timeouts.ecu_reset_activation_secs)
-                        .await
-                    {
-                        Ok(()) => {
-                            info!(component = %comp_id, baseline, "boot_count verify OK — new boot confirmed")
+            // Confirm each staged component actually rebooted, then mark it
+            // Activated — reboot-safe: reads `/status` (boot_count + ready),
+            // NEVER the per-component `/updates` session (the node reboot wiped
+            // it, so re-attaching would 404). The orchestrator-held boot_count
+            // baseline rejects "rebooted too soon"; components that don't report
+            // it fall back to a ready-only check. On confirmation the component
+            // is Activated (new bank booted + guest healthy) — `commit_all`'s
+            // node-level verdict then commits the whole in-trial set at once
+            // (the update *session* is the commit unit), so there is no
+            // per-component activation poll to re-attach here.
+            for (comp_id, _update_id) in &comps {
+                let baseline = baselines.get(comp_id).copied();
+                match self
+                    .wait_rebooted(comp_id, baseline, self.timeouts.ecu_reset_activation_secs)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(component = %comp_id, ?baseline, "reboot confirmed via /status — activated");
+                        if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
+                            s.state = EcuState::Activated;
                         }
-                        Err(err) => {
-                            error!(component = %comp_id, error = %err, "boot_count verify failed — no new boot reported");
-                            if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
-                                s.state = EcuState::Failed;
-                                s.error = Some(format!("{err}"));
-                            }
-                            if first_err.is_none() {
-                                first_err = Some(err);
-                            }
-                            reboot_failed = true;
+                    }
+                    Err(err) => {
+                        error!(component = %comp_id, error = %err, "reboot verify failed");
+                        if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
+                            s.state = EcuState::Failed;
+                            s.error = Some(format!("{err}"));
+                        }
+                        if first_err.is_none() {
+                            first_err = Some(err);
                         }
                     }
                 }
             }
-            if reboot_failed {
-                continue;
-            }
-
-            let mut set = tokio::task::JoinSet::new();
-            for (comp_id, update_id) in comps {
-                let url = self.server_url.clone();
-                let gw = gateway_id.clone();
-                let token = self.token.token(&comp_id).await?;
-                let secs = self.timeouts.ecu_reset_activation_secs;
-                set.spawn(async move {
-                    let result = ecu::wait_for_activation(
-                        &url,
-                        &comp_id,
-                        gw.as_deref(),
-                        &update_id,
-                        secs,
-                        &token,
-                    )
-                    .await;
-                    (comp_id, result)
-                });
-            }
-            collect_results(&mut set, ecus, EcuState::Activated, &mut first_err).await;
         }
 
         // 5. Reboot committed singleshot components that declared a reset_kind,
@@ -450,7 +432,32 @@ impl FlashEngine {
         Ok(())
     }
 
+    /// Issue the node-level **commit** verdict directly: commit every component
+    /// currently in trial on the node, in ONE call (the update *session* is the
+    /// commit unit). The device resolves the in-trial set from NV, so this is
+    /// reboot-safe and needs no per-component `/updates` session — it is how a
+    /// node-reboot step finalizes. Used by `commit_all`'s node path and exposed
+    /// for the manual `commit-trials` verb (no component list required).
+    pub async fn commit_node_trials(&self) -> Result<(), EngineError> {
+        let token = self.token.token("").await?;
+        ecu::commit_node_trials(&self.server_url, &token).await
+    }
+
+    /// Issue the node-level **rollback** verdict directly — see
+    /// [`commit_node_trials`](Self::commit_node_trials).
+    pub async fn rollback_node_trials(&self) -> Result<(), EngineError> {
+        let token = self.token.token("").await?;
+        ecu::rollback_node_trials(&self.server_url, &token).await
+    }
+
     /// Commit all activated firmware components — makes the trial permanent.
+    ///
+    /// On the node-reboot path (`force_ecu_reset`), the per-component `/updates`
+    /// sessions were destroyed by the reboot, and the orchestrator must never
+    /// commit a single component anyway — the update *session* is the commit
+    /// unit. So ONE node-level verdict commits every in-trial component at once
+    /// (resolved from NV by the device). The per-component path stays for local
+    /// resets, where the paused execute task is still alive to release.
     pub async fn commit_all(&self, ecus: &mut [EcuStatus]) -> Result<(), EngineError> {
         let to_commit: Vec<(String, Option<String>, String)> = ecus
             .iter()
@@ -461,6 +468,22 @@ impl FlashEngine {
                     .map(|id| (e.component_id.clone(), e.gateway_id.clone(), id))
             })
             .collect();
+
+        if to_commit.is_empty() {
+            return Ok(());
+        }
+
+        if self.force_ecu_reset {
+            info!(ecus = to_commit.len(), "committing (node-level verdict)");
+            self.commit_node_trials().await?;
+            for (comp, _, _) in &to_commit {
+                if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp) {
+                    s.state = EcuState::Committed;
+                }
+            }
+            info!("commit complete (node-level)");
+            return Ok(());
+        }
 
         info!(ecus = to_commit.len(), "committing");
         for (comp, gw, update_id) in &to_commit {
@@ -475,6 +498,10 @@ impl FlashEngine {
     }
 
     /// Rollback all activated firmware components — reverts to the prior bank.
+    ///
+    /// Same node-reboot vs local-reset split as [`commit_all`]: on
+    /// `force_ecu_reset` a single node-level verdict rolls back the whole
+    /// in-trial set; otherwise the per-component path releases each live task.
     pub async fn rollback_all(&self, ecus: &mut [EcuStatus]) -> Result<(), EngineError> {
         let to_rollback: Vec<(String, Option<String>, String)> = ecus
             .iter()
@@ -485,6 +512,24 @@ impl FlashEngine {
                     .map(|id| (e.component_id.clone(), e.gateway_id.clone(), id))
             })
             .collect();
+
+        if to_rollback.is_empty() {
+            return Ok(());
+        }
+
+        if self.force_ecu_reset {
+            warn!(
+                ecus = to_rollback.len(),
+                "rolling back (node-level verdict)"
+            );
+            self.rollback_node_trials().await?;
+            for (comp, _, _) in &to_rollback {
+                if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp) {
+                    s.state = EcuState::RolledBack;
+                }
+            }
+            return Ok(());
+        }
 
         warn!(ecus = to_rollback.len(), "rolling back");
         for (comp, gw, update_id) in &to_rollback {
@@ -651,15 +696,18 @@ impl FlashEngine {
     }
 
     /// Confirm a component actually rebooted, the SOVD way (§7.19.2): poll its
-    /// entity status until it reports `ready` AND a `boot_count` strictly greater
-    /// than the orchestrator-held `baseline`. A monotonic counter can't be faked
-    /// by a stale pre-reset answer, so this rejects the "rebooted too soon"
-    /// false-positive a bare reachability/`ready` check would accept. Tolerates
-    /// the node being unreachable mid-reboot (transient errors retried).
+    /// entity status until it reports `ready` AND (when `baseline` is `Some`) a
+    /// `boot_count` strictly greater than the orchestrator-held baseline. A
+    /// monotonic counter can't be faked by a stale pre-reset answer, so this
+    /// rejects the "rebooted too soon" false-positive a bare reachability/`ready`
+    /// check would accept. `baseline == None` (older firmware that doesn't report
+    /// `boot_count`) degrades to a ready-only check — still reboot-safe, since it
+    /// reads `/status`, never the wiped `/updates` session. Tolerates the node
+    /// being unreachable mid-reboot (transient errors retried).
     async fn wait_rebooted(
         &self,
         comp: &str,
-        baseline: u64,
+        baseline: Option<u64>,
         timeout_secs: u64,
     ) -> Result<(), EngineError> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
@@ -668,12 +716,15 @@ impl FlashEngine {
             if let Ok(client) = self.sovd_client(comp).await {
                 if let Ok(body) = client.read_status(comp).await {
                     let ready = matches!(body.status, sovd_core::EntityStatus::Ready);
-                    let bumped = body
-                        .extensions
-                        .get("x-sumo-runtime")
-                        .and_then(|r| r.get("boot_count"))
-                        .and_then(|v| v.as_u64())
-                        .is_some_and(|c| c > baseline);
+                    let bumped = match baseline {
+                        Some(b) => body
+                            .extensions
+                            .get("x-sumo-runtime")
+                            .and_then(|r| r.get("boot_count"))
+                            .and_then(|v| v.as_u64())
+                            .is_some_and(|c| c > b),
+                        None => true,
+                    };
                     if ready && bumped {
                         return Ok(());
                     }
@@ -682,7 +733,7 @@ impl FlashEngine {
             if tokio::time::Instant::now() > deadline {
                 return Err(EngineError::Timeout {
                     component: comp.to_string(),
-                    operation: "reboot (boot_count verify)".into(),
+                    operation: "reboot verify (/status)".into(),
                 });
             }
         }

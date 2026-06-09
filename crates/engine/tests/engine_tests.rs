@@ -482,3 +482,74 @@ async fn engine_guard_allows_all_rollbackable() {
         .await
         .is_ok());
 }
+
+#[tokio::test]
+async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
+    // saka's directive: on a node-reboot step the orchestrator must NOT commit
+    // each component — the per-component `/updates` session is wiped by the
+    // reboot, and the update *session* is the commit unit. `commit_all` under
+    // `force_ecu_reset` must issue ONE entity-root node verdict and never touch
+    // the per-component commit path (`attach` + `spec_commit` → `commit_flash`).
+    let backend = Arc::new(TestBackend::new("vm1"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), backend.clone());
+
+    // Mock = the real sovd-api router + a stub for the node verdict op (the
+    // real fan-out lives in vm-mgr; here we only assert the engine targets it).
+    let hits = Arc::new(AtomicU32::new(0));
+    let hits_route = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let node_op = axum::Router::new().route(
+        "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+        axum::routing::post(move || {
+            let hits = hits_route.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({
+                    "execution_id": "x-sumo-commit-trials",
+                    "operation_id": "x-sumo-commit-trials",
+                    "status": "completed",
+                    "started_at": "2026-01-01T00:00:00Z"
+                }))
+            }
+        }),
+    );
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op);
+    let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let url = format!("http://127.0.0.1:{port}");
+
+    let eng = FlashEngine::new(
+        url,
+        Arc::new(NoAuth),
+        dummy_trust_anchor(),
+        EngineTimeouts::default(),
+    )
+    .with_force_ecu_reset(true);
+
+    // A firmware component already Activated by the (separately exercised)
+    // node-reboot reset path.
+    let mut ecus = vec![EcuStatus {
+        component_id: "vm1".into(),
+        gateway_id: None,
+        state: EcuState::Activated,
+        update_type: UpdateType::Firmware,
+        active_version: None,
+        previous_version: None,
+        error: None,
+        update_id: Some("vm1".into()),
+    }];
+
+    eng.commit_all(&mut ecus).await.unwrap();
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "exactly one node-level verdict must be issued"
+    );
+    assert_eq!(ecus[0].state, EcuState::Committed);
+    // The per-component commit path was bypassed — `commit_flash` would have
+    // moved the backend to `Committed`; it stays at its construction state.
+    assert_eq!(*backend.flash_state.read(), FlashState::Complete);
+}
