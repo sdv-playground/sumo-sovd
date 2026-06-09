@@ -283,6 +283,16 @@ impl FlashEngine {
 
         // 4. RequiresEcuReset: one restart per affected ECU, then poll the group.
         for (gateway_id, comps) in by_ecu {
+            // Capture each component's boot_count BEFORE the reboot — the
+            // orchestrator holds the baseline (the device loses it across its own
+            // reboot). Absent => the device doesn't report it; we fall back to the
+            // activation poll below (no regression on older firmware).
+            let mut baselines: BTreeMap<String, u64> = BTreeMap::new();
+            for (comp_id, _) in &comps {
+                if let Some(bc) = self.read_boot_count(comp_id).await {
+                    baselines.insert(comp_id.clone(), bc);
+                }
+            }
             for (comp_id, _) in &comps {
                 if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
                     s.state = EcuState::AwaitingSystemReboot;
@@ -315,6 +325,38 @@ impl FlashEngine {
                 if first_err.is_none() {
                     first_err = Some(err);
                 }
+                continue;
+            }
+
+            // Confirm the node actually rebooted (orchestrator-held boot_count,
+            // the SOVD way) before trusting the post-reset /updates state — rejects
+            // "rebooted too soon". Per-component; skipped when the device reports no
+            // boot_count (falls through to the activation poll).
+            let mut reboot_failed = false;
+            for (comp_id, _) in &comps {
+                if let Some(baseline) = baselines.get(comp_id) {
+                    match self
+                        .wait_rebooted(comp_id, *baseline, self.timeouts.ecu_reset_activation_secs)
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(component = %comp_id, baseline, "boot_count verify OK — new boot confirmed")
+                        }
+                        Err(err) => {
+                            error!(component = %comp_id, error = %err, "boot_count verify failed — no new boot reported");
+                            if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
+                                s.state = EcuState::Failed;
+                                s.error = Some(format!("{err}"));
+                            }
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
+                            reboot_failed = true;
+                        }
+                    }
+                }
+            }
+            if reboot_failed {
                 continue;
             }
 
@@ -591,6 +633,56 @@ impl FlashEngine {
                 return Err(EngineError::Timeout {
                     component: key.to_string(),
                     operation: "reboot (singleshot)".into(),
+                });
+            }
+        }
+    }
+
+    /// Read a component's monotonic boot/restart counter from its SOVD entity
+    /// status (§7.19.2 → vendor `x-sumo-runtime.boot_count`). `None` if the device
+    /// doesn't report it (older firmware) — callers fall back to reachability.
+    async fn read_boot_count(&self, comp: &str) -> Option<u64> {
+        let client = self.sovd_client(comp).await.ok()?;
+        let body = client.read_status(comp).await.ok()?;
+        body.extensions
+            .get("x-sumo-runtime")?
+            .get("boot_count")?
+            .as_u64()
+    }
+
+    /// Confirm a component actually rebooted, the SOVD way (§7.19.2): poll its
+    /// entity status until it reports `ready` AND a `boot_count` strictly greater
+    /// than the orchestrator-held `baseline`. A monotonic counter can't be faked
+    /// by a stale pre-reset answer, so this rejects the "rebooted too soon"
+    /// false-positive a bare reachability/`ready` check would accept. Tolerates
+    /// the node being unreachable mid-reboot (transient errors retried).
+    async fn wait_rebooted(
+        &self,
+        comp: &str,
+        baseline: u64,
+        timeout_secs: u64,
+    ) -> Result<(), EngineError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if let Ok(client) = self.sovd_client(comp).await {
+                if let Ok(body) = client.read_status(comp).await {
+                    let ready = matches!(body.status, sovd_core::EntityStatus::Ready);
+                    let bumped = body
+                        .extensions
+                        .get("x-sumo-runtime")
+                        .and_then(|r| r.get("boot_count"))
+                        .and_then(|v| v.as_u64())
+                        .is_some_and(|c| c > baseline);
+                    if ready && bumped {
+                        return Ok(());
+                    }
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err(EngineError::Timeout {
+                    component: comp.to_string(),
+                    operation: "reboot (boot_count verify)".into(),
                 });
             }
         }
