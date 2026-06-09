@@ -31,6 +31,14 @@ pub struct FlashEngine {
     token: Arc<dyn TokenSource>,
     trust_anchor: Vec<u8>,
     timeouts: EngineTimeouts,
+    /// Force every staged component through the ONE-node-reboot activation path
+    /// (`RequiresEcuReset`) instead of each component's declared reset_kind. The
+    /// workshop campaign sets this so a banked step activates via a single node
+    /// reboot — both banks boot their new images together via the boot selector,
+    /// rather than racy per-component relaunches. Field/OTA leaves it false: the
+    /// onboard orchestrator never reboots a moving vehicle; activation waits for
+    /// the next power cycle.
+    force_ecu_reset: bool,
 }
 
 impl FlashEngine {
@@ -45,7 +53,15 @@ impl FlashEngine {
             token,
             trust_anchor,
             timeouts,
+            force_ecu_reset: false,
         }
+    }
+
+    /// Activate every staged component via one coalesced node reboot rather than
+    /// its declared reset_kind — see [`force_ecu_reset`](Self::force_ecu_reset).
+    pub fn with_force_ecu_reset(mut self, force: bool) -> Self {
+        self.force_ecu_reset = force;
+        self
     }
 
     /// No-mix guard: read each component's `x-sumo-update-mode` and reject a
@@ -211,10 +227,15 @@ impl FlashEngine {
         let mut local: Vec<(String, Option<String>, String)> = Vec::new();
         let mut by_ecu: BTreeMap<Option<String>, Vec<(String, String)>> = BTreeMap::new();
         for (comp, gw, update_id) in &staged {
-            let token = self.token.token(comp).await?;
-            let kind =
+            let kind = if self.force_ecu_reset {
+                // Workshop campaign: activate the whole step with ONE node reboot,
+                // regardless of each component's declared (e.g. Local) reset_kind.
+                sovd_core::ResetKind::RequiresEcuReset
+            } else {
+                let token = self.token.token(comp).await?;
                 ecu::fetch_reset_kind(&self.server_url, comp, gw.as_deref(), update_id, &token)
-                    .await?;
+                    .await?
+            };
             match kind {
                 sovd_core::ResetKind::None | sovd_core::ResetKind::Local => {
                     local.push((comp.clone(), gw.clone(), update_id.clone()));

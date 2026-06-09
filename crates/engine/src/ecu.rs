@@ -154,16 +154,23 @@ pub async fn flash_ecu_to_staging(
         // SUIT-backed: upload detached payloads in component order, streaming
         // files so a multi-hundred-MB image never lands in RAM.
         for payload in &job.payloads {
-            info!(component = %comp, uri = %payload.uri, "uploading payload");
+            // Size up front so the per-payload log reports it *before* a big
+            // (hundreds-of-MB) upload starts, then throughput after it finishes.
+            let size: u64 = match &payload.source {
+                PayloadSource::File(path) => tokio::fs::metadata(path)
+                    .await
+                    .map_err(|e| EngineError::FlashFailed {
+                        component: comp.clone(),
+                        message: format!("stat payload {}: {e}", path.display()),
+                    })?
+                    .len(),
+                PayloadSource::Bytes(bytes) => bytes.len() as u64,
+            };
+            let mb = size as f64 / 1_048_576.0;
+            info!(component = %comp, uri = %payload.uri, "uploading payload ({mb:.2} MB)");
+            let started = std::time::Instant::now();
             match &payload.source {
                 PayloadSource::File(path) => {
-                    let len = tokio::fs::metadata(path)
-                        .await
-                        .map_err(|e| EngineError::FlashFailed {
-                            component: comp.clone(),
-                            message: format!("stat payload {}: {e}", path.display()),
-                        })?
-                        .len();
                     let file = tokio::fs::File::open(path).await.map_err(|e| {
                         EngineError::FlashFailed {
                             component: comp.clone(),
@@ -172,7 +179,7 @@ pub async fn flash_ecu_to_staging(
                     })?;
                     let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
                     flash_client
-                        .upload_part_stream(&payload.uri, body, Some(len))
+                        .upload_part_stream(&payload.uri, body, Some(size))
                         .await
                         .map_err(|e| EngineError::FlashFailed {
                             component: comp.clone(),
@@ -189,6 +196,13 @@ pub async fn flash_ecu_to_staging(
                         })?;
                 }
             }
+            let secs = started.elapsed().as_secs_f64();
+            let rate = if secs > 0.0 { mb / secs } else { 0.0 };
+            info!(
+                component = %comp,
+                uri = %payload.uri,
+                "uploaded payload: {mb:.2} MB in {secs:.2}s ({rate:.2} MB/s)"
+            );
         }
     }
 
