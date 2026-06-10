@@ -283,16 +283,6 @@ impl FlashEngine {
 
         // 4. RequiresEcuReset: one restart per affected ECU, then poll the group.
         for (gateway_id, comps) in by_ecu {
-            // Capture each component's boot_count BEFORE the reboot — the
-            // orchestrator holds the baseline (the device loses it across its own
-            // reboot). Absent => the device doesn't report it; we fall back to the
-            // activation poll below (no regression on older firmware).
-            let mut baselines: BTreeMap<String, u64> = BTreeMap::new();
-            for (comp_id, _) in &comps {
-                if let Some(bc) = self.read_boot_count(comp_id).await {
-                    baselines.insert(comp_id.clone(), bc);
-                }
-            }
             for (comp_id, _) in &comps {
                 if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
                     s.state = EcuState::AwaitingSystemReboot;
@@ -328,30 +318,53 @@ impl FlashEngine {
                 continue;
             }
 
-            // Confirm each staged component actually rebooted, then mark it
-            // Activated — reboot-safe: reads `/status` (boot_count + ready),
-            // NEVER the per-component `/updates` session (the node reboot wiped
-            // it, so re-attaching would 404). The orchestrator-held boot_count
-            // baseline rejects "rebooted too soon"; components that don't report
-            // it fall back to a ready-only check. On confirmation the component
-            // is Activated (new bank booted + guest healthy) — `commit_all`'s
-            // node-level verdict then commits the whole in-trial set at once
-            // (the update *session* is the commit unit), so there is no
-            // per-component activation poll to re-attach here.
+            // Confirm the NODE actually rebooted: its SOVD server restarts WITH
+            // the node, so observe the server go unreachable then reachable
+            // again. The orchestrator witnesses that transition directly, so it
+            // can't be faked by a stale pre-reset answer ("rebooted too soon").
+            // The per-component `boot_count` is NOT a usable witness here: it is
+            // bumped only by a per-component `ecu_reset`, never by a node reboot,
+            // so it stays flat across the reboot. Done once for the node via a
+            // representative component's `/status`.
+            let probe = comps
+                .first()
+                .map(|(c, _)| c.clone())
+                .unwrap_or_else(|| restart_key.to_string());
+            if let Err(err) = self
+                .wait_node_rebooted(&probe, self.timeouts.ecu_reset_activation_secs)
+                .await
+            {
+                error!(error = %err, "node reboot not observed — SOVD server never went down then up");
+                for (comp_id, _) in &comps {
+                    if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
+                        s.state = EcuState::Failed;
+                        s.error = Some(format!("{err}"));
+                    }
+                }
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+                continue;
+            }
+
+            // The node is back. Each staged component → `ready` (its guest booted
+            // the new bank and reports healthy) ⇒ Activated; `commit_all`'s
+            // node-level verdict then commits the whole in-trial set at once (the
+            // update *session* is the commit unit) — there is no per-component
+            // `/updates` session to re-attach (the reboot wiped it).
             for (comp_id, _update_id) in &comps {
-                let baseline = baselines.get(comp_id).copied();
                 match self
-                    .wait_rebooted(comp_id, baseline, self.timeouts.ecu_reset_activation_secs)
+                    .wait_ready(comp_id, self.timeouts.ecu_reset_activation_secs)
                     .await
                 {
                     Ok(()) => {
-                        info!(component = %comp_id, ?baseline, "reboot confirmed via /status — activated");
+                        info!(component = %comp_id, "ready after node reboot — activated");
                         if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
                             s.state = EcuState::Activated;
                         }
                     }
                     Err(err) => {
-                        error!(component = %comp_id, error = %err, "reboot verify failed");
+                        error!(component = %comp_id, error = %err, "component not ready after node reboot");
                         if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
                             s.state = EcuState::Failed;
                             s.error = Some(format!("{err}"));
@@ -683,49 +696,56 @@ impl FlashEngine {
         }
     }
 
-    /// Read a component's monotonic boot/restart counter from its SOVD entity
-    /// status (§7.19.2 → vendor `x-sumo-runtime.boot_count`). `None` if the device
-    /// doesn't report it (older firmware) — callers fall back to reachability.
-    async fn read_boot_count(&self, comp: &str) -> Option<u64> {
-        let client = self.sovd_client(comp).await.ok()?;
-        let body = client.read_status(comp).await.ok()?;
-        body.extensions
-            .get("x-sumo-runtime")?
-            .get("boot_count")?
-            .as_u64()
+    /// Whether the node's SOVD server currently answers `GET {comp}/status`.
+    /// A liveness probe for the node-reboot observation — only reachability
+    /// matters, not the body.
+    async fn node_reachable(&self, comp: &str) -> bool {
+        match self.sovd_client(comp).await {
+            Ok(client) => client.read_status(comp).await.is_ok(),
+            Err(_) => false,
+        }
     }
 
-    /// Confirm a component actually rebooted, the SOVD way (§7.19.2): poll its
-    /// entity status until it reports `ready` AND (when `baseline` is `Some`) a
-    /// `boot_count` strictly greater than the orchestrator-held baseline. A
-    /// monotonic counter can't be faked by a stale pre-reset answer, so this
-    /// rejects the "rebooted too soon" false-positive a bare reachability/`ready`
-    /// check would accept. `baseline == None` (older firmware that doesn't report
-    /// `boot_count`) degrades to a ready-only check — still reboot-safe, since it
-    /// reads `/status`, never the wiped `/updates` session. Tolerates the node
-    /// being unreachable mid-reboot (transient errors retried).
-    async fn wait_rebooted(
-        &self,
-        comp: &str,
-        baseline: Option<u64>,
-        timeout_secs: u64,
-    ) -> Result<(), EngineError> {
+    /// Confirm the node rebooted by observing its SOVD server go UNREACHABLE
+    /// then REACHABLE again — the server restarts with the node, so this
+    /// down→up transition is a reboot proof the orchestrator witnesses
+    /// directly. It can't be faked by a stale pre-reset answer ("rebooted too
+    /// soon"): no `/status` answer is trusted until the server has been seen
+    /// down at least once and then up again. This replaces the per-component
+    /// `boot_count` witness, which a node reboot never bumps (only a
+    /// per-component `ecu_reset` does). Polls a representative component.
+    async fn wait_node_rebooted(&self, probe: &str, timeout_secs: u64) -> Result<(), EngineError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        let mut saw_down = false;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if self.node_reachable(probe).await {
+                if saw_down {
+                    return Ok(());
+                }
+            } else {
+                saw_down = true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err(EngineError::Timeout {
+                    component: probe.to_string(),
+                    operation: "node reboot (SOVD server down→up)".into(),
+                });
+            }
+        }
+    }
+
+    /// Wait until a component reports `ready` (its guest booted the new bank and
+    /// is healthy). The node is already back up (see [`wait_node_rebooted`]), so
+    /// this only waits on guest boot. Reads `/status` — never the wiped
+    /// `/updates` session.
+    async fn wait_ready(&self, comp: &str, timeout_secs: u64) -> Result<(), EngineError> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             if let Ok(client) = self.sovd_client(comp).await {
                 if let Ok(body) = client.read_status(comp).await {
-                    let ready = matches!(body.status, sovd_core::EntityStatus::Ready);
-                    let bumped = match baseline {
-                        Some(b) => body
-                            .extensions
-                            .get("x-sumo-runtime")
-                            .and_then(|r| r.get("boot_count"))
-                            .and_then(|v| v.as_u64())
-                            .is_some_and(|c| c > b),
-                        None => true,
-                    };
-                    if ready && bumped {
+                    if matches!(body.status, sovd_core::EntityStatus::Ready) {
                         return Ok(());
                     }
                 }
@@ -733,7 +753,7 @@ impl FlashEngine {
             if tokio::time::Instant::now() > deadline {
                 return Err(EngineError::Timeout {
                     component: comp.to_string(),
-                    operation: "reboot verify (/status)".into(),
+                    operation: "ready after node reboot".into(),
                 });
             }
         }
