@@ -7,6 +7,8 @@
 //! or security state. The driver unlocks the ECU (UDS) before staging.
 
 use sovd_client::flash::{FlashClient, FlashError};
+use sovd_client::SovdClient;
+use sovd_core::EntityStatus;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
 use tracing::{debug, info};
@@ -291,25 +293,104 @@ pub async fn flash_ecu_to_staging(
     })
 }
 
-/// Reset one ECU and wait until it reaches `Activated`.
-pub async fn reset_and_activate(
+/// Build a base-URL `SovdClient` for reading `/status` (bearer token when
+/// non-empty). Cheap to construct per call.
+fn status_client(server_url: &str, token: &str) -> Result<SovdClient, EngineError> {
+    let client = if token.is_empty() {
+        SovdClient::new(server_url)
+    } else {
+        SovdClient::with_bearer_token(server_url, token)
+    };
+    client.map_err(|e| EngineError::Sovd {
+        component: String::new(),
+        message: format!("sovd client: {e}"),
+    })
+}
+
+/// Read a component's heartbeat `boot_id` from `/status` `x-sumo-runtime`.
+/// `None` when the component reports no heartbeat (offline, or a non-heartbeat
+/// component like host-os) or `/status` is unreachable — callers treat absence
+/// as "no boot_id witness" and fall back to the observed server down→up.
+pub async fn read_boot_id(server_url: &str, component_id: &str, token: &str) -> Option<u32> {
+    let client = status_client(server_url, token).ok()?;
+    let body = client.read_status(component_id).await.ok()?;
+    body.extensions
+        .get("x-sumo-runtime")?
+        .get("boot_id")?
+        .as_u64()
+        .map(|v| v as u32)
+}
+
+/// Wait until a component is **rebooted and ready** — the converged verify the
+/// orchestrator uses for every reset kind. Polls `/status` (tolerating the
+/// server being unreachable mid-reboot) until `status == ready` AND a reboot is
+/// witnessed:
+/// - the heartbeat `boot_id` changed from `baseline` — a fresh guest lifetime,
+///   the primary witness for heartbeat components (works for a node reboot AND a
+///   per-VM relaunch; a stale heartbeat carries the OLD boot_id so it can't fool
+///   us); OR
+/// - the component reports no `boot_id` at all (non-heartbeat, e.g. host-os) and
+///   the SOVD server was seen to go down→up (the node restarted).
+///
+/// `baseline == None` (the component was offline pre-reset, e.g. factory
+/// provision) accepts the first heartbeat that appears.
+pub async fn wait_activated(
     server_url: &str,
     component_id: &str,
-    gateway_id: Option<&str>,
-    update_id: &str,
+    baseline: Option<u32>,
     timeout_secs: u64,
     token: &str,
 ) -> Result<(), EngineError> {
+    let client = status_client(server_url, token)?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut saw_down = false;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        match client.read_status(component_id).await {
+            Ok(body) => {
+                let ready = matches!(body.status, EntityStatus::Ready);
+                let cur = body
+                    .extensions
+                    .get("x-sumo-runtime")
+                    .and_then(|r| r.get("boot_id"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                let rebooted = match (baseline, cur) {
+                    (Some(b), Some(c)) => c != b, // heartbeat: a new guest lifetime
+                    (None, Some(_)) => true,      // was offline: first lifetime is the boot
+                    (_, None) => saw_down,        // no heartbeat: node down→up witness
+                };
+                if ready && rebooted {
+                    return Ok(());
+                }
+            }
+            // Unreachable mid-reboot (the node went down) — record it as a
+            // fallback witness for non-heartbeat components and keep polling.
+            Err(_) => saw_down = true,
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Err(EngineError::Timeout {
+                component: component_id.to_string(),
+                operation: "reboot+ready (/status boot_id)".into(),
+            });
+        }
+    }
+}
+
+/// Local reset of one component: capture its boot_id, restart it, and wait for a
+/// fresh, ready lifetime — the per-component analogue of the node path, same
+/// `/status` boot_id witness, just a per-component `status/restart` instead of a
+/// coalesced node reboot.
+pub async fn restart_and_verify(
+    server_url: &str,
+    component_id: &str,
+    gateway_id: Option<&str>,
+    timeout_secs: u64,
+    token: &str,
+) -> Result<(), EngineError> {
+    let baseline = read_boot_id(server_url, component_id, token).await;
     trigger_local_restart(server_url, component_id, gateway_id, token).await?;
-    wait_for_activation(
-        server_url,
-        component_id,
-        gateway_id,
-        update_id,
-        timeout_secs,
-        token,
-    )
-    .await
+    wait_activated(server_url, component_id, baseline, timeout_secs, token).await
 }
 
 /// Issue a node-level verdict — the entity-root vendor operation that commits
@@ -374,76 +455,6 @@ pub async fn trigger_local_restart(
             message: format!("reset: {e}"),
         })?;
     Ok(())
-}
-
-/// Poll `/updates` status until the component reaches a terminal `execute`
-/// state (`awaiting-verdict` ready-to-commit, or `completed`). Survives the
-/// ECU being unreachable during reboot — transient poll errors are retried.
-pub async fn wait_for_activation(
-    server_url: &str,
-    component_id: &str,
-    gateway_id: Option<&str>,
-    update_id: &str,
-    timeout_secs: u64,
-    token: &str,
-) -> Result<(), EngineError> {
-    let flash_client = build_flash_client(server_url, component_id, gateway_id, token)?;
-    info!(component = %component_id, update_id = %update_id, "waiting for activation");
-    flash_client
-        .attach(update_id)
-        .await
-        .map_err(|e| EngineError::FlashFailed {
-            component: component_id.to_string(),
-            message: format!("attach: {e}"),
-        })?;
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        match flash_client.spec_status().await {
-            Ok(body) => match (
-                body.phase.as_str(),
-                body.status.as_str(),
-                body.substate.as_deref(),
-            ) {
-                ("execute", "inProgress", Some("awaiting-verdict")) => {
-                    info!(component = %component_id, "execute paused at awaiting-verdict — ready to commit");
-                    return Ok(());
-                }
-                ("execute", "completed", _) => {
-                    info!(component = %component_id, "execute completed (auto-committed)");
-                    return Ok(());
-                }
-                ("execute", "failed", _) => {
-                    return Err(EngineError::FlashFailed {
-                        component: component_id.to_string(),
-                        message: format!(
-                            "execute failed during/after reset: {}",
-                            body.error.map(|e| e.message).unwrap_or_default()
-                        ),
-                    });
-                }
-                _ => {
-                    debug!(
-                        component = %component_id,
-                        phase = %body.phase,
-                        status = %body.status,
-                        substate = ?body.substate,
-                        "wait_for_activation: still in flight"
-                    );
-                }
-            },
-            Err(_) => {
-                debug!(component = %component_id, "spec_status poll failed, retrying");
-            }
-        }
-        if tokio::time::Instant::now() > deadline {
-            return Err(EngineError::Timeout {
-                component: component_id.to_string(),
-                operation: "activation".into(),
-            });
-        }
-    }
 }
 
 /// Read a component's declared `reset_kind` off the `/updates` wire (the

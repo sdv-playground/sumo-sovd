@@ -16,8 +16,8 @@ use sovd_core::models::{
     OperationInfo, ParameterInfo, SecurityMode, SecurityState, SessionMode,
 };
 use sovd_core::{
-    ActivationState, DiagnosticBackend, FlashProgress, FlashState, FlashStatus, PackageInfo,
-    PackageStatus, VerifyResult,
+    ActivationState, DiagnosticBackend, EntityStatus, EntityStatusBody, FlashProgress, FlashState,
+    FlashStatus, PackageInfo, PackageStatus, VerifyResult,
 };
 
 use sumo_sovd_flash_engine::{
@@ -38,6 +38,9 @@ struct TestBackend {
     flash_state: RwLock<FlashState>,
     transfer_counter: AtomicU32,
     reset_count: AtomicU32,
+    /// Heartbeat boot_id surfaced in `/status`; `ecu_reset` bumps it to simulate
+    /// a fresh guest lifetime (the reboot the orchestrator witnesses).
+    boot_id: AtomicU32,
     update_mode: RwLock<Option<(bool, String)>>,
     fail_flash: RwLock<Option<String>>,
 }
@@ -65,6 +68,7 @@ impl TestBackend {
             flash_state: RwLock::new(FlashState::Complete),
             transfer_counter: AtomicU32::new(0),
             reset_count: AtomicU32::new(0),
+            boot_id: AtomicU32::new(1),
             update_mode: RwLock::new(None),
             fail_flash: RwLock::new(None),
         }
@@ -254,10 +258,26 @@ impl DiagnosticBackend for TestBackend {
     }
     async fn ecu_reset(&self, _reset_type: u8) -> BackendResult<Option<u8>> {
         self.reset_count.fetch_add(1, Ordering::SeqCst);
+        // New guest lifetime → a fresh boot_id the orchestrator witnesses via /status.
+        self.boot_id.fetch_add(1, Ordering::SeqCst);
         *self.session.write() = "default".into();
         *self.security_unlocked.write() = false;
         *self.flash_state.write() = FlashState::Activated;
         Ok(None)
+    }
+    async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
+        let mut runtime = serde_json::Map::new();
+        runtime.insert(
+            "boot_id".into(),
+            serde_json::json!(self.boot_id.load(Ordering::SeqCst)),
+        );
+        let mut extensions = serde_json::Map::new();
+        extensions.insert("x-sumo-runtime".into(), serde_json::Value::Object(runtime));
+        Ok(EntityStatusBody {
+            status: EntityStatus::Ready,
+            extensions,
+            ..Default::default()
+        })
     }
     async fn get_activation_state(&self) -> BackendResult<ActivationState> {
         Ok(ActivationState {

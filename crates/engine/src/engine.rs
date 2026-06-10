@@ -258,31 +258,37 @@ impl FlashEngine {
 
         let mut first_err: Option<EngineError> = None;
 
-        // 3. Local: concurrent per-component restart.
+        // 3. Local: concurrent per-component restart + boot_id verify.
         if !local.is_empty() {
             let mut set = tokio::task::JoinSet::new();
-            for (comp, gw, update_id) in local {
+            for (comp, gw, _update_id) in local {
                 let url = self.server_url.clone();
                 let token = self.token.token(&comp).await?;
                 let secs = self.timeouts.local_reset_secs;
                 set.spawn(async move {
-                    let result = ecu::reset_and_activate(
-                        &url,
-                        &comp,
-                        gw.as_deref(),
-                        &update_id,
-                        secs,
-                        &token,
-                    )
-                    .await;
+                    let result =
+                        ecu::restart_and_verify(&url, &comp, gw.as_deref(), secs, &token).await;
                     (comp, result)
                 });
             }
             collect_results(&mut set, ecus, EcuState::Activated, &mut first_err).await;
         }
 
-        // 4. RequiresEcuReset: one restart per affected ECU, then poll the group.
+        // 4. RequiresEcuReset: one coalesced node restart, then verify each
+        //    staged component rebooted-and-ready via /status (boot_id changed).
         for (gateway_id, comps) in by_ecu {
+            // Capture each component's heartbeat boot_id BEFORE the reboot — a
+            // *changed* boot_id afterwards proves a fresh guest lifetime (the
+            // reboot took effect). Absent for offline/non-heartbeat components →
+            // wait_activated falls back to the observed server down→up.
+            let mut baselines: BTreeMap<String, Option<u32>> = BTreeMap::new();
+            for (comp_id, _) in &comps {
+                let token = self.token.token(comp_id).await?;
+                baselines.insert(
+                    comp_id.clone(),
+                    ecu::read_boot_id(&self.server_url, comp_id, &token).await,
+                );
+            }
             for (comp_id, _) in &comps {
                 if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
                     s.state = EcuState::AwaitingSystemReboot;
@@ -318,63 +324,25 @@ impl FlashEngine {
                 continue;
             }
 
-            // Confirm the NODE actually rebooted: its SOVD server restarts WITH
-            // the node, so observe the server go unreachable then reachable
-            // again. The orchestrator witnesses that transition directly, so it
-            // can't be faked by a stale pre-reset answer ("rebooted too soon").
-            // The per-component `boot_count` is NOT a usable witness here: it is
-            // bumped only by a per-component `ecu_reset`, never by a node reboot,
-            // so it stays flat across the reboot. Done once for the node via a
-            // representative component's `/status`.
-            let probe = comps
-                .first()
-                .map(|(c, _)| c.clone())
-                .unwrap_or_else(|| restart_key.to_string());
-            if let Err(err) = self
-                .wait_node_rebooted(&probe, self.timeouts.ecu_reset_activation_secs)
-                .await
-            {
-                error!(error = %err, "node reboot not observed — SOVD server never went down then up");
-                for (comp_id, _) in &comps {
-                    if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
-                        s.state = EcuState::Failed;
-                        s.error = Some(format!("{err}"));
-                    }
-                }
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
-                continue;
+            // Verify each staged component rebooted-and-ready, concurrently so
+            // all observe the node-down window together. A changed heartbeat
+            // boot_id + status==ready ⇒ Activated (the reboot took effect and the
+            // guest is healthy); `commit_all`'s node verdict then commits the
+            // whole in-trial set at once (the update *session* is the commit
+            // unit) — no per-component `/updates` session to re-attach (the
+            // reboot wiped it).
+            let mut set = tokio::task::JoinSet::new();
+            for (comp_id, _update_id) in comps {
+                let url = self.server_url.clone();
+                let token = self.token.token(&comp_id).await?;
+                let secs = self.timeouts.ecu_reset_activation_secs;
+                let baseline = baselines.get(&comp_id).copied().flatten();
+                set.spawn(async move {
+                    let result = ecu::wait_activated(&url, &comp_id, baseline, secs, &token).await;
+                    (comp_id, result)
+                });
             }
-
-            // The node is back. Each staged component → `ready` (its guest booted
-            // the new bank and reports healthy) ⇒ Activated; `commit_all`'s
-            // node-level verdict then commits the whole in-trial set at once (the
-            // update *session* is the commit unit) — there is no per-component
-            // `/updates` session to re-attach (the reboot wiped it).
-            for (comp_id, _update_id) in &comps {
-                match self
-                    .wait_ready(comp_id, self.timeouts.ecu_reset_activation_secs)
-                    .await
-                {
-                    Ok(()) => {
-                        info!(component = %comp_id, "ready after node reboot — activated");
-                        if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
-                            s.state = EcuState::Activated;
-                        }
-                    }
-                    Err(err) => {
-                        error!(component = %comp_id, error = %err, "component not ready after node reboot");
-                        if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp_id) {
-                            s.state = EcuState::Failed;
-                            s.error = Some(format!("{err}"));
-                        }
-                        if first_err.is_none() {
-                            first_err = Some(err);
-                        }
-                    }
-                }
-            }
+            collect_results(&mut set, ecus, EcuState::Activated, &mut first_err).await;
         }
 
         // 5. Reboot committed singleshot components that declared a reset_kind,
@@ -691,69 +659,6 @@ impl FlashEngine {
                 return Err(EngineError::Timeout {
                     component: key.to_string(),
                     operation: "reboot (singleshot)".into(),
-                });
-            }
-        }
-    }
-
-    /// Whether the node's SOVD server currently answers `GET {comp}/status`.
-    /// A liveness probe for the node-reboot observation — only reachability
-    /// matters, not the body.
-    async fn node_reachable(&self, comp: &str) -> bool {
-        match self.sovd_client(comp).await {
-            Ok(client) => client.read_status(comp).await.is_ok(),
-            Err(_) => false,
-        }
-    }
-
-    /// Confirm the node rebooted by observing its SOVD server go UNREACHABLE
-    /// then REACHABLE again — the server restarts with the node, so this
-    /// down→up transition is a reboot proof the orchestrator witnesses
-    /// directly. It can't be faked by a stale pre-reset answer ("rebooted too
-    /// soon"): no `/status` answer is trusted until the server has been seen
-    /// down at least once and then up again. This replaces the per-component
-    /// `boot_count` witness, which a node reboot never bumps (only a
-    /// per-component `ecu_reset` does). Polls a representative component.
-    async fn wait_node_rebooted(&self, probe: &str, timeout_secs: u64) -> Result<(), EngineError> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let mut saw_down = false;
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            if self.node_reachable(probe).await {
-                if saw_down {
-                    return Ok(());
-                }
-            } else {
-                saw_down = true;
-            }
-            if tokio::time::Instant::now() > deadline {
-                return Err(EngineError::Timeout {
-                    component: probe.to_string(),
-                    operation: "node reboot (SOVD server down→up)".into(),
-                });
-            }
-        }
-    }
-
-    /// Wait until a component reports `ready` (its guest booted the new bank and
-    /// is healthy). The node is already back up (see [`wait_node_rebooted`]), so
-    /// this only waits on guest boot. Reads `/status` — never the wiped
-    /// `/updates` session.
-    async fn wait_ready(&self, comp: &str, timeout_secs: u64) -> Result<(), EngineError> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if let Ok(client) = self.sovd_client(comp).await {
-                if let Ok(body) = client.read_status(comp).await {
-                    if matches!(body.status, sovd_core::EntityStatus::Ready) {
-                        return Ok(());
-                    }
-                }
-            }
-            if tokio::time::Instant::now() > deadline {
-                return Err(EngineError::Timeout {
-                    component: comp.to_string(),
-                    operation: "ready after node reboot".into(),
                 });
             }
         }
