@@ -7,8 +7,8 @@ description = "Device-buildable SOVD flash execution engine (FlashPlan → guard
 
 [dependencies]
 # SUIT manifest classification (firmware vs application vs policy)
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", branch = "main" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
 
 # SOVD REST wire — the engine talks to the device only through this client.
 sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
