@@ -15,8 +15,8 @@ use sovd_core::models::{
     OperationInfo, ParameterInfo, SecurityMode, SecurityState, SessionMode,
 };
 use sovd_core::{
-    ActivationState, DiagnosticBackend, FlashProgress, FlashState, FlashStatus, PackageInfo,
-    PackageStatus, VerifyResult,
+    ActivationState, DiagnosticBackend, EntityStatus, EntityStatusBody, FlashProgress, FlashState,
+    FlashStatus, PackageInfo, PackageStatus, VerifyResult,
 };
 
 use sumo_sovd_orchestrator::campaign::{CampaignConfig, CampaignOrchestrator, EcuState, EcuTarget};
@@ -35,6 +35,10 @@ struct TestBackend {
     flash_state: RwLock<FlashState>,
     transfer_counter: AtomicU32,
     fail_flash: RwLock<Option<String>>,
+    // Heartbeat boot counter — bumped by ecu_reset so the engine's
+    // reboot-witness (`/status` x-sumo-runtime boot_id change) can pass
+    // against the in-process server, which never actually goes down.
+    boot_id: AtomicU32,
 }
 
 impl TestBackend {
@@ -60,6 +64,7 @@ impl TestBackend {
             flash_state: RwLock::new(FlashState::Complete),
             transfer_counter: AtomicU32::new(0),
             fail_flash: RwLock::new(None),
+            boot_id: AtomicU32::new(1),
         }
     }
 }
@@ -244,7 +249,21 @@ impl DiagnosticBackend for TestBackend {
         *self.session.write() = "default".into();
         *self.security_unlocked.write() = false;
         *self.flash_state.write() = FlashState::Activated;
+        self.boot_id.fetch_add(1, Ordering::SeqCst);
         Ok(None)
+    }
+
+    async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
+        let mut extensions = serde_json::Map::new();
+        extensions.insert(
+            "x-sumo-runtime".into(),
+            serde_json::json!({ "boot_id": self.boot_id.load(Ordering::SeqCst) }),
+        );
+        Ok(EntityStatusBody {
+            status: EntityStatus::Ready,
+            extensions,
+            ..Default::default()
+        })
     }
 
     async fn get_activation_state(&self) -> BackendResult<ActivationState> {
