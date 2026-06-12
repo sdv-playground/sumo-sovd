@@ -66,6 +66,18 @@ impl TokenSource for NoAuth {
     }
 }
 
+/// A fixed operator-supplied bearer JWT, used verbatim for every component — the
+/// campaign counterpart of the rig's `RigToken::Static`. (Auto-minting a
+/// per-device JWT via `sovd-token-helper`, like `RigToken::Mint`, is a follow-up.)
+pub struct StaticToken(pub String);
+
+#[async_trait]
+impl TokenSource for StaticToken {
+    async fn token(&self, _component_id: &str) -> Result<String, EngineError> {
+        Ok(self.0.clone())
+    }
+}
+
 /// What kind of update a manifest represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateType {

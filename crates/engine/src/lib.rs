@@ -15,5 +15,5 @@ pub use engine::FlashEngine;
 pub use error::EngineError;
 pub use types::{
     CampaignReport, EcuState, EcuStatus, EngineTimeouts, FlashJob, FlashPlan, NoAuth, Payload,
-    PayloadSource, TokenSource, UpdateType,
+    PayloadSource, StaticToken, TokenSource, UpdateType,
 };

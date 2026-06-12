@@ -20,7 +20,7 @@ use crate::security_helper::{ComputeKeyRequest, SecurityHelperClient, SecurityHe
 
 pub use sumo_sovd_flash_engine::{EcuState, EcuStatus, UpdateType};
 use sumo_sovd_flash_engine::{
-    EngineTimeouts, FlashEngine, FlashJob, FlashPlan, NoAuth, Payload, PayloadSource,
+    EngineTimeouts, FlashEngine, FlashJob, FlashPlan, NoAuth, Payload, PayloadSource, StaticToken,
 };
 
 /// Configuration for a campaign deployment.
@@ -33,6 +33,10 @@ pub struct CampaignConfig {
     /// lifecycle visibly passes through `Validated` (reserved; the current
     /// /updates execute flow lands at AwaitingReboot directly).
     pub use_validated_flow: bool,
+    /// Operator-supplied SOVD bearer JWT for the flash engine's calls. `None`
+    /// builds unauthenticated clients (the device may not enforce auth yet).
+    /// Auto-minting per device (like rig's `RigToken::Mint`) is a follow-up.
+    pub sovd_token: Option<String>,
 }
 
 /// Target ECU for a campaign.
@@ -83,10 +87,15 @@ pub struct CampaignOrchestrator {
 impl CampaignOrchestrator {
     pub fn new(config: CampaignConfig) -> Self {
         let helper = SecurityHelperClient::new(config.security_helper.clone());
-        // Campaign drives a device SOVD that doesn't enforce auth yet → NoAuth.
+        // Inject the operator-supplied SOVD bearer if present, else NoAuth (the
+        // device may not enforce auth yet). Mirrors rig's injected `TokenSource`.
+        let token: Arc<dyn sumo_sovd_flash_engine::TokenSource> = match config.sovd_token.clone() {
+            Some(jwt) if !jwt.is_empty() => Arc::new(StaticToken(jwt)),
+            _ => Arc::new(NoAuth),
+        };
         let engine = FlashEngine::new(
             config.server_url.clone(),
-            Arc::new(NoAuth),
+            token,
             config.trust_anchor.clone(),
             EngineTimeouts::default(),
         );

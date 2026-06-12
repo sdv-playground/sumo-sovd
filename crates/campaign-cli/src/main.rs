@@ -55,6 +55,11 @@ struct Cli {
     #[arg(long, default_value = "dev-secret-123", global = true)]
     helper_token: String,
 
+    /// SOVD bearer JWT for the flash engine (operator-supplied). Omitted →
+    /// unauthenticated (the device may not enforce auth yet).
+    #[arg(long, global = true)]
+    sovd_token: Option<String>,
+
     /// Drive each ECU through the Validated state explicitly via
     /// validate() → activate() after transfer_exit. Demonstrates the
     /// new opt-in lifecycle; default is the classic flow.
@@ -187,6 +192,7 @@ async fn main() {
             token: cli.helper_token,
         },
         use_validated_flow: cli.validated,
+        sovd_token: cli.sovd_token,
     });
 
     let result = match cli.command {
