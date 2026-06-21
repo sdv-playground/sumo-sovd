@@ -14,7 +14,7 @@ use crate::ecu;
 use crate::error::EngineError;
 use crate::types::{
     CampaignReport, CampaignStep, EcuState, EcuStatus, EngineTimeouts, FlashPlan, HealthCheck,
-    NoPrepare, Prepare, TokenSource, UpdateType,
+    TokenSource, UpdateType,
 };
 
 /// Subset of the device's `x-sumo-update-mode` payload the engine reads: the
@@ -560,33 +560,12 @@ impl FlashEngine {
         health: &dyn HealthCheck,
         no_commit: bool,
     ) -> Result<CampaignReport, EngineError> {
-        self.run_campaign_with_prepare(steps, &NoPrepare, health, no_commit)
-            .await
-    }
-
-    /// [`Self::run_campaign`] with an injected [`Prepare`] hook: the engine calls
-    /// `prepare` before staging each step's component, and again before committing
-    /// (the reset clears any UDS session). The campaign injects its UDS unlock here;
-    /// JWT-only drivers use [`NoPrepare`] (what `run_campaign` passes).
-    pub async fn run_campaign_with_prepare(
-        &self,
-        steps: Vec<CampaignStep>,
-        prepare: &dyn Prepare,
-        health: &dyn HealthCheck,
-        no_commit: bool,
-    ) -> Result<CampaignReport, EngineError> {
         let mut committed: Vec<EcuStatus> = Vec::new();
         for (idx, step) in steps.into_iter().enumerate() {
             // Each step activates in its own mode — a banked group coalesces into
             // one node reboot — so reconfigure force per step (cheap clone; shares
             // the token Arc).
             let eng = self.clone().with_force_ecu_reset(step.force_ecu_reset);
-            // Prepare (e.g. UDS unlock) each component before staging it.
-            for job in &step.jobs {
-                prepare
-                    .prepare(&job.component_id, job.gateway_id.as_deref())
-                    .await?;
-            }
             let plan = FlashPlan { jobs: step.jobs };
             eng.guard(&plan).await?;
             let mut ecus = eng.stage_all(&plan).await?;
@@ -594,12 +573,8 @@ impl FlashEngine {
 
             if !health.is_healthy(&ecus).await? {
                 // Unhealthy: roll this step's trial back, then abort — don't commit
-                // a bad baseline, and don't run later steps on top of it. The reset
-                // cleared the session, so re-prepare before the rollback verdict.
+                // a bad baseline, and don't run later steps on top of it.
                 warn!(step = idx, "campaign step unhealthy after reset — rolling back + aborting");
-                for e in ecus.iter().filter(|e| e.state == EcuState::Activated) {
-                    let _ = prepare.prepare(&e.component_id, e.gateway_id.as_deref()).await;
-                }
                 if let Err(e) = eng.rollback_all(&mut ecus).await {
                     warn!(step = idx, error = %e, "rollback of unhealthy step also failed");
                 }
@@ -610,13 +585,6 @@ impl FlashEngine {
             }
 
             if !no_commit {
-                // The reset cleared the session — re-prepare each trial component
-                // before the commit verdict.
-                for e in ecus.iter().filter(|e| e.state == EcuState::Activated) {
-                    prepare
-                        .prepare(&e.component_id, e.gateway_id.as_deref())
-                        .await?;
-                }
                 eng.commit_all(&mut ecus).await?;
             }
             committed.extend(ecus);

@@ -22,7 +22,7 @@ use sovd_core::{
 
 use sumo_sovd_flash_engine::{
     CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
-    FlashPlan, HealthCheck, NoAuth, Prepare, UpdateType,
+    FlashPlan, HealthCheck, NoAuth, UpdateType,
 };
 
 // =============================================================================
@@ -706,40 +706,4 @@ async fn run_campaign_unhealthy_step_rolls_back_and_aborts() {
     );
     // The step's trial was rolled back — never left committed on a bad baseline.
     assert_eq!(*b1.flash_state.read(), FlashState::RolledBack);
-}
-
-/// Records how many times the engine asked the driver to prepare (e.g. UDS unlock).
-struct RecordingPrepare {
-    calls: AtomicU32,
-}
-#[async_trait]
-impl Prepare for RecordingPrepare {
-    async fn prepare(&self, _component_id: &str, _gateway_id: Option<&str>) -> Result<(), EngineError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn run_campaign_calls_prepare_before_stage_and_before_commit() {
-    let b1 = Arc::new(TestBackend::new("ecu1"));
-    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
-    backends.insert("ecu1".into(), b1.clone());
-    let (url, _h) = serve(backends).await;
-    let eng = engine(&url);
-
-    let prepare = RecordingPrepare {
-        calls: AtomicU32::new(0),
-    };
-    let steps = vec![CampaignStep {
-        jobs: vec![job("ecu1", &[0x01])],
-        force_ecu_reset: false,
-    }];
-    eng.run_campaign_with_prepare(steps, &prepare, &CameUp, false)
-        .await
-        .unwrap();
-    // Once before staging the component, once before its commit (the reset cleared
-    // the session) — the campaign's UDS-unlock points.
-    assert_eq!(prepare.calls.load(Ordering::SeqCst), 2);
-    assert_eq!(*b1.flash_state.read(), FlashState::Committed);
 }

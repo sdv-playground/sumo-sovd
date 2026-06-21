@@ -14,33 +14,6 @@ pub struct FlashPlan {
     pub jobs: Vec<FlashJob>,
 }
 
-/// Per-step preparation hook, injected by the driver — the third seam beside
-/// [`TokenSource`] and [`HealthCheck`]. [`FlashEngine::run_campaign_with_prepare`]
-/// calls it before it stages a step's component, and again before it commits (an
-/// ECU reset clears the UDS session per ISO 14229, so the session must be
-/// re-established). The campaign establishes its UDS programming session + security
-/// unlock here; a JWT-only driver (the rig — auth rides entirely in the token) uses
-/// [`NoPrepare`].
-#[async_trait]
-pub trait Prepare: Send + Sync {
-    async fn prepare(
-        &self,
-        component_id: &str,
-        gateway_id: Option<&str>,
-    ) -> Result<(), EngineError>;
-}
-
-/// No-op preparation — for drivers whose auth rides entirely in the token (the
-/// rig, the onboard agent), with no UDS session to establish.
-pub struct NoPrepare;
-
-#[async_trait]
-impl Prepare for NoPrepare {
-    async fn prepare(&self, _component_id: &str, _gateway_id: Option<&str>) -> Result<(), EngineError> {
-        Ok(())
-    }
-}
-
 /// One step of a multi-step campaign ([`FlashEngine::run_campaign`]): a set of
 /// jobs flashed and activated **together**, plus the step's activation mode.
 /// `force_ecu_reset = true` (a banked group) coalesces the whole set through ONE
