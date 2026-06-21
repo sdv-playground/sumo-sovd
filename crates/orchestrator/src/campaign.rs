@@ -21,7 +21,10 @@ use crate::security_helper::{ComputeKeyRequest, SecurityHelperClient, SecurityHe
 pub use sumo_sovd_flash_engine::{
     EcuState, EcuStatus, NoAuth, StaticToken, TokenSource, UpdateType,
 };
-use sumo_sovd_flash_engine::{EngineTimeouts, FlashEngine, FlashJob, FlashPlan, Payload, PayloadSource};
+use sumo_sovd_flash_engine::{
+    CameUp, CampaignStep, EngineError, EngineTimeouts, FlashEngine, FlashJob, FlashPlan, Payload,
+    PayloadSource, Prepare,
+};
 
 /// Configuration for a campaign deployment.
 pub struct CampaignConfig {
@@ -166,6 +169,30 @@ impl CampaignOrchestrator {
         let mut ecus = self.stage_all(targets).await?.ecus;
         self.reset_all(&mut ecus).await?;
         Ok(FlashPhaseResult { ecus })
+    }
+
+    /// Flash all ECU targets through the shared per-step lifecycle
+    /// ([`FlashEngine::run_campaign`]): guard → stage → reset → health-gate
+    /// ([`CameUp`]) → commit (unless `no_commit`) | rollback + abort. The
+    /// campaign's UDS session/security unlock is injected as the engine's
+    /// [`Prepare`] hook (`self`), so the engine stays auth-model-agnostic — the
+    /// same loop the rig and onboard drivers use. Targets flash as one step
+    /// (mixed rollbackable + irreversible plans are rejected by the engine's
+    /// no-mix guard; group them into separate calls).
+    pub async fn run_campaign(
+        &self,
+        targets: Vec<EcuTarget>,
+        no_commit: bool,
+    ) -> Result<FlashPhaseResult, OrchestratorError> {
+        let step = CampaignStep {
+            jobs: targets.into_iter().map(target_to_job).collect(),
+            force_ecu_reset: false,
+        };
+        let report = self
+            .engine
+            .run_campaign_with_prepare(vec![step], self, &CameUp, no_commit)
+            .await?;
+        Ok(FlashPhaseResult { ecus: report.ecus })
     }
 
     /// Commit all activated firmware ECUs. Re-unlocks each first (the ECU reset
@@ -373,6 +400,24 @@ impl CampaignOrchestrator {
         }
 
         Ok(())
+    }
+}
+
+/// The campaign's UDS unlock is the engine's [`Prepare`] hook: before staging and
+/// before each verdict (the ECU reset clears the session), the engine asks the
+/// campaign to (re)establish the programming session + security unlock. This is how
+/// `run_campaign` stays auth-model-agnostic — the rig uses `NoPrepare`, the campaign
+/// this.
+#[async_trait]
+impl Prepare for CampaignOrchestrator {
+    async fn prepare(
+        &self,
+        component_id: &str,
+        gateway_id: Option<&str>,
+    ) -> Result<(), EngineError> {
+        self.unlock_for_flash(component_id, gateway_id)
+            .await
+            .map_err(|e| EngineError::Internal(format!("unlock {component_id}: {e}")))
     }
 }
 
