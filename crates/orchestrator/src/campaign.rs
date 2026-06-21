@@ -18,10 +18,10 @@ use tracing::info;
 use crate::error::OrchestratorError;
 use crate::security_helper::{ComputeKeyRequest, SecurityHelperClient, SecurityHelperConfig};
 
-pub use sumo_sovd_flash_engine::{EcuState, EcuStatus, UpdateType};
-use sumo_sovd_flash_engine::{
-    EngineTimeouts, FlashEngine, FlashJob, FlashPlan, NoAuth, Payload, PayloadSource, StaticToken,
+pub use sumo_sovd_flash_engine::{
+    EcuState, EcuStatus, NoAuth, StaticToken, TokenSource, UpdateType,
 };
+use sumo_sovd_flash_engine::{EngineTimeouts, FlashEngine, FlashJob, FlashPlan, Payload, PayloadSource};
 
 /// Configuration for a campaign deployment.
 pub struct CampaignConfig {
@@ -33,10 +33,23 @@ pub struct CampaignConfig {
     /// lifecycle visibly passes through `Validated` (reserved; the current
     /// /updates execute flow lands at AwaitingReboot directly).
     pub use_validated_flow: bool,
-    /// Operator-supplied SOVD bearer JWT for the flash engine's calls. `None`
-    /// builds unauthenticated clients (the device may not enforce auth yet).
-    /// Auto-minting per device (like rig's `RigToken::Mint`) is a follow-up.
+    /// Operator-supplied SOVD bearer JWT for the flash engine's calls — the
+    /// simple, config-driven path: `Some(jwt)` → a fixed bearer, `None`/empty →
+    /// unauthenticated (the device may not enforce auth yet). For a *minting*
+    /// token source (resolve the device's `aud`/`boot_id` and mint per flash, like
+    /// the rig's `RigToken::Mint`, or an onboard minter), inject it via
+    /// [`CampaignOrchestrator::with_token_source`] instead.
     pub sovd_token: Option<String>,
+}
+
+/// The config-driven default [`TokenSource`]: a fixed bearer when `sovd_token` is a
+/// non-empty JWT, else unauthenticated. Callers needing per-device minting inject
+/// their own source via [`CampaignOrchestrator::with_token_source`].
+fn default_token_source(sovd_token: Option<&str>) -> Arc<dyn TokenSource> {
+    match sovd_token {
+        Some(jwt) if !jwt.is_empty() => Arc::new(StaticToken(jwt.to_string())),
+        _ => Arc::new(NoAuth),
+    }
 }
 
 /// Target ECU for a campaign.
@@ -85,14 +98,22 @@ pub struct CampaignOrchestrator {
 }
 
 impl CampaignOrchestrator {
+    /// Construct with the **config-driven** token source — a fixed bearer from
+    /// `config.sovd_token`, or unauthenticated. For per-device minting use
+    /// [`Self::with_token_source`].
     pub fn new(config: CampaignConfig) -> Self {
+        let token = default_token_source(config.sovd_token.as_deref());
+        Self::with_token_source(config, token)
+    }
+
+    /// Construct with a caller-supplied [`TokenSource`] — the injection seam. The
+    /// driver decides where the bearer comes from: a minting source that resolves
+    /// the device's `aud`/`boot_id` and mints per flash (the workshop minter
+    /// offboard, the onboard `jwt-mgr` in-vehicle), or a fixed/`NoAuth` for tests.
+    /// The flash engine, and thus the device, sees only the resulting bearer — the
+    /// campaign itself stays agnostic to how it was obtained.
+    pub fn with_token_source(config: CampaignConfig, token: Arc<dyn TokenSource>) -> Self {
         let helper = SecurityHelperClient::new(config.security_helper.clone());
-        // Inject the operator-supplied SOVD bearer if present, else NoAuth (the
-        // device may not enforce auth yet). Mirrors rig's injected `TokenSource`.
-        let token: Arc<dyn sumo_sovd_flash_engine::TokenSource> = match config.sovd_token.clone() {
-            Some(jwt) if !jwt.is_empty() => Arc::new(StaticToken(jwt)),
-            _ => Arc::new(NoAuth),
-        };
         let engine = FlashEngine::new(
             config.server_url.clone(),
             token,
@@ -365,4 +386,47 @@ pub trait FirmwareResolver: Send + Sync {
         l2_envelope: &[u8],
         l2_manifest: &sumo_onboard::Manifest,
     ) -> Result<Vec<u8>, OrchestratorError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config-driven default maps `sovd_token` → a fixed bearer or
+    /// unauthenticated — observed by what the source actually emits.
+    #[tokio::test]
+    async fn default_token_source_maps_config() {
+        // A non-empty JWT → that exact bearer.
+        let s = default_token_source(Some("jwt-abc"));
+        assert_eq!(s.token("vm1").await.unwrap(), "jwt-abc");
+
+        // None → unauthenticated (empty bearer; the engine sends no header).
+        let s = default_token_source(None);
+        assert_eq!(s.token("vm1").await.unwrap(), "");
+
+        // An empty string is treated as no token, not a literal empty bearer.
+        let s = default_token_source(Some(""));
+        assert_eq!(s.token("vm1").await.unwrap(), "");
+    }
+
+    /// A minting-style source: proves the injection seam — any `TokenSource`,
+    /// including one that mints a *different per-component* token, drops in as
+    /// `Arc<dyn TokenSource>` exactly where `default_token_source` would.
+    struct PerComponentMinter;
+
+    #[async_trait]
+    impl TokenSource for PerComponentMinter {
+        async fn token(&self, component_id: &str) -> Result<String, sumo_sovd_flash_engine::EngineError> {
+            Ok(format!("minted-for-{component_id}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_custom_minting_source_injects() {
+        // The seam accepts any TokenSource; the campaign is agnostic to how the
+        // bearer is obtained (here, minted per component).
+        let injected: Arc<dyn TokenSource> = Arc::new(PerComponentMinter);
+        assert_eq!(injected.token("vm1").await.unwrap(), "minted-for-vm1");
+        assert_eq!(injected.token("hsm").await.unwrap(), "minted-for-hsm");
+    }
 }
