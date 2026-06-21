@@ -14,6 +14,6 @@ pub mod types;
 pub use engine::FlashEngine;
 pub use error::EngineError;
 pub use types::{
-    CampaignReport, EcuState, EcuStatus, EngineTimeouts, FlashJob, FlashPlan, NoAuth, Payload,
-    PayloadSource, StaticToken, TokenSource, UpdateType,
+    CameUp, CampaignReport, CampaignStep, EcuState, EcuStatus, EngineTimeouts, FlashJob, FlashPlan,
+    HealthCheck, NoAuth, Payload, PayloadSource, StaticToken, TokenSource, UpdateType,
 };

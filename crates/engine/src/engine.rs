@@ -13,7 +13,8 @@ use tracing::{error, info, warn};
 use crate::ecu;
 use crate::error::EngineError;
 use crate::types::{
-    CampaignReport, EcuState, EcuStatus, EngineTimeouts, FlashPlan, TokenSource, UpdateType,
+    CampaignReport, CampaignStep, EcuState, EcuStatus, EngineTimeouts, FlashPlan, HealthCheck,
+    TokenSource, UpdateType,
 };
 
 /// Subset of the device's `x-sumo-update-mode` payload the engine reads: the
@@ -26,6 +27,7 @@ struct UpdateModeProbe {
     reset_kind: String,
 }
 
+#[derive(Clone)]
 pub struct FlashEngine {
     server_url: String,
     token: Arc<dyn TokenSource>,
@@ -537,6 +539,57 @@ impl FlashEngine {
         self.reset_all(&mut ecus).await?;
         self.commit_all(&mut ecus).await?;
         Ok(CampaignReport { ecus })
+    }
+
+    /// Run a multi-step campaign on **one committed baseline**: for each step in
+    /// order, `guard → stage → reset → health-gate → commit | rollback + abort`.
+    /// A healthy step commits its trial (unless `no_commit`) so the next step
+    /// builds on a committed baseline; an unhealthy step rolls its trial back and
+    /// **aborts the chain** (returns [`EngineError::CampaignAborted`]) — never
+    /// proceed on a bad baseline. `health` is the injected gate (default
+    /// [`CameUp`]); each step's `force_ecu_reset` sets its activation mode (a
+    /// banked group = one coalesced node reboot). `no_commit` leaves healthy
+    /// banked steps in trial (`Activated`) for a manual verdict.
+    ///
+    /// This is the shared per-step lifecycle both front-ends use: the campaign and
+    /// the rig produce the ordered steps + supply a token / health probe; the loop
+    /// lives here, once.
+    pub async fn run_campaign(
+        &self,
+        steps: Vec<CampaignStep>,
+        health: &dyn HealthCheck,
+        no_commit: bool,
+    ) -> Result<CampaignReport, EngineError> {
+        let mut committed: Vec<EcuStatus> = Vec::new();
+        for (idx, step) in steps.into_iter().enumerate() {
+            // Each step activates in its own mode — a banked group coalesces into
+            // one node reboot — so reconfigure force per step (cheap clone; shares
+            // the token Arc).
+            let eng = self.clone().with_force_ecu_reset(step.force_ecu_reset);
+            let plan = FlashPlan { jobs: step.jobs };
+            eng.guard(&plan).await?;
+            let mut ecus = eng.stage_all(&plan).await?;
+            eng.reset_all(&mut ecus).await?;
+
+            if !health.is_healthy(&ecus).await? {
+                // Unhealthy: roll this step's trial back, then abort — don't commit
+                // a bad baseline, and don't run later steps on top of it.
+                warn!(step = idx, "campaign step unhealthy after reset — rolling back + aborting");
+                if let Err(e) = eng.rollback_all(&mut ecus).await {
+                    warn!(step = idx, error = %e, "rollback of unhealthy step also failed");
+                }
+                return Err(EngineError::CampaignAborted {
+                    step: idx,
+                    reason: "system did not come up healthy after reset".to_string(),
+                });
+            }
+
+            if !no_commit {
+                eng.commit_all(&mut ecus).await?;
+            }
+            committed.extend(ecus);
+        }
+        Ok(CampaignReport { ecus: committed })
     }
 
     // --- internals ---------------------------------------------------------

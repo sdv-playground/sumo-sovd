@@ -26,6 +26,11 @@ pub enum EngineError {
         irreversible: Vec<String>,
     },
 
+    /// A campaign step's system-health gate failed: the step's trial was rolled
+    /// back and the campaign aborted rather than build on an unhealthy baseline.
+    #[error("campaign aborted at step {step}: {reason}")]
+    CampaignAborted { step: usize, reason: String },
+
     #[error("{0}")]
     Internal(String),
 }

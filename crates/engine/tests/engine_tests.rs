@@ -21,8 +21,8 @@ use sovd_core::{
 };
 
 use sumo_sovd_flash_engine::{
-    EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob, FlashPlan, NoAuth,
-    UpdateType,
+    CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
+    FlashPlan, HealthCheck, NoAuth, UpdateType,
 };
 
 // =============================================================================
@@ -572,4 +572,138 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
     // The per-component commit path was bypassed — `commit_flash` would have
     // moved the backend to `Committed`; it stays at its construction state.
     assert_eq!(*backend.flash_state.read(), FlashState::Complete);
+}
+
+// =============================================================================
+// run_campaign — the shared multi-step loop (health-gate + per-step commit/abort)
+// =============================================================================
+
+fn job(id: &str, env: &[u8]) -> FlashJob {
+    FlashJob {
+        component_id: id.to_string(),
+        gateway_id: None,
+        envelope: env.to_vec(),
+        payloads: vec![],
+    }
+}
+
+fn status(id: &str, state: EcuState) -> EcuStatus {
+    EcuStatus {
+        component_id: id.to_string(),
+        gateway_id: None,
+        state,
+        update_type: UpdateType::Firmware,
+        active_version: None,
+        previous_version: None,
+        error: None,
+        update_id: None,
+    }
+}
+
+#[tokio::test]
+async fn cameup_is_healthy_only_when_all_came_up() {
+    // Every component Activated/Committed → healthy.
+    assert!(CameUp
+        .is_healthy(&[
+            status("a", EcuState::Activated),
+            status("b", EcuState::Committed),
+        ])
+        .await
+        .unwrap());
+    // Any component Failed → unhealthy.
+    assert!(!CameUp
+        .is_healthy(&[
+            status("a", EcuState::Activated),
+            status("b", EcuState::Failed),
+        ])
+        .await
+        .unwrap());
+    // A component that never came up (still Staged) → unhealthy.
+    assert!(!CameUp
+        .is_healthy(&[status("a", EcuState::Staged)])
+        .await
+        .unwrap());
+    // Empty set → NOT healthy (nothing came up is no baseline to commit).
+    assert!(!CameUp.is_healthy(&[]).await.unwrap());
+}
+
+/// A gate that always reports unhealthy — drives the abort/rollback path.
+struct Unhealthy;
+#[async_trait]
+impl HealthCheck for Unhealthy {
+    async fn is_healthy(&self, _ecus: &[EcuStatus]) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+}
+
+#[tokio::test]
+async fn run_campaign_commits_each_healthy_step() {
+    let b1 = Arc::new(TestBackend::new("ecu1"));
+    let b2 = Arc::new(TestBackend::new("ecu2"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("ecu1".into(), b1.clone());
+    backends.insert("ecu2".into(), b2.clone());
+    let (url, _h) = serve(backends).await;
+    let eng = engine(&url);
+
+    // Two ordered steps; each healthy → committed, so the next builds on a
+    // committed baseline. (force=false: the per-component path; banked coalescing
+    // is exercised on the rig.)
+    let steps = vec![
+        CampaignStep {
+            jobs: vec![job("ecu1", &[0x01])],
+            force_ecu_reset: false,
+        },
+        CampaignStep {
+            jobs: vec![job("ecu2", &[0x02])],
+            force_ecu_reset: false,
+        },
+    ];
+    let report = eng.run_campaign(steps, &CameUp, false).await.unwrap();
+    assert_eq!(report.ecus.len(), 2);
+    assert!(report.ecus.iter().all(|e| e.state == EcuState::Committed));
+    assert_eq!(*b1.flash_state.read(), FlashState::Committed);
+    assert_eq!(*b2.flash_state.read(), FlashState::Committed);
+}
+
+#[tokio::test]
+async fn run_campaign_no_commit_leaves_the_trial() {
+    let b1 = Arc::new(TestBackend::new("ecu1"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("ecu1".into(), b1.clone());
+    let (url, _h) = serve(backends).await;
+    let eng = engine(&url);
+
+    let steps = vec![CampaignStep {
+        jobs: vec![job("ecu1", &[0x01])],
+        force_ecu_reset: false,
+    }];
+    let report = eng.run_campaign(steps, &CameUp, true).await.unwrap();
+    // Healthy but no_commit → left in trial (Activated), not committed.
+    assert!(report.ecus.iter().all(|e| e.state == EcuState::Activated));
+    assert_ne!(*b1.flash_state.read(), FlashState::Committed);
+}
+
+#[tokio::test]
+async fn run_campaign_unhealthy_step_rolls_back_and_aborts() {
+    let b1 = Arc::new(TestBackend::new("ecu1"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("ecu1".into(), b1.clone());
+    let (url, _h) = serve(backends).await;
+    let eng = engine(&url);
+
+    let steps = vec![CampaignStep {
+        jobs: vec![job("ecu1", &[0x01])],
+        force_ecu_reset: false,
+    }];
+    let err = eng
+        .run_campaign(steps, &Unhealthy, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::CampaignAborted { step: 0, .. }),
+        "expected CampaignAborted at step 0, got {err:?}"
+    );
+    // The step's trial was rolled back — never left committed on a bad baseline.
+    assert_eq!(*b1.flash_state.read(), FlashState::RolledBack);
 }

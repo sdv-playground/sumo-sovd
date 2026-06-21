@@ -49,6 +49,9 @@ impl From<sumo_sovd_flash_engine::EngineError> for OrchestratorError {
             } => OrchestratorError::Internal(format!(
                 "plan mixes rollbackable {rollbackable:?} with irreversible {irreversible:?}"
             )),
+            E::CampaignAborted { step, reason } => OrchestratorError::Internal(format!(
+                "campaign aborted at step {step}: {reason}"
+            )),
             E::Internal(m) => OrchestratorError::Internal(m),
         }
     }

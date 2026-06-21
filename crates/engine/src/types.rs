@@ -14,6 +14,17 @@ pub struct FlashPlan {
     pub jobs: Vec<FlashJob>,
 }
 
+/// One step of a multi-step campaign ([`FlashEngine::run_campaign`]): a set of
+/// jobs flashed and activated **together**, plus the step's activation mode.
+/// `force_ecu_reset = true` (a banked group) coalesces the whole set through ONE
+/// node reboot; `false` (a singleshot component) respects each component's declared
+/// `reset_kind`. The driver groups an ordered plan into steps — singleshot ones
+/// alone, then the banked group — from the device's `x-sumo-update-mode`.
+pub struct CampaignStep {
+    pub jobs: Vec<FlashJob>,
+    pub force_ecu_reset: bool,
+}
+
 /// One component's update: a signed SUIT envelope + its (streamed) payloads.
 pub struct FlashJob {
     /// SOVD component id, e.g. `"rt"`, `"vm1"`.
@@ -78,6 +89,36 @@ impl TokenSource for StaticToken {
     }
 }
 
+/// Per-step liveness gate, injected by the driver (the second seam beside
+/// [`TokenSource`]). After a campaign step's stage + reset,
+/// [`FlashEngine::run_campaign`] asks whether the system came up healthy before it
+/// commits the trial; an unhealthy step is rolled back and the campaign aborts —
+/// never build on a bad baseline. The default [`CameUp`] suffices for the
+/// SOVD-state contract today; richer probes (peer heartbeats, app-level liveness,
+/// a whole-system post-reboot check) implement this trait in the driver.
+#[async_trait]
+pub trait HealthCheck: Send + Sync {
+    async fn is_healthy(&self, ecus: &[EcuStatus]) -> Result<bool, EngineError>;
+}
+
+/// Default health gate: every component the step touched reached `Activated`
+/// (banked trial) or `Committed` (singleshot write-through) — i.e. each ECU came
+/// back up, none left `Failed`/`RolledBack`. Device-agnostic (reads only the
+/// engine's own status). Ported from the rig's `step_came_up`; the agreed minimal
+/// contract until a richer health definition lands. An empty set is **not** healthy
+/// — a step with nothing up is not a baseline to commit on.
+pub struct CameUp;
+
+#[async_trait]
+impl HealthCheck for CameUp {
+    async fn is_healthy(&self, ecus: &[EcuStatus]) -> Result<bool, EngineError> {
+        Ok(!ecus.is_empty()
+            && ecus
+                .iter()
+                .all(|e| matches!(e.state, EcuState::Activated | EcuState::Committed)))
+    }
+}
+
 /// What kind of update a manifest represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateType {
@@ -125,6 +166,7 @@ pub struct EcuStatus {
 
 /// Result of [`FlashEngine::run`](crate::FlashEngine::run): the final
 /// per-component status set.
+#[derive(Debug)]
 pub struct CampaignReport {
     pub ecus: Vec<EcuStatus>,
 }
