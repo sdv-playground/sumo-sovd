@@ -6,7 +6,7 @@
 //! This module is the SOVD flash protocol only — it does **not** touch session
 //! or security state. The driver unlocks the ECU (UDS) before staging.
 
-use sovd_client::flash::{FlashClient, FlashError};
+use sovd_client::flash::{FlashClient, FlashConfig, FlashError};
 use sovd_client::SovdClient;
 use sovd_core::EntityStatus;
 use sumo_crypto::RustCryptoBackend;
@@ -107,6 +107,7 @@ pub async fn flash_ecu_to_staging(
     server_url: &str,
     trust_anchor: &[u8],
     token: &str,
+    insecure: bool,
 ) -> Result<EcuFlashResult, EngineError> {
     let comp = &job.component_id;
     let gw = job.gateway_id.as_deref();
@@ -137,7 +138,7 @@ pub async fn flash_ecu_to_staging(
         .to_string();
     info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU flash (assumes already unlocked)");
 
-    let flash_client = build_flash_client(server_url, comp, gw, token)?;
+    let flash_client = build_flash_client(server_url, comp, gw, token, insecure)?;
 
     let update_id =
         open_update_or_rollback_pending(&flash_client, comp, &pkg_name, &pkg_version).await?;
@@ -295,11 +296,11 @@ pub async fn flash_ecu_to_staging(
 
 /// Build a base-URL `SovdClient` for reading `/status` (bearer token when
 /// non-empty). Cheap to construct per call.
-fn status_client(server_url: &str, token: &str) -> Result<SovdClient, EngineError> {
+fn status_client(server_url: &str, token: &str, insecure: bool) -> Result<SovdClient, EngineError> {
     let client = if token.is_empty() {
-        SovdClient::new(server_url)
+        SovdClient::new_insecure(server_url, insecure)
     } else {
-        SovdClient::with_bearer_token(server_url, token)
+        SovdClient::with_bearer_token_insecure(server_url, token, insecure)
     };
     client.map_err(|e| EngineError::Sovd {
         component: String::new(),
@@ -311,8 +312,13 @@ fn status_client(server_url: &str, token: &str) -> Result<SovdClient, EngineErro
 /// `None` when the component reports no heartbeat (offline, or a non-heartbeat
 /// component like host-os) or `/status` is unreachable — callers treat absence
 /// as "no boot_id witness" and fall back to the observed server down→up.
-pub async fn read_boot_id(server_url: &str, component_id: &str, token: &str) -> Option<u32> {
-    let client = status_client(server_url, token).ok()?;
+pub async fn read_boot_id(
+    server_url: &str,
+    component_id: &str,
+    token: &str,
+    insecure: bool,
+) -> Option<u32> {
+    let client = status_client(server_url, token, insecure).ok()?;
     let body = client.read_status(component_id).await.ok()?;
     body.extensions
         .get("x-sumo-runtime")?
@@ -340,8 +346,9 @@ pub async fn wait_activated(
     baseline: Option<u32>,
     timeout_secs: u64,
     token: &str,
+    insecure: bool,
 ) -> Result<(), EngineError> {
-    let client = status_client(server_url, token)?;
+    let client = status_client(server_url, token, insecure)?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut saw_down = false;
     loop {
@@ -387,10 +394,19 @@ pub async fn restart_and_verify(
     gateway_id: Option<&str>,
     timeout_secs: u64,
     token: &str,
+    insecure: bool,
 ) -> Result<(), EngineError> {
-    let baseline = read_boot_id(server_url, component_id, token).await;
-    trigger_local_restart(server_url, component_id, gateway_id, token).await?;
-    wait_activated(server_url, component_id, baseline, timeout_secs, token).await
+    let baseline = read_boot_id(server_url, component_id, token, insecure).await;
+    trigger_local_restart(server_url, component_id, gateway_id, token, insecure).await?;
+    wait_activated(
+        server_url,
+        component_id,
+        baseline,
+        timeout_secs,
+        token,
+        insecure,
+    )
+    .await
 }
 
 /// Issue a node-level verdict — the entity-root vendor operation that commits
@@ -402,12 +418,24 @@ pub async fn restart_and_verify(
 /// a 2xx is success, a failed fan-out returns 5xx with the per-component
 /// errors in the body. Wire: `POST /vehicle/v1/operations/{op_id}/executions`
 /// (ISO 17978-3 §7.14, at the entity root).
-async fn node_verdict(server_url: &str, op_id: &str, token: &str) -> Result<(), EngineError> {
+async fn node_verdict(
+    server_url: &str,
+    op_id: &str,
+    token: &str,
+    insecure: bool,
+) -> Result<(), EngineError> {
     let url = format!(
         "{}/vehicle/v1/operations/{op_id}/executions",
         server_url.trim_end_matches('/')
     );
-    let mut req = reqwest::Client::new().post(&url);
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(insecure)
+        .build()
+        .map_err(|e| EngineError::FlashFailed {
+            component: "node".to_string(),
+            message: format!("{op_id}: build client: {e}"),
+        })?;
+    let mut req = client.post(&url);
     if !token.is_empty() {
         req = req.bearer_auth(token);
     }
@@ -428,13 +456,21 @@ async fn node_verdict(server_url: &str, op_id: &str, token: &str) -> Result<(), 
 }
 
 /// Commit every in-trial component on the node in one verdict.
-pub async fn commit_node_trials(server_url: &str, token: &str) -> Result<(), EngineError> {
-    node_verdict(server_url, "x-sumo-commit-trials", token).await
+pub async fn commit_node_trials(
+    server_url: &str,
+    token: &str,
+    insecure: bool,
+) -> Result<(), EngineError> {
+    node_verdict(server_url, "x-sumo-commit-trials", token, insecure).await
 }
 
 /// Roll back every in-trial component on the node in one verdict.
-pub async fn rollback_node_trials(server_url: &str, token: &str) -> Result<(), EngineError> {
-    node_verdict(server_url, "x-sumo-rollback-trials", token).await
+pub async fn rollback_node_trials(
+    server_url: &str,
+    token: &str,
+    insecure: bool,
+) -> Result<(), EngineError> {
+    node_verdict(server_url, "x-sumo-rollback-trials", token, insecure).await
 }
 
 /// Trigger a per-component restart via `PUT components/{id}/status/restart`
@@ -444,8 +480,9 @@ pub async fn trigger_local_restart(
     component_id: &str,
     gateway_id: Option<&str>,
     token: &str,
+    insecure: bool,
 ) -> Result<(), EngineError> {
-    let flash_client = build_flash_client(server_url, component_id, gateway_id, token)?;
+    let flash_client = build_flash_client(server_url, component_id, gateway_id, token, insecure)?;
     info!(component = %component_id, "resetting ECU");
     flash_client
         .ecu_reset("hard")
@@ -466,8 +503,9 @@ pub async fn fetch_reset_kind(
     gateway_id: Option<&str>,
     update_id: &str,
     token: &str,
+    insecure: bool,
 ) -> Result<sovd_core::ResetKind, EngineError> {
-    let flash_client = build_flash_client(server_url, component_id, gateway_id, token)?;
+    let flash_client = build_flash_client(server_url, component_id, gateway_id, token, insecure)?;
     flash_client
         .attach(update_id)
         .await
@@ -486,21 +524,26 @@ pub async fn fetch_reset_kind(
 }
 
 /// Build a `FlashClient` for a component, bearing `token` when non-empty.
+/// `insecure` skips TLS certificate verification on the device endpoint (the
+/// `curl -k` equivalent); `false` is byte-identical to the prior `for_sovd*`
+/// constructors (full verification).
 pub(crate) fn build_flash_client(
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
     token: &str,
+    insecure: bool,
 ) -> Result<FlashClient, EngineError> {
-    let result = match (gateway_id, token.is_empty()) {
-        (Some(gw), false) => {
-            FlashClient::for_sovd_sub_entity_bearer(server_url, gw, component_id, token)
-        }
-        (Some(gw), true) => FlashClient::for_sovd_sub_entity(server_url, gw, component_id),
-        (None, false) => FlashClient::for_sovd_bearer(server_url, component_id, token),
-        (None, true) => FlashClient::for_sovd(server_url, component_id),
-    };
-    result.map_err(|e| EngineError::Sovd {
+    let mut builder = FlashConfig::builder(server_url)
+        .component_id(component_id)
+        .insecure(insecure);
+    if let Some(gw) = gateway_id {
+        builder = builder.gateway_id(gw);
+    }
+    if !token.is_empty() {
+        builder = builder.bearer(token);
+    }
+    FlashClient::new(builder.build()).map_err(|e| EngineError::Sovd {
         component: component_id.to_string(),
         message: format!("flash client: {e}"),
     })

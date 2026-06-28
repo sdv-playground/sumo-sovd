@@ -330,6 +330,7 @@ fn engine(server_url: &str) -> FlashEngine {
         Arc::new(NoAuth),
         dummy_trust_anchor(),
         EngineTimeouts::default(),
+        false,
     )
 }
 
@@ -545,6 +546,7 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
         Arc::new(NoAuth),
         dummy_trust_anchor(),
         EngineTimeouts::default(),
+        false,
     )
     .with_force_ecu_reset(true);
 

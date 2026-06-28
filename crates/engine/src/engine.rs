@@ -33,6 +33,12 @@ pub struct FlashEngine {
     token: Arc<dyn TokenSource>,
     trust_anchor: Vec<u8>,
     timeouts: EngineTimeouts,
+    /// Skip TLS certificate verification on the device endpoint (the `curl -k`
+    /// equivalent), threaded into every device-facing `SovdClient`/`FlashClient`
+    /// the engine builds. `false` (the default) is full verification —
+    /// byte-identical to before this knob existed. Set when the device's leaf
+    /// SAN won't match the dialled host (e.g. a `127.0.0.1` rig over HTTPS).
+    insecure: bool,
     /// Force every staged component through the ONE-node-reboot activation path
     /// (`RequiresEcuReset`) instead of each component's declared reset_kind. The
     /// workshop campaign sets this so a banked step activates via a single node
@@ -49,12 +55,14 @@ impl FlashEngine {
         token: Arc<dyn TokenSource>,
         trust_anchor: Vec<u8>,
         timeouts: EngineTimeouts,
+        insecure: bool,
     ) -> Self {
         Self {
             server_url: server_url.into(),
             token,
             trust_anchor,
             timeouts,
+            insecure,
             force_ecu_reset: false,
         }
     }
@@ -129,7 +137,14 @@ impl FlashEngine {
             statuses[i].state = EcuState::Flashing;
 
             let token = self.token.token(comp).await?;
-            match ecu::flash_ecu_to_staging(job, &self.server_url, &self.trust_anchor, &token).await
+            match ecu::flash_ecu_to_staging(
+                job,
+                &self.server_url,
+                &self.trust_anchor,
+                &token,
+                self.insecure,
+            )
+            .await
             {
                 Ok(result) => {
                     statuses[i].update_type = result.update_type;
@@ -235,8 +250,15 @@ impl FlashEngine {
                 sovd_core::ResetKind::RequiresEcuReset
             } else {
                 let token = self.token.token(comp).await?;
-                ecu::fetch_reset_kind(&self.server_url, comp, gw.as_deref(), update_id, &token)
-                    .await?
+                ecu::fetch_reset_kind(
+                    &self.server_url,
+                    comp,
+                    gw.as_deref(),
+                    update_id,
+                    &token,
+                    self.insecure,
+                )
+                .await?
             };
             match kind {
                 sovd_core::ResetKind::None | sovd_core::ResetKind::Local => {
@@ -267,9 +289,11 @@ impl FlashEngine {
                 let url = self.server_url.clone();
                 let token = self.token.token(&comp).await?;
                 let secs = self.timeouts.local_reset_secs;
+                let insecure = self.insecure;
                 set.spawn(async move {
                     let result =
-                        ecu::restart_and_verify(&url, &comp, gw.as_deref(), secs, &token).await;
+                        ecu::restart_and_verify(&url, &comp, gw.as_deref(), secs, &token, insecure)
+                            .await;
                     (comp, result)
                 });
             }
@@ -288,7 +312,7 @@ impl FlashEngine {
                 let token = self.token.token(comp_id).await?;
                 baselines.insert(
                     comp_id.clone(),
-                    ecu::read_boot_id(&self.server_url, comp_id, &token).await,
+                    ecu::read_boot_id(&self.server_url, comp_id, &token, self.insecure).await,
                 );
             }
             for (comp_id, _) in &comps {
@@ -339,8 +363,10 @@ impl FlashEngine {
                 let token = self.token.token(&comp_id).await?;
                 let secs = self.timeouts.ecu_reset_activation_secs;
                 let baseline = baselines.get(&comp_id).copied().flatten();
+                let insecure = self.insecure;
                 set.spawn(async move {
-                    let result = ecu::wait_activated(&url, &comp_id, baseline, secs, &token).await;
+                    let result =
+                        ecu::wait_activated(&url, &comp_id, baseline, secs, &token, insecure).await;
                     (comp_id, result)
                 });
             }
@@ -359,16 +385,21 @@ impl FlashEngine {
         }
         for (comp, gw) in ss_local {
             let token = self.token.token(&comp).await?;
-            let outcome =
-                match ecu::trigger_local_restart(&self.server_url, &comp, gw.as_deref(), &token)
-                    .await
-                {
-                    Ok(()) => {
-                        self.wait_reachable(&comp, self.timeouts.local_reset_secs)
-                            .await
-                    }
-                    Err(e) => Err(e),
-                };
+            let outcome = match ecu::trigger_local_restart(
+                &self.server_url,
+                &comp,
+                gw.as_deref(),
+                &token,
+                self.insecure,
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.wait_reachable(&comp, self.timeouts.local_reset_secs)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
             if let Err(err) = outcome {
                 if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
                     s.state = EcuState::Failed;
@@ -423,14 +454,14 @@ impl FlashEngine {
     /// for the manual `commit-trials` verb (no component list required).
     pub async fn commit_node_trials(&self) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
-        ecu::commit_node_trials(&self.server_url, &token).await
+        ecu::commit_node_trials(&self.server_url, &token, self.insecure).await
     }
 
     /// Issue the node-level **rollback** verdict directly — see
     /// [`commit_node_trials`](Self::commit_node_trials).
     pub async fn rollback_node_trials(&self) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
-        ecu::rollback_node_trials(&self.server_url, &token).await
+        ecu::rollback_node_trials(&self.server_url, &token, self.insecure).await
     }
 
     /// Commit all activated firmware components — makes the trial permanent.
@@ -603,8 +634,13 @@ impl FlashEngine {
         update_id: &str,
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
-        let flash_client =
-            ecu::build_flash_client(&self.server_url, component_id, gateway_id, &token)?;
+        let flash_client = ecu::build_flash_client(
+            &self.server_url,
+            component_id,
+            gateway_id,
+            &token,
+            self.insecure,
+        )?;
         flash_client
             .attach(update_id)
             .await
@@ -630,8 +666,13 @@ impl FlashEngine {
         update_id: &str,
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
-        let flash_client =
-            ecu::build_flash_client(&self.server_url, component_id, gateway_id, &token)?;
+        let flash_client = ecu::build_flash_client(
+            &self.server_url,
+            component_id,
+            gateway_id,
+            &token,
+            self.insecure,
+        )?;
         flash_client
             .attach(update_id)
             .await
@@ -723,9 +764,9 @@ impl FlashEngine {
     async fn sovd_client(&self, key: &str) -> Result<SovdClient, EngineError> {
         let token = self.token.token(key).await?;
         let client = if token.is_empty() {
-            SovdClient::new(&self.server_url)
+            SovdClient::new_insecure(&self.server_url, self.insecure)
         } else {
-            SovdClient::with_bearer_token(&self.server_url, &token)
+            SovdClient::with_bearer_token_insecure(&self.server_url, &token, self.insecure)
         };
         client.map_err(|e| EngineError::Sovd {
             component: key.to_string(),

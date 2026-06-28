@@ -350,6 +350,7 @@ async fn setup(backend: Arc<dyn DiagnosticBackend>) -> TestFixture {
         },
         use_validated_flow: false,
         sovd_token: None,
+        insecure: false,
     });
 
     TestFixture {
@@ -397,6 +398,7 @@ async fn setup_multi(backends: HashMap<String, Arc<dyn DiagnosticBackend>>) -> T
         },
         use_validated_flow: false,
         sovd_token: None,
+        insecure: false,
     });
 
     TestFixture {

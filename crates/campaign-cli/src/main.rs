@@ -193,6 +193,10 @@ async fn main() {
         },
         use_validated_flow: cli.validated,
         sovd_token: cli.sovd_token,
+        // The workshop campaign-cli talks plain HTTP today; no --insecure flag
+        // is exposed here. The orchestrator is insecure-capable (see
+        // CampaignConfig::insecure) when a future flag wants it.
+        insecure: false,
     });
 
     let result = match cli.command {

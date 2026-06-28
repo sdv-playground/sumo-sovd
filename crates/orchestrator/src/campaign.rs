@@ -40,6 +40,11 @@ pub struct CampaignConfig {
     /// the rig's `RigToken::Mint`, or an onboard minter), inject it via
     /// [`CampaignOrchestrator::with_token_source`] instead.
     pub sovd_token: Option<String>,
+    /// Skip TLS certificate verification on the device's SOVD endpoint (the
+    /// `curl -k` equivalent), threaded into the flash engine and the unlock
+    /// client. `false` (default) = full verification, byte-identical to before
+    /// this knob. Set when the device leaf SAN won't match the dialled host.
+    pub insecure: bool,
 }
 
 /// The config-driven default [`TokenSource`]: a fixed bearer when `sovd_token` is a
@@ -119,6 +124,7 @@ impl CampaignOrchestrator {
             token,
             config.trust_anchor.clone(),
             EngineTimeouts::default(),
+            config.insecure,
         );
         Self {
             config,
@@ -312,8 +318,8 @@ impl CampaignOrchestrator {
         component_id: &str,
         gateway_id: Option<&str>,
     ) -> Result<(), OrchestratorError> {
-        let client =
-            SovdClient::new(&self.config.server_url).map_err(|e| OrchestratorError::Sovd {
+        let client = SovdClient::new_insecure(&self.config.server_url, self.config.insecure)
+            .map_err(|e| OrchestratorError::Sovd {
                 component: component_id.to_string(),
                 message: format!("{e}"),
             })?;
