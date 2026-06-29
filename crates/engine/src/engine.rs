@@ -39,6 +39,12 @@ pub struct FlashEngine {
     /// byte-identical to before this knob existed. Set when the device's leaf
     /// SAN won't match the dialled host (e.g. a `127.0.0.1` rig over HTTPS).
     insecure: bool,
+    /// PEM-encoded CA root to pin the device endpoint's TLS cert against — the
+    /// verifying alternative to [`insecure`](Self::insecure), threaded into every
+    /// device-facing `SovdClient`/`FlashClient` the engine builds. `Some` pins
+    /// that CA (the leaf must chain to it); `None` (the default) falls back to
+    /// the `insecure` behaviour — byte-identical to before this knob existed.
+    ca_cert_pem: Option<Vec<u8>>,
     /// Force every staged component through the ONE-node-reboot activation path
     /// (`RequiresEcuReset`) instead of each component's declared reset_kind. The
     /// workshop campaign sets this so a banked step activates via a single node
@@ -56,6 +62,7 @@ impl FlashEngine {
         trust_anchor: Vec<u8>,
         timeouts: EngineTimeouts,
         insecure: bool,
+        ca_cert_pem: Option<Vec<u8>>,
     ) -> Self {
         Self {
             server_url: server_url.into(),
@@ -63,6 +70,7 @@ impl FlashEngine {
             trust_anchor,
             timeouts,
             insecure,
+            ca_cert_pem,
             force_ecu_reset: false,
         }
     }
@@ -143,6 +151,7 @@ impl FlashEngine {
                 &self.trust_anchor,
                 &token,
                 self.insecure,
+                self.ca_cert_pem.as_deref(),
             )
             .await
             {
@@ -257,6 +266,7 @@ impl FlashEngine {
                     update_id,
                     &token,
                     self.insecure,
+                    self.ca_cert_pem.as_deref(),
                 )
                 .await?
             };
@@ -290,10 +300,18 @@ impl FlashEngine {
                 let token = self.token.token(&comp).await?;
                 let secs = self.timeouts.local_reset_secs;
                 let insecure = self.insecure;
+                let ca_cert_pem = self.ca_cert_pem.clone();
                 set.spawn(async move {
-                    let result =
-                        ecu::restart_and_verify(&url, &comp, gw.as_deref(), secs, &token, insecure)
-                            .await;
+                    let result = ecu::restart_and_verify(
+                        &url,
+                        &comp,
+                        gw.as_deref(),
+                        secs,
+                        &token,
+                        insecure,
+                        ca_cert_pem.as_deref(),
+                    )
+                    .await;
                     (comp, result)
                 });
             }
@@ -312,7 +330,14 @@ impl FlashEngine {
                 let token = self.token.token(comp_id).await?;
                 baselines.insert(
                     comp_id.clone(),
-                    ecu::read_boot_id(&self.server_url, comp_id, &token, self.insecure).await,
+                    ecu::read_boot_id(
+                        &self.server_url,
+                        comp_id,
+                        &token,
+                        self.insecure,
+                        self.ca_cert_pem.as_deref(),
+                    )
+                    .await,
                 );
             }
             for (comp_id, _) in &comps {
@@ -364,9 +389,18 @@ impl FlashEngine {
                 let secs = self.timeouts.ecu_reset_activation_secs;
                 let baseline = baselines.get(&comp_id).copied().flatten();
                 let insecure = self.insecure;
+                let ca_cert_pem = self.ca_cert_pem.clone();
                 set.spawn(async move {
-                    let result =
-                        ecu::wait_activated(&url, &comp_id, baseline, secs, &token, insecure).await;
+                    let result = ecu::wait_activated(
+                        &url,
+                        &comp_id,
+                        baseline,
+                        secs,
+                        &token,
+                        insecure,
+                        ca_cert_pem.as_deref(),
+                    )
+                    .await;
                     (comp_id, result)
                 });
             }
@@ -391,6 +425,7 @@ impl FlashEngine {
                 gw.as_deref(),
                 &token,
                 self.insecure,
+                self.ca_cert_pem.as_deref(),
             )
             .await
             {
@@ -454,14 +489,26 @@ impl FlashEngine {
     /// for the manual `commit-trials` verb (no component list required).
     pub async fn commit_node_trials(&self) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
-        ecu::commit_node_trials(&self.server_url, &token, self.insecure).await
+        ecu::commit_node_trials(
+            &self.server_url,
+            &token,
+            self.insecure,
+            self.ca_cert_pem.as_deref(),
+        )
+        .await
     }
 
     /// Issue the node-level **rollback** verdict directly — see
     /// [`commit_node_trials`](Self::commit_node_trials).
     pub async fn rollback_node_trials(&self) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
-        ecu::rollback_node_trials(&self.server_url, &token, self.insecure).await
+        ecu::rollback_node_trials(
+            &self.server_url,
+            &token,
+            self.insecure,
+            self.ca_cert_pem.as_deref(),
+        )
+        .await
     }
 
     /// Commit all activated firmware components — makes the trial permanent.
@@ -640,6 +687,7 @@ impl FlashEngine {
             gateway_id,
             &token,
             self.insecure,
+            self.ca_cert_pem.as_deref(),
         )?;
         flash_client
             .attach(update_id)
@@ -672,6 +720,7 @@ impl FlashEngine {
             gateway_id,
             &token,
             self.insecure,
+            self.ca_cert_pem.as_deref(),
         )?;
         flash_client
             .attach(update_id)
@@ -763,10 +812,11 @@ impl FlashEngine {
     /// and the update-mode guard.
     async fn sovd_client(&self, key: &str) -> Result<SovdClient, EngineError> {
         let token = self.token.token(key).await?;
+        let ca = self.ca_cert_pem.as_deref();
         let client = if token.is_empty() {
-            SovdClient::new_insecure(&self.server_url, self.insecure)
+            SovdClient::new_verifying(&self.server_url, self.insecure, ca)
         } else {
-            SovdClient::with_bearer_token_insecure(&self.server_url, &token, self.insecure)
+            SovdClient::with_bearer_token_verifying(&self.server_url, &token, self.insecure, ca)
         };
         client.map_err(|e| EngineError::Sovd {
             component: key.to_string(),

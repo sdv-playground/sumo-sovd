@@ -108,6 +108,7 @@ pub async fn flash_ecu_to_staging(
     trust_anchor: &[u8],
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<EcuFlashResult, EngineError> {
     let comp = &job.component_id;
     let gw = job.gateway_id.as_deref();
@@ -138,7 +139,7 @@ pub async fn flash_ecu_to_staging(
         .to_string();
     info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU flash (assumes already unlocked)");
 
-    let flash_client = build_flash_client(server_url, comp, gw, token, insecure)?;
+    let flash_client = build_flash_client(server_url, comp, gw, token, insecure, ca_cert_pem)?;
 
     let update_id =
         open_update_or_rollback_pending(&flash_client, comp, &pkg_name, &pkg_version).await?;
@@ -296,11 +297,16 @@ pub async fn flash_ecu_to_staging(
 
 /// Build a base-URL `SovdClient` for reading `/status` (bearer token when
 /// non-empty). Cheap to construct per call.
-fn status_client(server_url: &str, token: &str, insecure: bool) -> Result<SovdClient, EngineError> {
+fn status_client(
+    server_url: &str,
+    token: &str,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Result<SovdClient, EngineError> {
     let client = if token.is_empty() {
-        SovdClient::new_insecure(server_url, insecure)
+        SovdClient::new_verifying(server_url, insecure, ca_cert_pem)
     } else {
-        SovdClient::with_bearer_token_insecure(server_url, token, insecure)
+        SovdClient::with_bearer_token_verifying(server_url, token, insecure, ca_cert_pem)
     };
     client.map_err(|e| EngineError::Sovd {
         component: String::new(),
@@ -317,8 +323,9 @@ pub async fn read_boot_id(
     component_id: &str,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Option<u32> {
-    let client = status_client(server_url, token, insecure).ok()?;
+    let client = status_client(server_url, token, insecure, ca_cert_pem).ok()?;
     let body = client.read_status(component_id).await.ok()?;
     body.extensions
         .get("x-sumo-runtime")?
@@ -347,8 +354,9 @@ pub async fn wait_activated(
     timeout_secs: u64,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let client = status_client(server_url, token, insecure)?;
+    let client = status_client(server_url, token, insecure, ca_cert_pem)?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut saw_down = false;
     loop {
@@ -395,9 +403,18 @@ pub async fn restart_and_verify(
     timeout_secs: u64,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let baseline = read_boot_id(server_url, component_id, token, insecure).await;
-    trigger_local_restart(server_url, component_id, gateway_id, token, insecure).await?;
+    let baseline = read_boot_id(server_url, component_id, token, insecure, ca_cert_pem).await;
+    trigger_local_restart(
+        server_url,
+        component_id,
+        gateway_id,
+        token,
+        insecure,
+        ca_cert_pem,
+    )
+    .await?;
     wait_activated(
         server_url,
         component_id,
@@ -405,6 +422,7 @@ pub async fn restart_and_verify(
         timeout_secs,
         token,
         insecure,
+        ca_cert_pem,
     )
     .await
 }
@@ -423,18 +441,30 @@ async fn node_verdict(
     op_id: &str,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
     let url = format!(
         "{}/vehicle/v1/operations/{op_id}/executions",
         server_url.trim_end_matches('/')
     );
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(insecure)
-        .build()
-        .map_err(|e| EngineError::FlashFailed {
-            component: "node".to_string(),
-            message: format!("{op_id}: build client: {e}"),
-        })?;
+    // Same CA-trust seam as the SovdClient/FlashClient builders: pin the given
+    // root when set, else fall back to skip-verify (`insecure`).
+    let builder = reqwest::Client::builder();
+    let builder = match ca_cert_pem {
+        Some(pem) => {
+            builder.add_root_certificate(reqwest::Certificate::from_pem(pem).map_err(|e| {
+                EngineError::FlashFailed {
+                    component: "node".to_string(),
+                    message: format!("{op_id}: parse ca_cert_pem: {e}"),
+                }
+            })?)
+        }
+        None => builder.danger_accept_invalid_certs(insecure),
+    };
+    let client = builder.build().map_err(|e| EngineError::FlashFailed {
+        component: "node".to_string(),
+        message: format!("{op_id}: build client: {e}"),
+    })?;
     let mut req = client.post(&url);
     if !token.is_empty() {
         req = req.bearer_auth(token);
@@ -460,8 +490,16 @@ pub async fn commit_node_trials(
     server_url: &str,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    node_verdict(server_url, "x-sumo-commit-trials", token, insecure).await
+    node_verdict(
+        server_url,
+        "x-sumo-commit-trials",
+        token,
+        insecure,
+        ca_cert_pem,
+    )
+    .await
 }
 
 /// Roll back every in-trial component on the node in one verdict.
@@ -469,8 +507,16 @@ pub async fn rollback_node_trials(
     server_url: &str,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    node_verdict(server_url, "x-sumo-rollback-trials", token, insecure).await
+    node_verdict(
+        server_url,
+        "x-sumo-rollback-trials",
+        token,
+        insecure,
+        ca_cert_pem,
+    )
+    .await
 }
 
 /// Trigger a per-component restart via `PUT components/{id}/status/restart`
@@ -481,8 +527,16 @@ pub async fn trigger_local_restart(
     gateway_id: Option<&str>,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let flash_client = build_flash_client(server_url, component_id, gateway_id, token, insecure)?;
+    let flash_client = build_flash_client(
+        server_url,
+        component_id,
+        gateway_id,
+        token,
+        insecure,
+        ca_cert_pem,
+    )?;
     info!(component = %component_id, "resetting ECU");
     flash_client
         .ecu_reset("hard")
@@ -504,8 +558,16 @@ pub async fn fetch_reset_kind(
     update_id: &str,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<sovd_core::ResetKind, EngineError> {
-    let flash_client = build_flash_client(server_url, component_id, gateway_id, token, insecure)?;
+    let flash_client = build_flash_client(
+        server_url,
+        component_id,
+        gateway_id,
+        token,
+        insecure,
+        ca_cert_pem,
+    )?;
     flash_client
         .attach(update_id)
         .await
@@ -526,17 +588,21 @@ pub async fn fetch_reset_kind(
 /// Build a `FlashClient` for a component, bearing `token` when non-empty.
 /// `insecure` skips TLS certificate verification on the device endpoint (the
 /// `curl -k` equivalent); `false` is byte-identical to the prior `for_sovd*`
-/// constructors (full verification).
+/// constructors (full verification). `ca_cert_pem`, when `Some`, instead pins
+/// that PEM CA root for the device leaf (the verifying counterpart to
+/// `insecure`); `None` keeps the `insecure` behaviour.
 pub(crate) fn build_flash_client(
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
     token: &str,
     insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<FlashClient, EngineError> {
     let mut builder = FlashConfig::builder(server_url)
         .component_id(component_id)
-        .insecure(insecure);
+        .insecure(insecure)
+        .ca_cert_pem(ca_cert_pem.map(|c| c.to_vec()));
     if let Some(gw) = gateway_id {
         builder = builder.gateway_id(gw);
     }

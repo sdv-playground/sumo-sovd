@@ -125,6 +125,7 @@ impl CampaignOrchestrator {
             config.trust_anchor.clone(),
             EngineTimeouts::default(),
             config.insecure,
+            None,
         );
         Self {
             config,

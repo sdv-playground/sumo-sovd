@@ -331,6 +331,7 @@ fn engine(server_url: &str) -> FlashEngine {
         dummy_trust_anchor(),
         EngineTimeouts::default(),
         false,
+        None,
     )
 }
 
@@ -547,6 +548,7 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
         dummy_trust_anchor(),
         EngineTimeouts::default(),
         false,
+        None,
     )
     .with_force_ecu_reset(true);
 
