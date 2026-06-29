@@ -297,7 +297,7 @@ pub async fn flash_ecu_to_staging(
 
 /// Build a base-URL `SovdClient` for reading `/status` (bearer token when
 /// non-empty). Cheap to construct per call.
-pub(crate) fn status_client(
+fn status_client(
     server_url: &str,
     token: &str,
     insecure: bool,
@@ -312,19 +312,6 @@ pub(crate) fn status_client(
         component: String::new(),
         message: format!("sovd client: {e}"),
     })
-}
-
-/// Swap a URL's scheme between `http://` and `https://` (prefix only); returns
-/// `None` when the URL begins with neither prefix. Used to recover when a device
-/// flips scheme across a reset: its `tls-identity` goes live on the first
-/// post-provision restart, turning `http://host:port` into `https://host:port`.
-pub(crate) fn flip_scheme(url: &str) -> Option<String> {
-    if let Some(rest) = url.strip_prefix("https://") {
-        Some(format!("http://{rest}"))
-    } else {
-        url.strip_prefix("http://")
-            .map(|rest| format!("https://{rest}"))
-    }
 }
 
 /// Read a component's heartbeat `boot_id` from `/status` `x-sumo-runtime`.
@@ -369,8 +356,7 @@ pub async fn wait_activated(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let mut base = server_url.to_string();
-    let mut client = status_client(&base, token, insecure, ca_cert_pem)?;
+    let client = status_client(server_url, token, insecure, ca_cert_pem)?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut saw_down = false;
     loop {
@@ -395,20 +381,7 @@ pub async fn wait_activated(
             }
             // Unreachable mid-reboot (the node went down) — record it as a
             // fallback witness for non-heartbeat components and keep polling.
-            // The device may also flip http<->https across the reset (its
-            // tls-identity goes live); if the opposite scheme now answers,
-            // adopt it so the next poll proceeds on the live endpoint.
-            Err(_) => {
-                saw_down = true;
-                if let Some(f) = flip_scheme(&base) {
-                    if let Ok(c) = status_client(&f, token, insecure, ca_cert_pem) {
-                        if c.read_status(component_id).await.is_ok() {
-                            base = f;
-                            client = c;
-                        }
-                    }
-                }
-            }
+            Err(_) => saw_down = true,
         }
         if tokio::time::Instant::now() > deadline {
             return Err(EngineError::Timeout {
@@ -640,22 +613,4 @@ pub(crate) fn build_flash_client(
         component: component_id.to_string(),
         message: format!("flash client: {e}"),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn flip_scheme_swaps_http_and_https() {
-        assert_eq!(
-            flip_scheme("http://host:8080/x").as_deref(),
-            Some("https://host:8080/x")
-        );
-        assert_eq!(
-            flip_scheme("https://host:8080/x").as_deref(),
-            Some("http://host:8080/x")
-        );
-        assert_eq!(flip_scheme("ftp://x"), None);
-    }
 }
