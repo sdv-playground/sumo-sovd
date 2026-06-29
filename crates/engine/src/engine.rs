@@ -29,7 +29,13 @@ struct UpdateModeProbe {
 
 #[derive(Clone)]
 pub struct FlashEngine {
-    server_url: String,
+    /// Device base URL. An `Arc<Mutex>` (not a bare `String`) so a step that
+    /// observes the device flip `http`↔`https` across a reset — its
+    /// `tls-identity` goes live on the first post-provision restart — can adopt
+    /// the live scheme in place. `Clone` deliberately SHARES the lock, so a
+    /// step's reset and the verdict (`commit_all`/`rollback_all`) that follows,
+    /// plus any cloned per-step engines, all dial the same live endpoint.
+    server_url: std::sync::Arc<std::sync::Mutex<String>>,
     token: Arc<dyn TokenSource>,
     trust_anchor: Vec<u8>,
     timeouts: EngineTimeouts,
@@ -65,7 +71,7 @@ impl FlashEngine {
         ca_cert_pem: Option<Vec<u8>>,
     ) -> Self {
         Self {
-            server_url: server_url.into(),
+            server_url: std::sync::Arc::new(std::sync::Mutex::new(server_url.into())),
             token,
             trust_anchor,
             timeouts,
@@ -147,7 +153,7 @@ impl FlashEngine {
             let token = self.token.token(comp).await?;
             match ecu::flash_ecu_to_staging(
                 job,
-                &self.server_url,
+                &self.base(),
                 &self.trust_anchor,
                 &token,
                 self.insecure,
@@ -260,7 +266,7 @@ impl FlashEngine {
             } else {
                 let token = self.token.token(comp).await?;
                 ecu::fetch_reset_kind(
-                    &self.server_url,
+                    &self.base(),
                     comp,
                     gw.as_deref(),
                     update_id,
@@ -296,7 +302,7 @@ impl FlashEngine {
         if !local.is_empty() {
             let mut set = tokio::task::JoinSet::new();
             for (comp, gw, _update_id) in local {
-                let url = self.server_url.clone();
+                let url = self.base();
                 let token = self.token.token(&comp).await?;
                 let secs = self.timeouts.local_reset_secs;
                 let insecure = self.insecure;
@@ -331,7 +337,7 @@ impl FlashEngine {
                 baselines.insert(
                     comp_id.clone(),
                     ecu::read_boot_id(
-                        &self.server_url,
+                        &self.base(),
                         comp_id,
                         &token,
                         self.insecure,
@@ -382,9 +388,12 @@ impl FlashEngine {
             // whole in-trial set at once (the update *session* is the commit
             // unit) — no per-component `/updates` session to re-attach (the
             // reboot wiped it).
+            // A staged component id to re-probe the live scheme after the reset
+            // (captured before `comps` is consumed by the verify loop below).
+            let probe = comps.first().map(|(c, _)| c.clone());
             let mut set = tokio::task::JoinSet::new();
             for (comp_id, _update_id) in comps {
-                let url = self.server_url.clone();
+                let url = self.base();
                 let token = self.token.token(&comp_id).await?;
                 let secs = self.timeouts.ecu_reset_activation_secs;
                 let baseline = baselines.get(&comp_id).copied().flatten();
@@ -405,6 +414,13 @@ impl FlashEngine {
                 });
             }
             collect_results(&mut set, ecus, EcuState::Activated, &mut first_err).await;
+            // After the coalesced reset the device may have flipped
+            // http<->https (its tls-identity goes live on the first
+            // post-provision restart); adopt whichever scheme answers /status
+            // now so the verdict (commit/rollback) dials the live endpoint.
+            if let Some(c) = &probe {
+                self.adopt_live_scheme(c).await;
+            }
         }
 
         // 5. Reboot committed singleshot components that declared a reset_kind,
@@ -420,7 +436,7 @@ impl FlashEngine {
         for (comp, gw) in ss_local {
             let token = self.token.token(&comp).await?;
             let outcome = match ecu::trigger_local_restart(
-                &self.server_url,
+                &self.base(),
                 &comp,
                 gw.as_deref(),
                 &token,
@@ -490,7 +506,7 @@ impl FlashEngine {
     pub async fn commit_node_trials(&self) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
         ecu::commit_node_trials(
-            &self.server_url,
+            &self.base(),
             &token,
             self.insecure,
             self.ca_cert_pem.as_deref(),
@@ -503,7 +519,7 @@ impl FlashEngine {
     pub async fn rollback_node_trials(&self) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
         ecu::rollback_node_trials(
-            &self.server_url,
+            &self.base(),
             &token,
             self.insecure,
             self.ca_cert_pem.as_deref(),
@@ -672,6 +688,40 @@ impl FlashEngine {
 
     // --- internals ---------------------------------------------------------
 
+    /// The current device base URL. The engine may adopt the opposite scheme
+    /// after a reset — see [`adopt_live_scheme`](Self::adopt_live_scheme).
+    fn base(&self) -> String {
+        self.server_url.lock().expect("server_url poisoned").clone()
+    }
+
+    /// Adopt `url` as the device base URL for every subsequent call. Shared
+    /// across clones via the `Arc<Mutex>`, so the verdict that follows a reset
+    /// dials it too.
+    fn adopt_base(&self, url: String) {
+        *self.server_url.lock().expect("server_url poisoned") = url;
+    }
+
+    /// After a reset the device may have flipped http<->https (its tls-identity
+    /// goes live on the first post-provision restart). Adopt whichever scheme
+    /// answers /status now, so the verdict/commit dials the live endpoint.
+    async fn adopt_live_scheme(&self, probe_comp: &str) {
+        let tok = self.token.token(probe_comp).await.unwrap_or_default();
+        let cur = self.base();
+        if let Ok(c) = ecu::status_client(&cur, &tok, self.insecure, self.ca_cert_pem.as_deref()) {
+            if c.read_status(probe_comp).await.is_ok() {
+                return; // current scheme already answers — keep it
+            }
+        }
+        if let Some(f) = ecu::flip_scheme(&cur) {
+            if let Ok(c) = ecu::status_client(&f, &tok, self.insecure, self.ca_cert_pem.as_deref())
+            {
+                if c.read_status(probe_comp).await.is_ok() {
+                    self.adopt_base(f);
+                }
+            }
+        }
+    }
+
     /// Commit one component — pure SOVD (attach + spec_commit). The driver
     /// re-unlocks (UDS) before calling, if its security model needs it.
     async fn commit_one(
@@ -682,7 +732,7 @@ impl FlashEngine {
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
         let flash_client = ecu::build_flash_client(
-            &self.server_url,
+            &self.base(),
             component_id,
             gateway_id,
             &token,
@@ -715,7 +765,7 @@ impl FlashEngine {
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
         let flash_client = ecu::build_flash_client(
-            &self.server_url,
+            &self.base(),
             component_id,
             gateway_id,
             &token,
@@ -814,9 +864,9 @@ impl FlashEngine {
         let token = self.token.token(key).await?;
         let ca = self.ca_cert_pem.as_deref();
         let client = if token.is_empty() {
-            SovdClient::new_verifying(&self.server_url, self.insecure, ca)
+            SovdClient::new_verifying(&self.base(), self.insecure, ca)
         } else {
-            SovdClient::with_bearer_token_verifying(&self.server_url, &token, self.insecure, ca)
+            SovdClient::with_bearer_token_verifying(&self.base(), &token, self.insecure, ca)
         };
         client.map_err(|e| EngineError::Sovd {
             component: key.to_string(),
