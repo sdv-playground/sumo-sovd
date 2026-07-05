@@ -21,7 +21,9 @@ use crate::security_helper::{ComputeKeyRequest, SecurityHelperClient, SecurityHe
 pub use sumo_sovd_flash_engine::{
     EcuState, EcuStatus, NoAuth, StaticToken, TokenSource, UpdateType,
 };
-use sumo_sovd_flash_engine::{EngineTimeouts, FlashEngine, FlashJob, FlashPlan, Payload, PayloadSource};
+use sumo_sovd_flash_engine::{
+    EngineTimeouts, FlashEngine, FlashJob, FlashPlan, Payload, PayloadSource,
+};
 
 /// Configuration for a campaign deployment.
 pub struct CampaignConfig {
@@ -423,7 +425,10 @@ mod tests {
 
     #[async_trait]
     impl TokenSource for PerComponentMinter {
-        async fn token(&self, component_id: &str) -> Result<String, sumo_sovd_flash_engine::EngineError> {
+        async fn token(
+            &self,
+            component_id: &str,
+        ) -> Result<String, sumo_sovd_flash_engine::EngineError> {
             Ok(format!("minted-for-{component_id}"))
         }
     }

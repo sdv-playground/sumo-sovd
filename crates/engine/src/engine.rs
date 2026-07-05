@@ -652,7 +652,10 @@ impl FlashEngine {
             if !health.is_healthy(&ecus).await? {
                 // Unhealthy: roll this step's trial back, then abort — don't commit
                 // a bad baseline, and don't run later steps on top of it.
-                warn!(step = idx, "campaign step unhealthy after reset — rolling back + aborting");
+                warn!(
+                    step = idx,
+                    "campaign step unhealthy after reset — rolling back + aborting"
+                );
                 if let Err(e) = eng.rollback_all(&mut ecus).await {
                     warn!(step = idx, error = %e, "rollback of unhealthy step also failed");
                 }
