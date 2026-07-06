@@ -7,10 +7,10 @@ description = "SUIT campaign orchestrator over SOVD — coordinates multi-ECU fi
 
 [dependencies]
 # SUIT manifest parsing + validation
-sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
-sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
-sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
-sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.0" }
+sumo-onboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-processor = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-crypto = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
+sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.1.1" }
 
 # Shared SOVD flash execution engine (stage → reset → commit/rollback)
 sumo-sovd-flash-engine = { path = "../engine" }
