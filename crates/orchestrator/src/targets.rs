@@ -10,7 +10,7 @@
 //! - **Multiflash spec**: a small JSON file naming per-ECU manifests +
 //!   payload files on disk. Use [`MultiflashSpec`] — convenient when
 //!   you've built artefacts separately and want to flash a coordinated
-//!   set without an L1 envelope. Used by `examples/managed-cvc/`.
+//!   set without an L1 envelope. Used by `sumo-campaign multiflash`.
 
 use serde::Deserialize;
 use sumo_crypto::RustCryptoBackend;
