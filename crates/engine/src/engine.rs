@@ -232,7 +232,20 @@ impl FlashEngine {
         let mut ss_local: Vec<(String, Option<String>)> = Vec::new();
         let mut ss_by_ecu: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
         for e in ecus.iter().filter(|e| e.state == EcuState::Committed) {
-            match self.component_reset_kind(&e.component_id).await {
+            let kind = self.component_reset_kind(&e.component_id).await.unwrap_or_else(|| {
+                // Fail CLOSED: this component was just written irreversibly. If we
+                // cannot read whether it needs a reboot, reboot — an unnecessary
+                // node reset is bounded and observable; skipping it leaves
+                // unverified firmware armed for the next power cycle and lets the
+                // step pass a vacuous health gate (exactly what happened when the
+                // rig's RT probe failed silently and the M7 reboot was skipped).
+                warn!(
+                    component = %e.component_id,
+                    "update-mode unreadable for committed singleshot — defaulting to requires_ecu_reset"
+                );
+                sovd_core::ResetKind::RequiresEcuReset
+            });
+            match kind {
                 sovd_core::ResetKind::Local => {
                     ss_local.push((e.component_id.clone(), e.gateway_id.clone()))
                 }
@@ -773,20 +786,36 @@ impl FlashEngine {
     /// capability — available without a live update (unlike the per-update
     /// `/updates` status that `fetch_reset_kind` reads). Unknown / unreported /
     /// unreachable → `None` (no reboot).
-    async fn component_reset_kind(&self, comp: &str) -> sovd_core::ResetKind {
-        let Ok(client) = self.sovd_client(comp).await else {
-            return sovd_core::ResetKind::None;
+    /// The component's declared reset kind, off the stable `x-sumo-update-mode`
+    /// data param. `None` = the probe FAILED (client/read/parse — each logged);
+    /// the caller picks the safe default. A device legitimately declaring "no
+    /// reset needed" comes back as `Some(ResetKind::None)` — the two must not
+    /// be conflated (a silent fallback here once skipped the RT/M7 reboot).
+    async fn component_reset_kind(&self, comp: &str) -> Option<sovd_core::ResetKind> {
+        let client = match self.sovd_client(comp).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(component = %comp, error = %e, "update-mode probe: no SOVD client/token");
+                return None;
+            }
         };
-        let Ok(resp) = client.read_data(comp, "x-sumo-update-mode").await else {
-            return sovd_core::ResetKind::None;
+        let resp = match client.read_data(comp, "x-sumo-update-mode").await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(component = %comp, error = %e, "update-mode probe: read failed");
+                return None;
+            }
         };
         match serde_json::from_value::<UpdateModeProbe>(resp.value) {
-            Ok(mode) => match mode.reset_kind.as_str() {
+            Ok(mode) => Some(match mode.reset_kind.as_str() {
                 "requires_ecu_reset" => sovd_core::ResetKind::RequiresEcuReset,
                 "local" => sovd_core::ResetKind::Local,
                 _ => sovd_core::ResetKind::None,
-            },
-            Err(_) => sovd_core::ResetKind::None,
+            }),
+            Err(e) => {
+                warn!(component = %comp, error = %e, "update-mode probe: unparseable payload");
+                None
+            }
         }
     }
 
