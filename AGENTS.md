@@ -27,7 +27,7 @@ Finding commands:
 
 ```bash
 rg --files -g 'Cargo.toml' -g 'README*' -g 'CLAUDE.md'
-rg -n "CampaignOrchestrator|FirmwareResolver|SecurityHelper|flash_all|commit_all|rollback" crates README.md CLAUDE.md
+rg -n "CampaignOrchestrator|FirmwareResolver|TokenSource|flash_all|commit_all|rollback" crates README.md CLAUDE.md
 ```
 
 ## Stack
@@ -38,7 +38,7 @@ rg -n "CampaignOrchestrator|FirmwareResolver|SecurityHelper|flash_all|commit_all
 ## Guardrails
 
 - Keep L1 campaign ordering and L2 image semantics manifest-driven.
-- SOVD session/security/upload/flash/reset/commit flow belongs in orchestration code, not hard-coded test scripts.
+- SOVD upload/flash/reset/commit flow belongs in orchestration code, not hard-coded test scripts. UDS session/security unlock is the SOVD server's job (writes carry a JWT bearer), never a client step.
 - Preserve atomic campaign behavior: trial all targets before commit; rollback on failure.
 
 ## Gotchas

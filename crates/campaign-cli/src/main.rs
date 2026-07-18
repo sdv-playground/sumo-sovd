@@ -3,11 +3,14 @@
 //! Deploy an L1 campaign manifest (multi-ECU):
 //!   sumo-campaign deploy campaign.suit --server http://localhost:4000 \
 //!     --trust-anchor keys/signing.pub --gateway vehicle_gateway \
-//!     --sovd-ecus vm1 --helper-url http://localhost:9100 --helper-token dev-secret-123
+//!     --sovd-ecus vm1 --sovd-token <jwt>
 //!
 //! Flash a single L2 image manifest:
 //!   sumo-campaign flash vm1 manifest.suit --server http://localhost:4000 \
-//!     --gateway vehicle_gateway --helper-url http://localhost:9100 --helper-token dev-secret-123
+//!     --gateway vehicle_gateway --sovd-token <jwt>
+//!
+//! SOVD writes carry the JWT bearer; UDS session/security unlock happens
+//! transparently server-side in the SOVD server.
 
 use std::process;
 
@@ -15,7 +18,6 @@ use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
 use sumo_sovd_orchestrator::campaign::{CampaignConfig, CampaignOrchestrator, EcuTarget};
-use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
 use sumo_sovd_orchestrator::targets::{parse_l1_campaign_with_payloads, MultiflashSpec};
 
 // =============================================================================
@@ -42,18 +44,6 @@ struct Cli {
     /// Gateway component ID (if ECUs are behind a gateway)
     #[arg(long, global = true)]
     gateway: Option<String>,
-
-    /// UDS security access level
-    #[arg(long, default_value = "1", global = true)]
-    security_level: u8,
-
-    /// Security helper URL
-    #[arg(long, default_value = "http://localhost:9100", global = true)]
-    helper_url: String,
-
-    /// Security helper bearer token
-    #[arg(long, default_value = "dev-secret-123", global = true)]
-    helper_token: String,
 
     /// SOVD bearer JWT for the flash engine (operator-supplied). Omitted →
     /// unauthenticated (the device may not enforce auth yet).
@@ -186,11 +176,6 @@ async fn main() {
                 })
             })
             .unwrap_or_default(),
-        security_level: cli.security_level,
-        security_helper: SecurityHelperConfig {
-            url: cli.helper_url,
-            token: cli.helper_token,
-        },
         use_validated_flow: cli.validated,
         sovd_token: cli.sovd_token,
         // The workshop campaign-cli talks plain HTTP today; no --insecure flag

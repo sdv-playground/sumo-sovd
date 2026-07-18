@@ -20,7 +20,6 @@ use sovd_core::{
 };
 
 use sumo_sovd_orchestrator::campaign::{CampaignConfig, CampaignOrchestrator, EcuState, EcuTarget};
-use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
 
 // =============================================================================
 // Test Backend — simulates flash lifecycle in-memory
@@ -308,15 +307,11 @@ fn dummy_trust_anchor() -> Vec<u8> {
 struct TestFixture {
     orchestrator: CampaignOrchestrator,
     _sovd_handle: tokio::task::JoinHandle<()>,
-    _helper_handle: tokio::task::JoinHandle<()>,
 }
 
 async fn setup(backend: Arc<dyn DiagnosticBackend>) -> TestFixture {
     let sovd_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sovd_port = sovd_listener.local_addr().unwrap().port();
-
-    let helper_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let helper_port = helper_listener.local_addr().unwrap().port();
 
     let id = backend.entity_info().id.clone();
     let state = sovd_api::AppState::single(&id, backend);
@@ -325,29 +320,11 @@ async fn setup(backend: Arc<dyn DiagnosticBackend>) -> TestFixture {
         axum::serve(sovd_listener, app).await.unwrap();
     });
 
-    let helper_app = {
-        use axum::{routing::post, Json, Router};
-        Router::new().route(
-            "/calculate",
-            post(|Json(_body): Json<serde_json::Value>| async move {
-                Json(serde_json::json!({"key": "aabb"}))
-            }),
-        )
-    };
-    let helper_handle = tokio::spawn(async move {
-        axum::serve(helper_listener, helper_app).await.unwrap();
-    });
-
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let orchestrator = CampaignOrchestrator::new(CampaignConfig {
         server_url: format!("http://127.0.0.1:{sovd_port}"),
         trust_anchor: dummy_trust_anchor(),
-        security_level: 1,
-        security_helper: SecurityHelperConfig {
-            url: format!("http://127.0.0.1:{helper_port}"),
-            token: "test".into(),
-        },
         use_validated_flow: false,
         sovd_token: None,
         insecure: false,
@@ -356,7 +333,6 @@ async fn setup(backend: Arc<dyn DiagnosticBackend>) -> TestFixture {
     TestFixture {
         orchestrator,
         _sovd_handle: sovd_handle,
-        _helper_handle: helper_handle,
     }
 }
 
@@ -364,26 +340,10 @@ async fn setup_multi(backends: HashMap<String, Arc<dyn DiagnosticBackend>>) -> T
     let sovd_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sovd_port = sovd_listener.local_addr().unwrap().port();
 
-    let helper_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let helper_port = helper_listener.local_addr().unwrap().port();
-
     let state = sovd_api::AppState::new(backends);
     let app = sovd_api::create_router(state);
     let sovd_handle = tokio::spawn(async move {
         axum::serve(sovd_listener, app).await.unwrap();
-    });
-
-    let helper_app = {
-        use axum::{routing::post, Json, Router};
-        Router::new().route(
-            "/calculate",
-            post(|Json(_body): Json<serde_json::Value>| async move {
-                Json(serde_json::json!({"key": "aabb"}))
-            }),
-        )
-    };
-    let helper_handle = tokio::spawn(async move {
-        axum::serve(helper_listener, helper_app).await.unwrap();
     });
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -391,11 +351,6 @@ async fn setup_multi(backends: HashMap<String, Arc<dyn DiagnosticBackend>>) -> T
     let orchestrator = CampaignOrchestrator::new(CampaignConfig {
         server_url: format!("http://127.0.0.1:{sovd_port}"),
         trust_anchor: dummy_trust_anchor(),
-        security_level: 1,
-        security_helper: SecurityHelperConfig {
-            url: format!("http://127.0.0.1:{helper_port}"),
-            token: "test".into(),
-        },
         use_validated_flow: false,
         sovd_token: None,
         insecure: false,
@@ -404,7 +359,6 @@ async fn setup_multi(backends: HashMap<String, Arc<dyn DiagnosticBackend>>) -> T
     TestFixture {
         orchestrator,
         _sovd_handle: sovd_handle,
-        _helper_handle: helper_handle,
     }
 }
 

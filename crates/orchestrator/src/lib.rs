@@ -12,13 +12,11 @@
 //! CampaignOrchestrator
 //!      ↓
 //!  Stage phase (per-ECU):        Reset phase (campaign-level):
-//!   1. Programming session        8. Reset all staged ECUs
-//!   2. Security unlock             9. Wait for activation (trial)
-//!   3. Upload package
-//!   4. Verify                    Commit phase (campaign-level):
-//!   5. Start flash transfer       10. Commit all or rollback all
-//!   6. Monitor progress
-//!   7. Finalize → AwaitingReboot
+//!   1. Upload package             6. Reset all staged ECUs
+//!   2. Verify                     7. Wait for activation (trial)
+//!   3. Start flash transfer
+//!   4. Monitor progress          Commit phase (campaign-level):
+//!   5. Finalize → AwaitingReboot  8. Commit all or rollback all
 //!      ↓
 //! SOVD Servers (vm-mgr, SOVDd, etc.)
 //! ```
@@ -35,12 +33,13 @@
 //!   encryption info, security_version. Signed by firmware author.
 //! - **SOVD API**: Standard REST interface for diagnostic operations.
 //!   The orchestrator uses sovd-client to drive each ECU.
-//! - **Security helper**: External service that computes security keys
-//!   from seeds (pluggable per deployment).
+//! - **Auth**: SOVD writes carry a JWT bearer (see the engine's
+//!   [`TokenSource`](sumo_sovd_flash_engine::TokenSource) seam). UDS
+//!   session/security unlock happens transparently server-side in the
+//!   SOVD server — there is no client-side unlock choreography.
 
 pub mod campaign;
 pub mod error;
-pub mod security_helper;
 pub mod sovd_ops;
 pub mod targets;
 

@@ -8,9 +8,6 @@ pub enum OrchestratorError {
     #[error("SOVD API error for {component}: {message}")]
     Sovd { component: String, message: String },
 
-    #[error("security unlock failed for {component}: {message}")]
-    SecurityFailed { component: String, message: String },
-
     #[error("flash failed for {component}: {message}")]
     FlashFailed { component: String, message: String },
 

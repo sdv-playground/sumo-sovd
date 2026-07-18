@@ -1,14 +1,15 @@
 //! Campaign orchestrator — the offboard adapter over the shared `FlashEngine`.
 //!
-//! Resolves an L1 campaign manifest into a `FlashPlan`, owns UDS unlock (the
-//! engine assumes already-unlocked), and delegates the stage → reset → commit
-//! lifecycle to `sumo_sovd_flash_engine::FlashEngine`. The reset is a
+//! Resolves an L1 campaign manifest into a `FlashPlan` and delegates the
+//! stage → reset → commit lifecycle to `sumo_sovd_flash_engine::FlashEngine`.
+//! UDS session/security is the SOVD server's concern: writes carry a JWT
+//! bearer (the engine's [`TokenSource`] seam) and the server unlocks itself
+//! on a valid token — no client-side unlock choreography. The reset is a
 //! campaign-level decision: stage all ECUs, then reset them together.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sovd_client::SovdClient;
 use sumo_codec::commands::CommandValue;
 use sumo_codec::labels::*;
 use sumo_crypto::RustCryptoBackend;
@@ -16,7 +17,6 @@ use sumo_onboard::Validator;
 use tracing::info;
 
 use crate::error::OrchestratorError;
-use crate::security_helper::{ComputeKeyRequest, SecurityHelperClient, SecurityHelperConfig};
 
 pub use sumo_sovd_flash_engine::{
     EcuState, EcuStatus, NoAuth, StaticToken, TokenSource, UpdateType,
@@ -29,8 +29,6 @@ use sumo_sovd_flash_engine::{
 pub struct CampaignConfig {
     pub server_url: String,
     pub trust_anchor: Vec<u8>,
-    pub security_level: u8,
-    pub security_helper: SecurityHelperConfig,
     /// If true, drive each ECU through `validate()` → `activate()` so the
     /// lifecycle visibly passes through `Validated` (reserved; the current
     /// /updates execute flow lands at AwaitingReboot directly).
@@ -43,9 +41,9 @@ pub struct CampaignConfig {
     /// [`CampaignOrchestrator::with_token_source`] instead.
     pub sovd_token: Option<String>,
     /// Skip TLS certificate verification on the device's SOVD endpoint (the
-    /// `curl -k` equivalent), threaded into the flash engine and the unlock
-    /// client. `false` (default) = full verification, byte-identical to before
-    /// this knob. Set when the device leaf SAN won't match the dialled host.
+    /// `curl -k` equivalent), threaded into the flash engine. `false`
+    /// (default) = full verification, byte-identical to before this knob.
+    /// Set when the device leaf SAN won't match the dialled host.
     pub insecure: bool,
 }
 
@@ -100,7 +98,6 @@ fn target_to_job(t: EcuTarget) -> FlashJob {
 /// Orchestrates multi-ECU firmware campaigns over SOVD.
 pub struct CampaignOrchestrator {
     config: CampaignConfig,
-    helper: SecurityHelperClient,
     engine: FlashEngine,
 }
 
@@ -120,7 +117,6 @@ impl CampaignOrchestrator {
     /// The flash engine, and thus the device, sees only the resulting bearer — the
     /// campaign itself stays agnostic to how it was obtained.
     pub fn with_token_source(config: CampaignConfig, token: Arc<dyn TokenSource>) -> Self {
-        let helper = SecurityHelperClient::new(config.security_helper.clone());
         let engine = FlashEngine::new(
             config.server_url.clone(),
             token,
@@ -129,31 +125,17 @@ impl CampaignOrchestrator {
             config.insecure,
             None,
         );
-        Self {
-            config,
-            helper,
-            engine,
-        }
+        Self { config, engine }
     }
 
-    /// Pooled security-helper client. Used internally for unlock and exposed so
-    /// callers (e.g. sumo-deploy) can probe `/info` or perform extra unlocks.
-    pub fn helper(&self) -> &SecurityHelperClient {
-        &self.helper
-    }
-
-    /// Stage all ECU targets — unlock each (UDS), then flash to AwaitingReboot
-    /// via the engine. Does NOT reset. On flash failure the engine rolls back
-    /// already-staged ECUs.
+    /// Stage all ECU targets — flash each to AwaitingReboot via the engine.
+    /// Does NOT reset. On flash failure the engine rolls back already-staged
+    /// ECUs. The SOVD server handles UDS session/security itself on a valid
+    /// bearer.
     pub async fn stage_all(
         &self,
         targets: Vec<EcuTarget>,
     ) -> Result<StagePhaseResult, OrchestratorError> {
-        // The engine assumes already-unlocked — unlock every target up front.
-        for t in &targets {
-            self.unlock_for_flash(&t.component_id, t.gateway_id.as_deref())
-                .await?;
-        }
         let plan = FlashPlan {
             jobs: targets.into_iter().map(target_to_job).collect(),
         };
@@ -177,30 +159,16 @@ impl CampaignOrchestrator {
         Ok(FlashPhaseResult { ecus })
     }
 
-    /// Commit all activated firmware ECUs. Re-unlocks each first (the ECU reset
-    /// cleared the session per ISO 14229), then the engine posts the verdict.
+    /// Commit all activated firmware ECUs — the engine posts the verdict.
+    /// (The post-reset UDS session/security re-establishment is the SOVD
+    /// server's concern, not the campaign's.)
     pub async fn commit_all(&self, ecus: &[EcuStatus]) -> Result<(), OrchestratorError> {
-        for e in ecus
-            .iter()
-            .filter(|e| e.state == EcuState::Activated && e.update_type == UpdateType::Firmware)
-        {
-            self.unlock_for_flash(&e.component_id, e.gateway_id.as_deref())
-                .await?;
-        }
         let mut owned = ecus.to_vec();
         self.engine.commit_all(&mut owned).await.map_err(Into::into)
     }
 
-    /// Rollback all activated firmware ECUs. Best-effort re-unlock per ECU.
+    /// Rollback all activated firmware ECUs.
     pub async fn rollback_all(&self, ecus: &[EcuStatus]) -> Result<(), OrchestratorError> {
-        for e in ecus
-            .iter()
-            .filter(|e| e.state == EcuState::Activated && e.update_type == UpdateType::Firmware)
-        {
-            let _ = self
-                .unlock_for_flash(&e.component_id, e.gateway_id.as_deref())
-                .await;
-        }
         let mut owned = ecus.to_vec();
         self.engine
             .rollback_all(&mut owned)
@@ -309,79 +277,6 @@ impl CampaignOrchestrator {
         }
 
         self.flash_all(targets).await
-    }
-
-    /// Establish programming session + security unlock for an ECU.
-    ///
-    /// Called before staging and after each ECU reset (ISO 14229 resets session
-    /// and security to default — needed before commit/rollback). The engine
-    /// never touches session/security; that's the campaign's concern.
-    async fn unlock_for_flash(
-        &self,
-        component_id: &str,
-        gateway_id: Option<&str>,
-    ) -> Result<(), OrchestratorError> {
-        let client = SovdClient::new_insecure(&self.config.server_url, self.config.insecure)
-            .map_err(|e| OrchestratorError::Sovd {
-                component: component_id.to_string(),
-                message: format!("{e}"),
-            })?;
-
-        let (mode_component, mode_target) = if let Some(gw) = gateway_id {
-            (gw, Some(component_id))
-        } else {
-            (component_id, None)
-        };
-
-        // Session → programming
-        client
-            .set_mode_targeted(
-                mode_component,
-                "session",
-                serde_json::json!({"value": "programming"}),
-                mode_target,
-            )
-            .await
-            .map_err(|e| OrchestratorError::Sovd {
-                component: component_id.to_string(),
-                message: format!("set_session: {e}"),
-            })?;
-
-        // Security unlock
-        let seed_resp = client.set_mode_targeted(
-            mode_component, "security",
-            serde_json::json!({"value": format!("level{}_requestseed", self.config.security_level)}),
-            mode_target,
-        ).await.map_err(|e| OrchestratorError::SecurityFailed {
-            component: component_id.to_string(),
-            message: format!("seed: {e}"),
-        })?;
-
-        if let Some(seed_val) = seed_resp.seed.as_ref() {
-            let seed_str = seed_val
-                .get("Request_Seed")
-                .and_then(|s| s.as_str())
-                .or_else(|| seed_val.as_str())
-                .unwrap_or("");
-            let key_hex = self
-                .helper()
-                .compute_key(&ComputeKeyRequest::new(
-                    seed_str,
-                    self.config.security_level,
-                    component_id,
-                ))
-                .await?;
-            client.set_mode_targeted(
-                mode_component, "security",
-                serde_json::json!({"value": format!("level{}", self.config.security_level), "key": key_hex}),
-                mode_target,
-            ).await.map_err(|e| OrchestratorError::SecurityFailed {
-                component: component_id.to_string(),
-                message: format!("key: {e}"),
-            })?;
-        }
-
-        Ok(())
     }
 }
 

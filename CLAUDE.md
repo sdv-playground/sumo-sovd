@@ -12,8 +12,8 @@ firmware update campaigns.
 Fleet Backend → [L1 campaign + L2 manifests + firmware]
      ↓
 sumo-sovd-orchestrator
-     ↓ per-ECU via SOVD API:
-     ↓   session → security → upload → flash → reset → commit
+     ↓ per-ECU via SOVD API (JWT bearer; UDS unlock is server-side):
+     ↓   upload → flash → reset → commit
      ↓
 SOVD Servers (vm-mgr, SOVDd, etc.)
 ```
@@ -24,6 +24,8 @@ SOVD Servers (vm-mgr, SOVDd, etc.)
 - L2 image manifest: per-ECU firmware with digest, encryption, security_version
 - FirmwareResolver trait: pluggable firmware source (CDN, local cache, CAS)
 - Per-ECU flash lifecycle driven by SOVD REST API via sovd-client
+- Auth: SOVD writes carry a JWT bearer (TokenSource seam); UDS
+  session/security unlock happens transparently server-side
 
 ## Build & Test
 

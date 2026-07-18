@@ -9,20 +9,22 @@ Fleet Backend → [L1 campaign manifest + L2 image manifests + firmware]
      ↓
 sumo-sovd-orchestrator
      ↓ for each ECU (manifest-driven ordering):
-     ↓   1. Switch to programming session
-     ↓   2. Unlock security (via security helper)
-     ↓   3. Upload firmware package
-     ↓   4. Verify package integrity
-     ↓   5. Start flash transfer
-     ↓   6. Monitor progress
-     ↓   7. Finalize transfer
-     ↓   8. Reset ECU
-     ↓   9. Wait for activation (poll)
+     ↓   1. Upload firmware package
+     ↓   2. Verify package integrity
+     ↓   3. Start flash transfer
+     ↓   4. Monitor progress
+     ↓   5. Finalize transfer
+     ↓   6. Reset ECU
+     ↓   7. Wait for activation (poll)
      ↓
      ↓ All ECUs in trial → health check → commit all or rollback all
      ↓
 SOVD Servers (vm-mgr, SOVDd, etc.)
 ```
+
+SOVD writes carry a JWT bearer (the flash engine's `TokenSource` seam);
+UDS session/security unlock happens transparently server-side in the
+SOVD server. There is no client-side seed/key choreography.
 
 ## Key Concepts
 
@@ -54,21 +56,25 @@ The orchestrator reads the L1 manifest's SUIT command sequences to determine beh
 
 ```rust
 use sumo_sovd_orchestrator::campaign::*;
-use sumo_sovd_orchestrator::security_helper::SecurityHelperConfig;
 
 let orchestrator = CampaignOrchestrator::new(CampaignConfig {
     server_url: "http://localhost:4000".into(),
     trust_anchor: std::fs::read("signing.pub")?,
-    security_level: 1,
-    security_helper: SecurityHelperConfig {
-        url: "http://localhost:9100".into(),
-        token: "dev-secret-123".into(),
-    },
+    use_validated_flow: false,
+    // SOVD writes carry a JWT bearer; the server unlocks itself (UDS) on a
+    // valid token. None → unauthenticated (device may not enforce auth yet).
+    sovd_token: Some(jwt),
+    insecure: false,
 });
 
 // Flash all ECUs to trial
 let result = orchestrator.flash_all(vec![
-    EcuTarget { component_id: "os1".into(), gateway_id: Some("vehicle_gateway".into()), package: firmware },
+    EcuTarget {
+        component_id: "os1".into(),
+        gateway_id: Some("vehicle_gateway".into()),
+        manifest: suit_envelope,
+        payloads: vec![],
+    },
 ]).await?;
 
 // Health check... then commit or rollback
@@ -86,7 +92,6 @@ Launches:
   - `os1` → vm-mgr SOVD proxy (port 4001)
   - `engine_ecu` → UDS ECU on vcan1
   - `body_ecu` → UDS ECU on vcan1
-- Security helper (port 9100)
 
 ## Test Results (6/6 passing)
 
@@ -105,5 +110,4 @@ Launches:
 - [SOVDd](https://github.com/sdv-playground/SOVDd) — SOVD diagnostic server
 - [vm-mgr](https://github.com/sdv-playground/vm-mgr) — VM lifecycle manager with SUIT + SOVD
 - [SOVD Explorer](https://github.com/skarlsson/SOVD-explorer) — Diagnostic GUI
-- [SOVD Security Helper](https://github.com/skarlsson/SOVD-security-helper) — Key derivation service
 - [SUMO specs](https://github.com/tr-sdv-sandbox/sumo) — Specifications and test vectors
