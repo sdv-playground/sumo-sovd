@@ -339,11 +339,27 @@ impl FlashEngine {
             // reboot took effect). Absent for offline/non-heartbeat components →
             // wait_activated falls back to the observed server down→up.
             let mut baselines: BTreeMap<String, Option<u32>> = BTreeMap::new();
+            // ALSO capture the NODE boot_id baseline per component (the MM stamps
+            // the same node nonce on every component's status). A changed
+            // node_boot_id after the reboot is the unmissable witness for
+            // no-heartbeat components (host-os) — see ecu::wait_activated.
+            let mut node_baselines: BTreeMap<String, Option<String>> = BTreeMap::new();
             for (comp_id, _) in &comps {
                 let token = self.token.token(comp_id).await?;
                 baselines.insert(
                     comp_id.clone(),
                     ecu::read_boot_id(
+                        &self.server_url,
+                        comp_id,
+                        &token,
+                        self.insecure,
+                        self.ca_cert_pem.as_deref(),
+                    )
+                    .await,
+                );
+                node_baselines.insert(
+                    comp_id.clone(),
+                    ecu::read_node_boot_id(
                         &self.server_url,
                         comp_id,
                         &token,
@@ -401,6 +417,7 @@ impl FlashEngine {
                 let token = self.token.token(&comp_id).await?;
                 let secs = self.timeouts.ecu_reset_activation_secs;
                 let baseline = baselines.get(&comp_id).copied().flatten();
+                let node_baseline = node_baselines.get(&comp_id).cloned().flatten();
                 let insecure = self.insecure;
                 let ca_cert_pem = self.ca_cert_pem.clone();
                 set.spawn(async move {
@@ -408,6 +425,7 @@ impl FlashEngine {
                         &url,
                         &comp_id,
                         baseline,
+                        node_baseline,
                         secs,
                         &token,
                         insecure,

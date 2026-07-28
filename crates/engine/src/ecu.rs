@@ -334,6 +334,30 @@ pub async fn read_boot_id(
         .map(|v| v as u32)
 }
 
+/// Read the NODE per-boot nonce from `/status` `x-sumo-runtime.node_boot_id` — a
+/// string (UUID) the machine-manager stamps on EVERY component's status, changing
+/// on every node reboot. This is the UNMISSABLE reboot witness for components with
+/// no per-component heartbeat (`host-os`): unlike the transient SOVD down→up window
+/// (which a fast reboot slips through), a changed `node_boot_id` is durable state
+/// the poll can always observe. `None` when unreachable or the MM predates the
+/// field (callers then fall back to the down→up witness). See the machine-manager
+/// `read_entity_status` (component-mgr backend) which emits it.
+pub async fn read_node_boot_id(
+    server_url: &str,
+    component_id: &str,
+    token: &str,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Option<String> {
+    let client = status_client(server_url, token, insecure, ca_cert_pem).ok()?;
+    let body = client.read_status(component_id).await.ok()?;
+    body.extensions
+        .get("x-sumo-runtime")?
+        .get("node_boot_id")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 /// Wait until a component is **rebooted and ready** — the converged verify the
 /// orchestrator uses for every reset kind. Polls `/status` (tolerating the
 /// server being unreachable mid-reboot) until `status == ready` AND a reboot is
@@ -351,6 +375,7 @@ pub async fn wait_activated(
     server_url: &str,
     component_id: &str,
     baseline: Option<u32>,
+    node_baseline: Option<String>,
     timeout_secs: u64,
     token: &str,
     insecure: bool,
@@ -364,17 +389,30 @@ pub async fn wait_activated(
         match client.read_status(component_id).await {
             Ok(body) => {
                 let ready = matches!(body.status, EntityStatus::Ready);
-                let cur = body
-                    .extensions
-                    .get("x-sumo-runtime")
+                let runtime = body.extensions.get("x-sumo-runtime");
+                let cur = runtime
                     .and_then(|r| r.get("boot_id"))
                     .and_then(|v| v.as_u64())
                     .map(|v| v as u32);
-                let rebooted = match (baseline, cur) {
+                // NODE reboot witness (unmissable): a changed node_boot_id proves
+                // the node restarted, for ANY component — including no-heartbeat
+                // host-os. Preferred over the transient down→up window a fast
+                // reboot slips through. Only counts when we HAVE a baseline to
+                // compare (the MM stamps node_boot_id on every status).
+                let cur_node = runtime
+                    .and_then(|r| r.get("node_boot_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let node_rebooted = match (&node_baseline, &cur_node) {
+                    (Some(b), Some(c)) => c != b,
+                    _ => false, // no node witness available → rely on the others
+                };
+                let hb_rebooted = match (baseline, cur) {
                     (Some(b), Some(c)) => c != b, // heartbeat: a new guest lifetime
                     (None, Some(_)) => true,      // was offline: first lifetime is the boot
                     (_, None) => saw_down,        // no heartbeat: node down→up witness
                 };
+                let rebooted = node_rebooted || hb_rebooted;
                 if ready && rebooted {
                     return Ok(());
                 }
@@ -419,6 +457,10 @@ pub async fn restart_and_verify(
         server_url,
         component_id,
         baseline,
+        // Local per-component restart (not a node reboot) — the node_boot_id
+        // doesn't change, so no node witness here; the heartbeat/down witness
+        // applies as before.
+        None,
         timeout_secs,
         token,
         insecure,
