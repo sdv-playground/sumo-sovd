@@ -450,22 +450,22 @@ impl FlashEngine {
         }
         for (comp, gw) in ss_local {
             let token = self.token.token(&comp).await?;
-            let outcome = match ecu::trigger_local_restart(
+            // Use restart_and_verify (capture boot_id → restart → wait for a fresh
+            // ready lifetime) rather than trigger + a bare reachability ping: the
+            // ping returns on the still-alive pre-restart instance, letting the
+            // next step race a not-yet-restarted component (same class of bug as
+            // the node path above). restart_and_verify waits for the reboot to be
+            // WITNESSED before we proceed.
+            let outcome = ecu::restart_and_verify(
                 &self.server_url,
                 &comp,
                 gw.as_deref(),
+                self.timeouts.local_reset_secs,
                 &token,
                 self.insecure,
                 self.ca_cert_pem.as_deref(),
             )
-            .await
-            {
-                Ok(()) => {
-                    self.wait_reachable(&comp, self.timeouts.local_reset_secs)
-                        .await
-                }
-                Err(e) => Err(e),
-            };
+            .await;
             if let Err(err) = outcome {
                 if let Some(s) = ecus.iter_mut().find(|s| s.component_id == comp) {
                     s.state = EcuState::Failed;
@@ -479,11 +479,42 @@ impl FlashEngine {
         for (gateway_id, comps) in ss_by_ecu {
             let restart_key = gateway_id.as_deref().unwrap_or("");
             info!(gateway = ?gateway_id, components = ?comps, "rebooting node for committed singleshot (RequiresEcuReset)");
+            // Witness the reboot, don't just ping. `system_restart` is async — it
+            // returns 202 while the OLD supernova is still up, and the actual
+            // restart fires seconds later (esp. behind the reboot_host VM/loopback
+            // teardown). A bare reachability ping (`wait_reachable`) returns on that
+            // still-alive old instance, so the campaign races into the NEXT step,
+            // opens a /updates session, and the delayed restart then wipes the
+            // in-memory session → `prepare` 404 (reliably, on high-latency links).
+            // So: capture the node per-boot nonce BEFORE the restart, then wait for
+            // it to CHANGE (+ status ready) via wait_activated — the same
+            // reboot-witnessed converge the banked/trial path uses. The next step
+            // only starts once the node is genuinely back on a fresh boot. Use the
+            // first component as the witness (node_boot_id is node-wide).
+            let witness = comps.first().cloned().unwrap_or_default();
+            let witness_token = self.token.token(&witness).await.unwrap_or_default();
+            let node_baseline = ecu::read_node_boot_id(
+                &self.server_url,
+                &witness,
+                &witness_token,
+                self.insecure,
+                self.ca_cert_pem.as_deref(),
+            )
+            .await;
             let outcome = match self.sovd_client(restart_key).await {
                 Ok(client) => match client.system_restart(gateway_id.as_deref(), "hard").await {
                     Ok(_) => {
-                        self.wait_reachable(restart_key, self.timeouts.ecu_reset_activation_secs)
-                            .await
+                        ecu::wait_activated(
+                            &self.server_url,
+                            &witness,
+                            None, // committed singleshot: no heartbeat/trial to compare
+                            node_baseline,
+                            self.timeouts.ecu_reset_activation_secs,
+                            &witness_token,
+                            self.insecure,
+                            self.ca_cert_pem.as_deref(),
+                        )
+                        .await
                     }
                     Err(e) => Err(EngineError::FlashFailed {
                         component: comps.first().cloned().unwrap_or_default(),
@@ -833,26 +864,6 @@ impl FlashEngine {
             Err(e) => {
                 warn!(component = %comp, error = %e, "update-mode probe: unparseable payload");
                 None
-            }
-        }
-    }
-
-    /// Poll the device's SOVD API until it answers again after a reboot. A
-    /// committed singleshot reset has no trial/verdict to wait on — this just
-    /// confirms the node came back (its API serves `/components`).
-    async fn wait_reachable(&self, key: &str, timeout_secs: u64) -> Result<(), EngineError> {
-        let client = self.sovd_client(key).await?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if client.list_components().await.is_ok() {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() > deadline {
-                return Err(EngineError::Timeout {
-                    component: key.to_string(),
-                    operation: "reboot (singleshot)".into(),
-                });
             }
         }
     }
