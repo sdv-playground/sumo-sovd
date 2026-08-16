@@ -647,6 +647,132 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
     assert_eq!(*backend.flash_state.read(), FlashState::Complete);
 }
 
+/// Build a node-verdict mock whose commit handler echoes a nonce chosen by
+/// `echo_for(attempt_index, sent_nonce)` and counts hits — for the replay-retry
+/// tests. Returns the base URL + the hit counter.
+async fn serve_nonce_echo_verdict(
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+    echo_for: impl Fn(u32, String) -> String + Clone + Send + Sync + 'static,
+) -> (String, Arc<AtomicU32>) {
+    let hits = Arc::new(AtomicU32::new(0));
+    let hits_route = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let node_op = axum::Router::new().route(
+        "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let hits = hits_route.clone();
+            let echo_for = echo_for.clone();
+            async move {
+                let n = hits.fetch_add(1, Ordering::SeqCst);
+                let sent = body
+                    .get("nonce")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // A fresh, complete §7.14 record; the echoed nonce is what varies.
+                let now = chrono::Utc::now().to_rfc3339();
+                axum::Json(serde_json::json!({
+                    "execution_id": format!("exec-{n}"),
+                    "operation_id": "x-sumo-commit-trials",
+                    "status": "completed",
+                    "result": { "committed": ["vm1"], "skipped": [] },
+                    "started_at": now,
+                    "completed_at": now,
+                    "nonce": echo_for(n, sent),
+                }))
+            }
+        }),
+    );
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op);
+    let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), hits)
+}
+
+fn force_reset_engine(url: String) -> FlashEngine {
+    FlashEngine::new(
+        url,
+        Arc::new(NoAuth),
+        dummy_trust_anchor(),
+        EngineTimeouts::default(),
+        false,
+        None,
+    )
+    .with_force_ecu_reset(true)
+}
+
+fn activated_vm1() -> Vec<EcuStatus> {
+    vec![EcuStatus {
+        component_id: "vm1".into(),
+        gateway_id: None,
+        state: EcuState::Activated,
+        update_type: UpdateType::Firmware,
+        active_version: None,
+        previous_version: None,
+        error: None,
+        update_id: Some("vm1".into()),
+    }]
+}
+
+#[tokio::test]
+async fn node_verdict_retries_once_on_nonce_mismatch_then_succeeds() {
+    // The field bug: a pooled connection answered a verdict POST with a PRIOR
+    // execution's record. The engine now sends a fresh uuid4 nonce per POST and, on
+    // a mismatched echo (the replay symptom), retries ONCE on a fresh connection.
+    // Attempt 0 echoes a WRONG nonce → retry; attempt 1 echoes the sent nonce → ok.
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
+    let (url, hits) = serve_nonce_echo_verdict(backends, |n, sent| {
+        if n == 0 {
+            "stale-prior-nonce".to_string()
+        } else {
+            sent
+        }
+    })
+    .await;
+
+    let eng = force_reset_engine(url);
+    let mut ecus = activated_vm1();
+    eng.commit_all(&mut ecus).await.unwrap();
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "must retry exactly once on the nonce mismatch"
+    );
+    assert_eq!(ecus[0].state, EcuState::Committed);
+}
+
+#[tokio::test]
+async fn node_verdict_fails_after_one_retry_on_persistent_replay() {
+    // A persistent replay (every response echoes a WRONG nonce) fails after the
+    // single retry — the engine never commits on an unverifiable verdict.
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
+    let (url, hits) =
+        serve_nonce_echo_verdict(backends, |_n, _sent| "always-wrong".to_string()).await;
+
+    let eng = force_reset_engine(url);
+    let mut ecus = activated_vm1();
+    let err = eng.commit_all(&mut ecus).await.unwrap_err();
+
+    assert!(
+        matches!(err, EngineError::FlashFailed { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "one initial POST + exactly one retry, then fail"
+    );
+    assert_ne!(
+        ecus[0].state,
+        EcuState::Committed,
+        "must not commit on an unverifiable verdict"
+    );
+}
+
 // =============================================================================
 // run_campaign — the shared multi-step loop (health-gate + per-step commit/abort)
 // =============================================================================

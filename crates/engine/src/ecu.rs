@@ -712,6 +712,91 @@ fn compact_record(r: &OperationExecution) -> String {
     )
 }
 
+/// The client replay nonce the device echoed in its verdict record, read from the
+/// RAW response JSON — [`OperationExecution`] has no `nonce` field, so component-mgr
+/// appends it as a flattened top-level `nonce` (its `sovd/routes.rs` `VerdictExecution`).
+/// `None` = an older device that ignores the POST body (no echo).
+fn echoed_nonce(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("nonce")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether a verdict response can be trusted — the nonce echo (replay guard) layered
+/// over [`validate_verdict_record`]. Three-way so [`node_verdict`] knows when a fresh
+/// connection could help ([`Retry`](VerdictOutcome::Retry)) versus a genuinely bad
+/// verdict ([`Fail`](VerdictOutcome::Fail)).
+#[derive(Debug, PartialEq, Eq)]
+enum VerdictOutcome {
+    /// Replay-proof and valid — the commit is real.
+    Valid,
+    /// Replay suspected — the device echoed a *different* nonce, or (a device that
+    /// does not echo) the record is stale. A transport-level replay is defeated by a
+    /// virgin connection, so retry once. Carries the reason for the log/error.
+    Retry(String),
+    /// A genuinely bad verdict (wrong status, missing component) — no retry.
+    Fail(String),
+}
+
+/// True iff the record's `completed_at` proves it predates the request window — the
+/// stale-echo replay symptom, the same freshness rule [`validate_verdict_record`]
+/// enforces, isolated as a boolean so the replay-retry decision needn't string-match
+/// an error. A missing/unparseable stamp is NOT "stale" (malformed → a hard fail
+/// there); a pre-2000 unsynced clock is a legitimately-fresh record (see
+/// [`CLOCK_SYNCED_FLOOR_SECS`]).
+fn verdict_is_stale(
+    record: &OperationExecution,
+    window_start: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(completed_at) = record.completed_at.as_deref() else {
+        return false;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(completed_at) else {
+        return false;
+    };
+    let completed = parsed.timestamp();
+    completed >= CLOCK_SYNCED_FLOOR_SECS && completed < window_start.timestamp() - VERDICT_SKEW_SECS
+}
+
+/// Decide whether a verdict response is trustworthy, layering the client nonce (the
+/// replay guard) over [`validate_verdict_record`] (status/freshness/content).
+/// `echoed` is the `nonce` the device echoed: `Some` on a new device (enforce it),
+/// `None` on an old one (fall back to the freshness window as the only replay guard,
+/// staying wire-compatible). Pure, so the replay/retry rules are unit-testable.
+fn check_verdict(
+    record: &OperationExecution,
+    echoed: Option<&str>,
+    sent_nonce: &str,
+    op_id: &str,
+    expected: &[String],
+    window_start: chrono::DateTime<chrono::Utc>,
+) -> VerdictOutcome {
+    match echoed {
+        // New device: a matching nonce proves this record answers THIS POST — the
+        // strong replay guard makes freshness implicit; status/content still apply.
+        Some(n) if n == sent_nonce => {
+            match validate_verdict_record(record, op_id, expected, window_start) {
+                Ok(()) => VerdictOutcome::Valid,
+                Err(e) => VerdictOutcome::Fail(e),
+            }
+        }
+        // Echoed but mismatched: a stale/replayed response — a virgin connection
+        // sidesteps a transport-level replay, so retry.
+        Some(_) => VerdictOutcome::Retry(
+            "verdict nonce missing/mismatched (stale or replayed response)".to_string(),
+        ),
+        // Old device (no echo): the freshness window is the only replay guard. A
+        // stale record is a replay symptom (retry); any other failure is genuine.
+        None => match validate_verdict_record(record, op_id, expected, window_start) {
+            Ok(()) => VerdictOutcome::Valid,
+            Err(e) if verdict_is_stale(record, window_start) => VerdictOutcome::Retry(e),
+            Err(e) => VerdictOutcome::Fail(e),
+        },
+    }
+}
+
 /// Issue a node-level verdict — the entity-root vendor operation that commits
 /// (or rolls back) **every component currently in trial on the node** in one
 /// call. This is how a node-reboot campaign step finalizes: the per-component
@@ -721,10 +806,14 @@ fn compact_record(r: &OperationExecution) -> String {
 /// `POST /vehicle/v1/operations/{op_id}/executions` (ISO 17978-3 §7.14, at the
 /// entity root).
 ///
-/// A 2xx is necessary but NOT sufficient: the §7.14 execution record in the body
-/// is parsed and [`validate_verdict_record`]-checked (completed + fresh + acted on
-/// the `expected` components). A failed fan-out returns 5xx with the per-component
-/// errors; an unparseable or stale/failed body is an error, never a silent log.
+/// A 2xx is necessary but NOT sufficient: the §7.14 execution record in the body is
+/// parsed and [`check_verdict`]-checked — the client `nonce` echo (replay guard) over
+/// [`validate_verdict_record`] (completed + fresh + acted on the `expected`
+/// components). Each POST carries a fresh uuid4 `nonce` on a fresh one-off client (a
+/// virgin connection), and a stale/nonce-mismatched response is retried ONCE on
+/// another fresh connection before failing — the field bug was a transport-level
+/// replay a virgin connection sidesteps. A failed fan-out returns 5xx with the
+/// per-component errors; an unparseable body is an error, never a silent log.
 async fn node_verdict(
     server_url: &str,
     op_id: &str,
@@ -737,8 +826,104 @@ async fn node_verdict(
         "{}/vehicle/v1/operations/{op_id}/executions",
         server_url.trim_end_matches('/')
     );
-    // Same CA-trust seam as the SovdClient/FlashClient builders: pin the given
-    // root when set, else fall back to skip-verify (`insecure`).
+    // Two attempts max: the field bug was a transport-level replay (a pooled
+    // connection answering with a PRIOR execution's record). A VIRGIN connection
+    // sidesteps it, so a stale/nonce-mismatched first response is retried ONCE.
+    const MAX_ATTEMPTS: usize = 2;
+    let mut warned_no_echo = false;
+    let mut last_retry_reason = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        // A fresh one-off client per attempt = a virgin connection pool: no
+        // pooled/desynced connection is reused (the retry's whole point).
+        let client = build_verdict_client(insecure, ca_cert_pem, op_id)?;
+        // Unique per POST — the device echoes it verbatim in the execution record,
+        // so a matching echo proves the record answers THIS request, not a replay.
+        let nonce = uuid::Uuid::new_v4().to_string();
+        // Capture the request window BEFORE the POST — the record must be stamped
+        // at/after this instant (minus skew), else it is a stale prior record.
+        let window_start = chrono::Utc::now();
+        let mut req = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::json!({ "nonce": nonce }).to_string());
+        if !token.is_empty() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
+            component: "node".to_string(),
+            message: format!("{op_id}: {e}"),
+        })?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(EngineError::FlashFailed {
+                component: "node".to_string(),
+                message: format!("{op_id}: HTTP {status}: {body}"),
+            });
+        }
+        let record: OperationExecution =
+            serde_json::from_str(&body).map_err(|e| EngineError::FlashFailed {
+                component: "node".to_string(),
+                message: format!(
+                    "{op_id}: verdict response is not an execution record ({e}): {body}"
+                ),
+            })?;
+        let echoed = echoed_nonce(&body);
+        // Old device that doesn't echo: warn ONCE (not per attempt) and lean on the
+        // freshness window. A new device's absent echo is indistinguishable, so
+        // enforcement gates on the field being PRESENT (see [`check_verdict`]).
+        if echoed.is_none() && !warned_no_echo {
+            warn!(
+                op = op_id,
+                "device does not echo verdict nonces — upgrade for replay-proof commits"
+            );
+            warned_no_echo = true;
+        }
+        match check_verdict(
+            &record,
+            echoed.as_deref(),
+            &nonce,
+            op_id,
+            expected,
+            window_start,
+        ) {
+            VerdictOutcome::Valid => {
+                info!(op = op_id, "node-level verdict applied and validated");
+                return Ok(());
+            }
+            VerdictOutcome::Fail(message) => {
+                return Err(EngineError::FlashFailed {
+                    component: "node".to_string(),
+                    message: format!("{op_id}: {message}"),
+                });
+            }
+            VerdictOutcome::Retry(reason) => {
+                last_retry_reason = reason;
+                if attempt < MAX_ATTEMPTS {
+                    warn!(
+                        op = op_id,
+                        reason = %last_retry_reason,
+                        "verdict looks stale/replayed — retrying once on a fresh connection"
+                    );
+                }
+            }
+        }
+    }
+    Err(EngineError::FlashFailed {
+        component: "node".to_string(),
+        message: format!("{op_id}: {last_retry_reason} (persisted after a fresh-connection retry)"),
+    })
+}
+
+/// Build a one-off reqwest client for a node-verdict POST — the same CA-trust seam
+/// as the SovdClient/FlashClient builders: pin the given root when set, else fall
+/// back to skip-verify (`insecure`). One fresh client per verdict attempt yields a
+/// virgin connection pool, the retry's defence against a pooled-connection replay.
+fn build_verdict_client(
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+    op_id: &str,
+) -> Result<reqwest::Client, EngineError> {
     let builder = reqwest::Client::builder();
     let builder = match ca_cert_pem {
         Some(pem) => {
@@ -751,43 +936,10 @@ async fn node_verdict(
         }
         None => builder.danger_accept_invalid_certs(insecure),
     };
-    let client = builder.build().map_err(|e| EngineError::FlashFailed {
+    builder.build().map_err(|e| EngineError::FlashFailed {
         component: "node".to_string(),
         message: format!("{op_id}: build client: {e}"),
-    })?;
-    let mut req = client.post(&url);
-    if !token.is_empty() {
-        req = req.bearer_auth(token);
-    }
-    // Capture the request window BEFORE the POST — the verdict's execution record
-    // must be stamped at/after this instant (minus skew), else it is a stale
-    // record from a prior commit (the bug: hours-old records passed on bare 2xx).
-    let window_start = chrono::Utc::now();
-    let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
-        component: "node".to_string(),
-        message: format!("{op_id}: {e}"),
-    })?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(EngineError::FlashFailed {
-            component: "node".to_string(),
-            message: format!("{op_id}: HTTP {status}: {body}"),
-        });
-    }
-    let record: OperationExecution =
-        serde_json::from_str(&body).map_err(|e| EngineError::FlashFailed {
-            component: "node".to_string(),
-            message: format!("{op_id}: verdict response is not an execution record ({e}): {body}"),
-        })?;
-    validate_verdict_record(&record, op_id, expected, window_start).map_err(|message| {
-        EngineError::FlashFailed {
-            component: "node".to_string(),
-            message: format!("{op_id}: {message}"),
-        }
-    })?;
-    info!(op = op_id, "node-level verdict applied and validated");
-    Ok(())
+    })
 }
 
 /// Commit every in-trial component on the node in one verdict. `expected` are the
@@ -1150,5 +1302,108 @@ mod tests {
         let past = (now - chrono::Duration::seconds(VERDICT_SKEW_SECS + 1)).to_rfc3339();
         let rec = record(OperationStatus::Completed, Some(past), None);
         assert!(validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).is_err());
+    }
+
+    // --- check_verdict / echoed_nonce: the client-nonce replay guard ------------
+
+    #[test]
+    fn nonce_echoed_and_matching_is_valid() {
+        let now = chrono::Utc::now();
+        let rec = record(
+            OperationStatus::Completed,
+            Some(now.to_rfc3339()),
+            Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
+        );
+        assert_eq!(
+            check_verdict(
+                &rec,
+                Some("n1"),
+                "n1",
+                "x-sumo-commit-trials",
+                &["vm1".to_string()],
+                now
+            ),
+            VerdictOutcome::Valid
+        );
+    }
+
+    #[test]
+    fn nonce_echoed_but_mismatched_retries() {
+        // A DIFFERENT echoed nonce is a stale/replayed response → retry, even though
+        // status + freshness + content would otherwise pass. This is the field bug.
+        let now = chrono::Utc::now();
+        let rec = record(
+            OperationStatus::Completed,
+            Some(now.to_rfc3339()),
+            Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
+        );
+        assert!(matches!(
+            check_verdict(
+                &rec,
+                Some("other"),
+                "n1",
+                "x-sumo-commit-trials",
+                &["vm1".to_string()],
+                now
+            ),
+            VerdictOutcome::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn nonce_absent_falls_back_to_freshness_only() {
+        // Old device (no echo): a fresh, valid record passes on the freshness path.
+        let now = chrono::Utc::now();
+        let rec = record(
+            OperationStatus::Completed,
+            Some(now.to_rfc3339()),
+            Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
+        );
+        assert_eq!(
+            check_verdict(
+                &rec,
+                None,
+                "n1",
+                "x-sumo-commit-trials",
+                &["vm1".to_string()],
+                now
+            ),
+            VerdictOutcome::Valid
+        );
+    }
+
+    #[test]
+    fn nonce_absent_and_stale_record_retries() {
+        // Old device + a stale record = the transport-replay symptom → retry.
+        let now = chrono::Utc::now();
+        let stale = (now - chrono::Duration::hours(3)).to_rfc3339();
+        let rec = record(OperationStatus::Completed, Some(stale), None);
+        assert!(matches!(
+            check_verdict(&rec, None, "n1", "x-sumo-commit-trials", &[], now),
+            VerdictOutcome::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn nonce_match_but_bad_status_is_a_hard_fail() {
+        // A matching nonce proves freshness, but a non-completed verdict is still a
+        // genuine failure — Fail, never Retry (a fresh connection can't fix it).
+        let now = chrono::Utc::now();
+        let rec = record(OperationStatus::Failed, Some(now.to_rfc3339()), None);
+        assert!(matches!(
+            check_verdict(&rec, Some("n1"), "n1", "x-sumo-commit-trials", &[], now),
+            VerdictOutcome::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn echoed_nonce_reads_the_flattened_top_level_field() {
+        // component-mgr flattens OperationExecution + appends a top-level `nonce`.
+        let body = r#"{"execution_id":"e","operation_id":"o","status":"completed","started_at":"t","nonce":"abc"}"#;
+        assert_eq!(echoed_nonce(body).as_deref(), Some("abc"));
+        // No nonce field (old device) → None.
+        let body_no =
+            r#"{"execution_id":"e","operation_id":"o","status":"completed","started_at":"t"}"#;
+        assert_eq!(echoed_nonce(body_no), None);
     }
 }
