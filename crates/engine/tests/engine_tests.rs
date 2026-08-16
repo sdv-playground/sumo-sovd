@@ -591,11 +591,17 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
             let hits = hits_route.clone();
             async move {
                 hits.fetch_add(1, Ordering::SeqCst);
+                // A fresh, complete §7.14 execution record — what a real device
+                // returns. The engine now validates completed status + freshness +
+                // that the expected component (vm1) landed in `committed`.
+                let now = chrono::Utc::now().to_rfc3339();
                 axum::Json(serde_json::json!({
                     "execution_id": "x-sumo-commit-trials",
                     "operation_id": "x-sumo-commit-trials",
                     "status": "completed",
-                    "started_at": "2026-01-01T00:00:00Z"
+                    "result": { "committed": ["vm1"], "skipped": [] },
+                    "started_at": now,
+                    "completed_at": now,
                 }))
             }
         }),

@@ -498,6 +498,20 @@ impl FlashEngine {
             // first component as the witness (node_boot_id is node-wide).
             let witness = comps.first().cloned().unwrap_or_default();
             let witness_token = self.token.token(&witness).await.unwrap_or_default();
+            // Capture BOTH baselines before the restart (mirror the banked path):
+            // the node per-boot nonce (the unmissable no-heartbeat witness) AND the
+            // witness component's heartbeat boot_id if it has one. With the
+            // fail-closed `wait_activated`, hard-coding `None` here would leave the
+            // reboot unwitnessed unless node_boot_id/down→up fired — so pass the
+            // heartbeat baseline too and require a REAL witness.
+            let hb_baseline = ecu::read_boot_id(
+                &self.server_url,
+                &witness,
+                &witness_token,
+                self.insecure,
+                self.ca_cert_pem.as_deref(),
+            )
+            .await;
             let node_baseline = ecu::read_node_boot_id(
                 &self.server_url,
                 &witness,
@@ -512,7 +526,7 @@ impl FlashEngine {
                         ecu::wait_activated(
                             &self.server_url,
                             &witness,
-                            None, // committed singleshot: no heartbeat/trial to compare
+                            hb_baseline,
                             node_baseline,
                             self.timeouts.ecu_reset_activation_secs,
                             &witness_token,
@@ -555,9 +569,20 @@ impl FlashEngine {
     /// node-reboot step finalizes. Used by `commit_all`'s node path and exposed
     /// for the manual `commit-trials` verb (no component list required).
     pub async fn commit_node_trials(&self) -> Result<(), EngineError> {
+        // Manual `commit-trials` verb: no component list, so the verdict's
+        // freshness + completed status are validated but not per-component content.
+        self.commit_node_trials_for(&[]).await
+    }
+
+    /// [`commit_node_trials`](Self::commit_node_trials) with the components the
+    /// caller expects the verdict to have committed — they must appear in the
+    /// record's `committed` set (else a verdict that acted on a stale/empty
+    /// in-trial set would pass). Empty ⇒ freshness/status only.
+    async fn commit_node_trials_for(&self, expected: &[String]) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
         ecu::commit_node_trials(
             &self.server_url,
+            expected,
             &token,
             self.insecure,
             self.ca_cert_pem.as_deref(),
@@ -568,9 +593,16 @@ impl FlashEngine {
     /// Issue the node-level **rollback** verdict directly — see
     /// [`commit_node_trials`](Self::commit_node_trials).
     pub async fn rollback_node_trials(&self) -> Result<(), EngineError> {
+        self.rollback_node_trials_for(&[]).await
+    }
+
+    /// [`rollback_node_trials`](Self::rollback_node_trials) with the components the
+    /// caller expects in the record's `rolled_back` set.
+    async fn rollback_node_trials_for(&self, expected: &[String]) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
         ecu::rollback_node_trials(
             &self.server_url,
+            expected,
             &token,
             self.insecure,
             self.ca_cert_pem.as_deref(),
@@ -603,7 +635,8 @@ impl FlashEngine {
 
         if self.force_ecu_reset {
             info!(ecus = to_commit.len(), "committing (node-level verdict)");
-            self.commit_node_trials().await?;
+            let expected: Vec<String> = to_commit.iter().map(|(c, _, _)| c.clone()).collect();
+            self.commit_node_trials_for(&expected).await?;
             for (comp, _, _) in &to_commit {
                 if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp) {
                     s.state = EcuState::Committed;
@@ -650,7 +683,8 @@ impl FlashEngine {
                 ecus = to_rollback.len(),
                 "rolling back (node-level verdict)"
             );
-            self.rollback_node_trials().await?;
+            let expected: Vec<String> = to_rollback.iter().map(|(c, _, _)| c.clone()).collect();
+            self.rollback_node_trials_for(&expected).await?;
             for (comp, _, _) in &to_rollback {
                 if let Some(s) = ecus.iter_mut().find(|s| &s.component_id == comp) {
                     s.state = EcuState::RolledBack;
@@ -766,14 +800,33 @@ impl FlashEngine {
                 component: component_id.to_string(),
                 message: format!("attach: {e}"),
             })?;
-        flash_client
+        let body = flash_client
             .spec_commit()
             .await
-            .map(|_| ())
             .map_err(|e| EngineError::FlashFailed {
                 component: component_id.to_string(),
                 message: format!("spec_commit: {e}"),
-            })
+            })?;
+        // spec_commit polls until the execute phase is *terminal* — but "terminal"
+        // includes `failed`, which the poll returns as Ok(body). A bare terminal
+        // is not success: require the verdict to have actually completed. (The
+        // §7.14 execution-record freshness/`result` fields validated on the node
+        // path are NOT part of the spec `UpdateStatusBody`; `status` is the
+        // strongest check this per-component spec wire exposes.)
+        if body.status != "completed" {
+            return Err(EngineError::FlashFailed {
+                component: component_id.to_string(),
+                message: format!(
+                    "spec_commit ended at {}/{}{}",
+                    body.phase,
+                    body.status,
+                    body.error
+                        .map(|e| format!(": {}", e.message))
+                        .unwrap_or_default()
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Rollback one component — pure SOVD (attach + spec_rollback).

@@ -7,11 +7,11 @@
 //! or security state. The driver unlocks the ECU (UDS) before staging.
 
 use sovd_client::flash::{FlashClient, FlashConfig, FlashError};
-use sovd_client::SovdClient;
+use sovd_client::{OperationExecution, OperationStatus, SovdClient, SovdClientError};
 use sovd_core::EntityStatus;
 use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::EngineError;
 use crate::types::{FlashJob, PayloadSource, UpdateType};
@@ -332,12 +332,29 @@ pub async fn read_boot_id(
     ca_cert_pem: Option<&[u8]>,
 ) -> Option<u32> {
     let client = status_client(server_url, token, insecure, ca_cert_pem).ok()?;
-    let body = client.read_status(component_id).await.ok()?;
-    body.extensions
-        .get("x-sumo-runtime")?
-        .get("boot_id")?
-        .as_u64()
-        .map(|v| v as u32)
+    // (ii) `/status` unreadable → no heartbeat baseline. Stay quiet: the
+    // connect-level down→up witness in `wait_activated` (which classifies its own
+    // read errors) covers the reboot signal; here it is simply "no baseline".
+    let body = match client.read_status(component_id).await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    // (i) `/status` readable but no heartbeat `boot_id`. Absence is *legitimate*
+    // for non-heartbeat components (e.g. host-os), so this is a debug trace, not a
+    // warning — the heartbeatless node path must not cry wolf on every baseline
+    // capture. (The node-wide witness is `node_boot_id`; see `read_node_boot_id`.)
+    match body
+        .extensions
+        .get("x-sumo-runtime")
+        .and_then(|r| r.get("boot_id"))
+        .and_then(|v| v.as_u64())
+    {
+        Some(v) => Some(v as u32),
+        None => {
+            debug!(component = %component_id, "x-sumo-runtime.boot_id absent — no heartbeat (or wire mismatch)");
+            None
+        }
+    }
 }
 
 /// Read the NODE per-boot nonce from `/status` `x-sumo-runtime.node_boot_id` — a
@@ -356,27 +373,134 @@ pub async fn read_node_boot_id(
     ca_cert_pem: Option<&[u8]>,
 ) -> Option<String> {
     let client = status_client(server_url, token, insecure, ca_cert_pem).ok()?;
-    let body = client.read_status(component_id).await.ok()?;
-    body.extensions
-        .get("x-sumo-runtime")?
-        .get("node_boot_id")?
-        .as_str()
-        .map(|s| s.to_string())
+    // (ii) `/status` unreadable → no node baseline; the down→up witness covers the
+    // reboot. Quiet (the connect-level signal is `wait_activated`'s job).
+    let body = match client.read_status(component_id).await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    // (i) `/status` readable but `node_boot_id` missing. Unlike heartbeat
+    // `boot_id`, the MM stamps `node_boot_id` on EVERY component's status — its
+    // absence means a wire-shape mismatch or an MM that predates the field, and
+    // the reboot witness silently loses its unmissable signal. Say so loudly
+    // (once per baseline capture, i.e. once per component per wait).
+    match body
+        .extensions
+        .get("x-sumo-runtime")
+        .and_then(|r| r.get("node_boot_id"))
+        .and_then(|v| v.as_str())
+    {
+        Some(s) => Some(s.to_string()),
+        None => {
+            warn!(
+                component = %component_id,
+                "x-sumo-runtime.node_boot_id absent — wire mismatch or MM predates it"
+            );
+            None
+        }
+    }
+}
+
+/// The reboot-witness verdict — factored **pure** so the fail-closed decision is
+/// unit-testable in isolation. See [`witness_decision`] / [`wait_activated`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Witness {
+    /// `node_boot_id` rotated (baseline `Some`, current `Some`, and they differ)
+    /// — the unmissable node-reboot signal, valid even for no-heartbeat components.
+    PassNodeBootId,
+    /// Heartbeat `boot_id` rotated (baseline `Some`, current `Some`, and they
+    /// differ) — a fresh guest lifetime.
+    PassHeartbeatBootId,
+    /// An OBSERVED connect-level down→up transition: the node was seen unreachable
+    /// earlier this wait, and is now `ready`.
+    PassDownUp,
+    /// No witness yet — keep polling until the deadline.
+    NotYet,
+}
+
+/// Pure, fail-closed reboot-witness decision. Passes ONLY on:
+/// - (a) a positive boot-id transition — `node_boot_id` OR heartbeat `boot_id`
+///   with BOTH baseline and current present and differing; OR
+/// - (b) an observed down→up transition — `saw_down` was set by an earlier
+///   connect-level poll THIS wait, and the node is now `ready`.
+///
+/// Every other input yields [`Witness::NotYet`] (times out): both baselines
+/// `None` with no down→up, unchanged boot ids, or a boot id that merely
+/// *appeared* (`None`→`Some`) — none of which prove a reboot. A pass ALWAYS
+/// requires `ready`; a rebooted-but-not-yet-ready node keeps waiting.
+fn witness_decision(
+    node_baseline: Option<&str>,
+    cur_node: Option<&str>,
+    hb_baseline: Option<u32>,
+    cur_hb: Option<u32>,
+    ready: bool,
+    saw_down: bool,
+) -> Witness {
+    if !ready {
+        return Witness::NotYet;
+    }
+    if let (Some(b), Some(c)) = (node_baseline, cur_node) {
+        if b != c {
+            return Witness::PassNodeBootId;
+        }
+    }
+    if let (Some(b), Some(c)) = (hb_baseline, cur_hb) {
+        if b != c {
+            return Witness::PassHeartbeatBootId;
+        }
+    }
+    if saw_down {
+        return Witness::PassDownUp;
+    }
+    Witness::NotYet
+}
+
+/// Classify a `/status` read failure: `true` iff the server did NOT answer at the
+/// connect level (connection refused / timeout / io) — the DOWN half of a down→up
+/// reboot witness. An HTTP status *response* (4xx/5xx → [`SovdClientError::ServerError`])
+/// or a body that will not parse ([`SovdClientError::ParseError`]) proves the
+/// server is UP, so it is NEVER a down observation (that conflation was the old
+/// vacuous-pass hole).
+fn is_connect_level(e: &SovdClientError) -> bool {
+    matches!(
+        e,
+        SovdClientError::HttpError(_)
+            | SovdClientError::ConnectionFailed(_)
+            | SovdClientError::IoError(_)
+            | SovdClientError::Timeout
+    )
+}
+
+/// Name what the witness never saw, for the timeout error (fix: "an error that
+/// names what was missing").
+fn witness_timeout_reason(had_boot_baseline: bool, saw_down: bool) -> String {
+    let boot = if had_boot_baseline {
+        "boot id(s) captured but never rotated"
+    } else {
+        "node_boot_id absent on the wire"
+    };
+    let downup = if saw_down {
+        "down observed but the node never came back ready"
+    } else {
+        "no down→up transition observed"
+    };
+    format!("no reboot witness: {boot} and {downup}")
 }
 
 /// Wait until a component is **rebooted and ready** — the converged verify the
-/// orchestrator uses for every reset kind. Polls `/status` (tolerating the
-/// server being unreachable mid-reboot) until `status == ready` AND a reboot is
-/// witnessed:
-/// - the heartbeat `boot_id` changed from `baseline` — a fresh guest lifetime,
-///   the primary witness for heartbeat components (works for a node reboot AND a
-///   per-VM relaunch; a stale heartbeat carries the OLD boot_id so it can't fool
-///   us); OR
-/// - the component reports no `boot_id` at all (non-heartbeat, e.g. host-os) and
-///   the SOVD server was seen to go down→up (the node restarted).
+/// orchestrator uses for every reset kind. Polls `/status` (tolerating the server
+/// being unreachable mid-reboot) and passes ONLY when a reboot is genuinely
+/// witnessed AND `status == ready` (see [`witness_decision`]):
+/// - a rotated `node_boot_id` (unmissable, works for no-heartbeat host-os) or a
+///   rotated heartbeat `boot_id` (a fresh guest lifetime); OR
+/// - an OBSERVED connect-level down→up transition (the node was seen unreachable,
+///   then answered ready) — the fallback for components with no boot-id witness.
 ///
-/// `baseline == None` (the component was offline pre-reset, e.g. factory
-/// provision) accepts the first heartbeat that appears.
+/// Fail-closed: if the deadline expires with none of the above, it errors naming
+/// the missing witness. A boot id that merely *appears* (`None`→`Some`), an HTTP
+/// error response, or a transient non-connect read error do **not** pass — only a
+/// real reboot does.
+#[allow(clippy::too_many_arguments)]
 pub async fn wait_activated(
     server_url: &str,
     component_id: &str,
@@ -389,6 +513,11 @@ pub async fn wait_activated(
 ) -> Result<(), EngineError> {
     let client = status_client(server_url, token, insecure, ca_cert_pem)?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    // The DOWN half of a down→up transition (1b): set once a poll fails at the
+    // CONNECT level (the node is unreachable, i.e. rebooting), so a later ready
+    // read completes the transition. Local to this wait — NOT a permanent latch —
+    // and set ONLY by a connect-level failure (an HTTP status response proves the
+    // server is up and must not count).
     let mut saw_down = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -400,37 +529,43 @@ pub async fn wait_activated(
                     .and_then(|r| r.get("boot_id"))
                     .and_then(|v| v.as_u64())
                     .map(|v| v as u32);
-                // NODE reboot witness (unmissable): a changed node_boot_id proves
-                // the node restarted, for ANY component — including no-heartbeat
-                // host-os. Preferred over the transient down→up window a fast
-                // reboot slips through. Only counts when we HAVE a baseline to
-                // compare (the MM stamps node_boot_id on every status).
                 let cur_node = runtime
                     .and_then(|r| r.get("node_boot_id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let node_rebooted = match (&node_baseline, &cur_node) {
-                    (Some(b), Some(c)) => c != b,
-                    _ => false, // no node witness available → rely on the others
-                };
-                let hb_rebooted = match (baseline, cur) {
-                    (Some(b), Some(c)) => c != b, // heartbeat: a new guest lifetime
-                    (None, Some(_)) => true,      // was offline: first lifetime is the boot
-                    (_, None) => saw_down,        // no heartbeat: node down→up witness
-                };
-                let rebooted = node_rebooted || hb_rebooted;
-                if ready && rebooted {
-                    return Ok(());
+                    .and_then(|v| v.as_str());
+                match witness_decision(
+                    node_baseline.as_deref(),
+                    cur_node,
+                    baseline,
+                    cur,
+                    ready,
+                    saw_down,
+                ) {
+                    Witness::NotYet => {}
+                    pass => {
+                        info!(component = %component_id, witness = ?pass, "reboot witnessed — component ready");
+                        return Ok(());
+                    }
                 }
             }
-            // Unreachable mid-reboot (the node went down) — record it as a
-            // fallback witness for non-heartbeat components and keep polling.
-            Err(_) => saw_down = true,
+            // Classify the read failure: only a CONNECT-level failure (node
+            // unreachable) is the DOWN half of the witness. An HTTP status
+            // response (4xx/5xx) or an unparseable body proves the server is UP,
+            // so it never counts as down — that was the vacuous-pass hole.
+            Err(e) => {
+                if is_connect_level(&e) {
+                    saw_down = true;
+                } else {
+                    debug!(component = %component_id, error = %e, "status poll: server answered, no witness yet");
+                }
+            }
         }
         if tokio::time::Instant::now() > deadline {
             return Err(EngineError::Timeout {
                 component: component_id.to_string(),
-                operation: "reboot+ready (/status boot_id)".into(),
+                operation: witness_timeout_reason(
+                    node_baseline.is_some() || baseline.is_some(),
+                    saw_down,
+                ),
             });
         }
     }
@@ -475,18 +610,125 @@ pub async fn restart_and_verify(
     .await
 }
 
+/// Skew allowance (seconds) for the verdict freshness check: the device stamps
+/// `completed_at` off ITS clock while the orchestrator captures the request
+/// window off its own, so a small difference is tolerated.
+const VERDICT_SKEW_SECS: i64 = 30;
+
+/// `completed_at` below this (2000-01-01T00:00:00Z, unix 946684800) means the
+/// device clock is unsynced — the RDB3 boots at the epoch until NTP catches up
+/// and can commit seconds after the post-reboot ready, so a legitimate fresh
+/// record may carry a 1970 stamp. This is distinct from a real stale echo (which
+/// carries a REAL, post-2020, hours-old time), so the freshness window is skipped
+/// for such a record; status + content checks still apply.
+const CLOCK_SYNCED_FLOOR_SECS: i64 = 946_684_800;
+
+/// Validate a §7.14 node-verdict execution record — the fresh-and-correct content
+/// check the commit path was missing (a bare 2xx let stale/failed records
+/// through). Requires: `status == completed`; a `completed_at` that parses as
+/// RFC 3339 and is no older than `window_start − 30 s`; and, when the record
+/// reports the acted-on set, every `expected` component present in it. `op_id`
+/// selects the result key (`committed` for commit-trials, `rolled_back` for
+/// rollback-trials). Returns `Err(compact-echo-of-record)` on any violation.
+///
+/// Pure (all inputs are values) so the freshness/content rules are unit-testable.
+fn validate_verdict_record(
+    record: &OperationExecution,
+    op_id: &str,
+    expected: &[String],
+    window_start: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    if record.status != OperationStatus::Completed {
+        return Err(format!(
+            "verdict not completed (status={}): {}",
+            record.status,
+            compact_record(record)
+        ));
+    }
+    let completed_at = record
+        .completed_at
+        .as_deref()
+        .ok_or_else(|| format!("verdict has no completed_at: {}", compact_record(record)))?;
+    let completed = chrono::DateTime::parse_from_rfc3339(completed_at)
+        .map_err(|e| {
+            format!(
+                "verdict completed_at unparseable ({e}): {}",
+                compact_record(record)
+            )
+        })?
+        .timestamp();
+    // A pre-2000 `completed_at` means the device clock is unsynced (RDB3 at the
+    // epoch pre-NTP): a legitimate fresh record, NOT a stale echo — skip the
+    // window comparison for it. A synced (>= 2000) clock is checked as before.
+    if completed < CLOCK_SYNCED_FLOOR_SECS {
+        warn!("device clock unsynced (completed_at={completed_at}) — freshness check skipped");
+    } else {
+        let floor = window_start.timestamp() - VERDICT_SKEW_SECS;
+        if completed < floor {
+            return Err(format!(
+                "verdict is stale: completed_at {completed_at} precedes the request window: {}",
+                compact_record(record)
+            ));
+        }
+    }
+    // Content check: when the record reports the acted-on set, the components we
+    // asked to commit must appear there — catches a verdict that acted on a stale
+    // or empty in-trial set (they would show up under `skipped`, not `committed`).
+    let acted_key = if op_id.contains("rollback") {
+        "rolled_back"
+    } else {
+        "committed"
+    };
+    if let Some(acted) = record
+        .result
+        .as_ref()
+        .and_then(|r| r.get(acted_key))
+        .and_then(|v| v.as_array())
+    {
+        let acted: Vec<&str> = acted.iter().filter_map(|v| v.as_str()).collect();
+        for comp in expected {
+            if !acted.contains(&comp.as_str()) {
+                return Err(format!(
+                    "expected component {comp:?} absent from {acted_key} {acted:?}: {}",
+                    compact_record(record)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One-line echo of an execution record for error messages (no pretty-print).
+fn compact_record(r: &OperationExecution) -> String {
+    format!(
+        "{{status={}, started_at={}, completed_at={:?}, result={}}}",
+        r.status,
+        r.started_at,
+        r.completed_at,
+        r.result
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".to_string())
+    )
+}
+
 /// Issue a node-level verdict — the entity-root vendor operation that commits
 /// (or rolls back) **every component currently in trial on the node** in one
 /// call. This is how a node-reboot campaign step finalizes: the per-component
 /// `/updates` sessions are gone after the reboot, so the orchestrator never
 /// re-attaches per component — it issues ONE verdict and the node fans it out
-/// from NV (the update *session* is the commit unit). The op is synchronous;
-/// a 2xx is success, a failed fan-out returns 5xx with the per-component
-/// errors in the body. Wire: `POST /vehicle/v1/operations/{op_id}/executions`
-/// (ISO 17978-3 §7.14, at the entity root).
+/// from NV (the update *session* is the commit unit). Wire:
+/// `POST /vehicle/v1/operations/{op_id}/executions` (ISO 17978-3 §7.14, at the
+/// entity root).
+///
+/// A 2xx is necessary but NOT sufficient: the §7.14 execution record in the body
+/// is parsed and [`validate_verdict_record`]-checked (completed + fresh + acted on
+/// the `expected` components). A failed fan-out returns 5xx with the per-component
+/// errors; an unparseable or stale/failed body is an error, never a silent log.
 async fn node_verdict(
     server_url: &str,
     op_id: &str,
+    expected: &[String],
     token: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
@@ -517,6 +759,10 @@ async fn node_verdict(
     if !token.is_empty() {
         req = req.bearer_auth(token);
     }
+    // Capture the request window BEFORE the POST — the verdict's execution record
+    // must be stamped at/after this instant (minus skew), else it is a stale
+    // record from a prior commit (the bug: hours-old records passed on bare 2xx).
+    let window_start = chrono::Utc::now();
     let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
         component: "node".to_string(),
         message: format!("{op_id}: {e}"),
@@ -529,13 +775,27 @@ async fn node_verdict(
             message: format!("{op_id}: HTTP {status}: {body}"),
         });
     }
-    info!(op = op_id, %body, "node-level verdict applied");
+    let record: OperationExecution =
+        serde_json::from_str(&body).map_err(|e| EngineError::FlashFailed {
+            component: "node".to_string(),
+            message: format!("{op_id}: verdict response is not an execution record ({e}): {body}"),
+        })?;
+    validate_verdict_record(&record, op_id, expected, window_start).map_err(|message| {
+        EngineError::FlashFailed {
+            component: "node".to_string(),
+            message: format!("{op_id}: {message}"),
+        }
+    })?;
+    info!(op = op_id, "node-level verdict applied and validated");
     Ok(())
 }
 
-/// Commit every in-trial component on the node in one verdict.
+/// Commit every in-trial component on the node in one verdict. `expected` are the
+/// component ids that must appear in the record's `committed` set (empty ⇒ the
+/// manual verb, freshness/status still enforced).
 pub async fn commit_node_trials(
     server_url: &str,
+    expected: &[String],
     token: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
@@ -543,6 +803,7 @@ pub async fn commit_node_trials(
     node_verdict(
         server_url,
         "x-sumo-commit-trials",
+        expected,
         token,
         insecure,
         ca_cert_pem,
@@ -550,9 +811,11 @@ pub async fn commit_node_trials(
     .await
 }
 
-/// Roll back every in-trial component on the node in one verdict.
+/// Roll back every in-trial component on the node in one verdict. `expected` are
+/// the component ids that must appear in the record's `rolled_back` set.
 pub async fn rollback_node_trials(
     server_url: &str,
+    expected: &[String],
     token: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
@@ -560,6 +823,7 @@ pub async fn rollback_node_trials(
     node_verdict(
         server_url,
         "x-sumo-rollback-trials",
+        expected,
         token,
         insecure,
         ca_cert_pem,
@@ -661,4 +925,206 @@ pub(crate) fn build_flash_client(
         component: component_id.to_string(),
         message: format!("flash client: {e}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- witness_decision: the pure, fail-closed reboot-witness verdict -------
+
+    #[test]
+    fn node_boot_id_transition_passes() {
+        assert_eq!(
+            witness_decision(Some("A"), Some("B"), None, None, true, false),
+            Witness::PassNodeBootId
+        );
+    }
+
+    #[test]
+    fn heartbeat_boot_id_transition_passes() {
+        assert_eq!(
+            witness_decision(None, None, Some(1), Some(2), true, false),
+            Witness::PassHeartbeatBootId
+        );
+    }
+
+    #[test]
+    fn both_baselines_none_and_no_transition_never_passes() {
+        // The vacuous-pass hole, closed: no boot-id baseline, server up, no
+        // down→up ⇒ keep waiting (times out) — never a pass.
+        assert_eq!(
+            witness_decision(None, None, None, None, true, false),
+            Witness::NotYet
+        );
+        // A boot id that merely *appears* (None→Some) is not a transition either.
+        assert_eq!(
+            witness_decision(None, Some("A"), None, Some(1), true, false),
+            Witness::NotYet
+        );
+    }
+
+    #[test]
+    fn unchanged_boot_ids_do_not_pass() {
+        assert_eq!(
+            witness_decision(Some("A"), Some("A"), Some(1), Some(1), true, false),
+            Witness::NotYet
+        );
+    }
+
+    #[test]
+    fn connect_fail_then_up_passes_but_only_when_ready() {
+        // down observed earlier this wait + now ready ⇒ down→up pass.
+        assert_eq!(
+            witness_decision(None, None, None, None, true, true),
+            Witness::PassDownUp
+        );
+        // down observed but not yet ready ⇒ keep waiting (no vacuous pass).
+        assert_eq!(
+            witness_decision(None, None, None, None, false, true),
+            Witness::NotYet
+        );
+    }
+
+    #[test]
+    fn not_ready_never_passes_even_with_a_boot_id_transition() {
+        assert_eq!(
+            witness_decision(Some("A"), Some("B"), Some(1), Some(2), false, true),
+            Witness::NotYet
+        );
+    }
+
+    // --- is_connect_level: the down-half classifier ---------------------------
+
+    #[test]
+    fn connect_level_errors_count_as_down() {
+        assert!(is_connect_level(&SovdClientError::ConnectionFailed(
+            "refused".into()
+        )));
+        assert!(is_connect_level(&SovdClientError::Timeout));
+        assert!(is_connect_level(&SovdClientError::IoError(
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused")
+        )));
+    }
+
+    #[test]
+    fn a_5xx_response_does_not_count_as_down() {
+        // A 5xx is a RESPONSE — the server is up, just erroring. NOT down.
+        assert!(!is_connect_level(&SovdClientError::ServerError {
+            status: 503,
+            message: "unavailable".into()
+        }));
+        // A body that will not parse is also a response ⇒ up, not down.
+        assert!(!is_connect_level(&SovdClientError::ParseError(
+            "bad json".into()
+        )));
+    }
+
+    // --- validate_verdict_record: freshness + content -------------------------
+
+    fn record(
+        status: OperationStatus,
+        completed_at: Option<String>,
+        result: Option<serde_json::Value>,
+    ) -> OperationExecution {
+        OperationExecution {
+            execution_id: "x-sumo-commit-trials".into(),
+            operation_id: "x-sumo-commit-trials".into(),
+            status,
+            result,
+            error: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            completed_at,
+        }
+    }
+
+    #[test]
+    fn fresh_completed_verdict_passes() {
+        let now = chrono::Utc::now();
+        let rec = record(
+            OperationStatus::Completed,
+            Some(now.to_rfc3339()),
+            Some(serde_json::json!({ "committed": ["vm1", "vm2"], "skipped": [] })),
+        );
+        assert!(
+            validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()], now)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn stale_completed_at_fails() {
+        let now = chrono::Utc::now();
+        let stale = (now - chrono::Duration::hours(3)).to_rfc3339();
+        let rec = record(
+            OperationStatus::Completed,
+            Some(stale),
+            Some(serde_json::json!({ "committed": ["vm1"] })),
+        );
+        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).unwrap_err();
+        assert!(err.contains("stale"), "got: {err}");
+    }
+
+    #[test]
+    fn wrong_status_fails() {
+        let now = chrono::Utc::now();
+        let rec = record(OperationStatus::Failed, Some(now.to_rfc3339()), None);
+        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).unwrap_err();
+        assert!(err.contains("not completed"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_component_in_committed_fails() {
+        let now = chrono::Utc::now();
+        let rec = record(
+            OperationStatus::Completed,
+            Some(now.to_rfc3339()),
+            // vm1 was skipped, not committed — a stale/empty in-trial set.
+            Some(serde_json::json!({ "committed": ["vm2"], "skipped": ["vm1"] })),
+        );
+        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()], now)
+            .unwrap_err();
+        assert!(
+            err.contains("vm1") && err.contains("committed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unsynced_epoch_clock_skips_freshness() {
+        // RDB3 boots at the epoch until NTP syncs — a legitimate fresh commit can
+        // carry a 1970 stamp. Pre-2000 ⇒ skip the window check; status + content
+        // still enforced, so this passes.
+        let now = chrono::Utc::now();
+        let rec = record(
+            OperationStatus::Completed,
+            Some("1970-01-01T00:00:05Z".to_string()),
+            Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
+        );
+        assert!(
+            validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()], now)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn missing_completed_at_fails() {
+        let now = chrono::Utc::now();
+        let rec = record(OperationStatus::Completed, None, None);
+        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).unwrap_err();
+        assert!(err.contains("completed_at"), "got: {err}");
+    }
+
+    #[test]
+    fn skew_boundary() {
+        let now = chrono::Utc::now();
+        // Exactly at the 30 s floor ⇒ passes (the check is `< floor`).
+        let at_floor = (now - chrono::Duration::seconds(VERDICT_SKEW_SECS)).to_rfc3339();
+        let rec = record(OperationStatus::Completed, Some(at_floor), None);
+        assert!(validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).is_ok());
+        // One second past the floor ⇒ fails.
+        let past = (now - chrono::Duration::seconds(VERDICT_SKEW_SECS + 1)).to_rfc3339();
+        let rec = record(OperationStatus::Completed, Some(past), None);
+        assert!(validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).is_err());
+    }
 }

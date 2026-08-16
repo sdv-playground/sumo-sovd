@@ -20,6 +20,9 @@ serde_json = "1"
 tracing = "0.1"
 thiserror = "1"
 async-trait = "0.1"
+# Parse the §7.14 node-verdict execution record's RFC 3339 `completed_at` and
+# stamp the request window, for the commit freshness check (ecu::node_verdict).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Stream a `PayloadSource::File` into the upload body without buffering it whole.
 # reqwest::Body is only constructed here and handed to sovd-client — the engine
 # never makes an HTTP call of its own.
