@@ -25,6 +25,11 @@ use sumo_sovd_flash_engine::{
     FlashPlan, HealthCheck, NoAuth, UpdateType,
 };
 
+// Off-board toolkit — builds + signs a real SUIT disable envelope so the
+// engine's own validate/classify path (not the opaque-firmware fallback) runs.
+use sumo_offboard::image_builder::ImageManifestBuilder;
+use sumo_offboard::keygen;
+
 // =============================================================================
 // Test backend — simulates the flash lifecycle in-memory.
 // =============================================================================
@@ -463,6 +468,64 @@ async fn engine_reboots_committed_singleshot_with_reset_kind() {
         ecus[0].state,
         EcuState::Committed,
         "singleshot stays committed — no trial/verdict"
+    );
+}
+
+#[tokio::test]
+async fn engine_disable_manifest_is_removal_and_commits_via_execute() {
+    // A signed SUIT *disable* manifest (no install/invoke, no payload) must
+    // classify as Removal — NOT the Policy no-op — and route through
+    // prepare/execute so the device enacts the deactivation, reaching Committed
+    // with no trial/verdict (singleshot-irreversible).
+    let signing_key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let trust_anchor = signing_key.public_key_bytes();
+    let disable_envelope = ImageManifestBuilder::new()
+        .component_id(vec!["rt".to_string()])
+        .sequence_number(1)
+        // Fixed iat (2023-11-14T22:13:20Z) — a constant, not now(), for reproducibility.
+        .signing_time(1_700_000_000)
+        .build_disable(&signing_key)
+        .unwrap();
+
+    let backend = Arc::new(TestBackend::new("rt"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), backend.clone());
+    let (url, _h) = serve(backends).await;
+
+    // The engine must trust the manifest's signing key — the dummy anchor the
+    // other tests use makes validation fail (opaque-firmware fallback), which
+    // would never reach `disable_target()`.
+    let eng = FlashEngine::new(
+        url,
+        Arc::new(NoAuth),
+        trust_anchor,
+        EngineTimeouts::default(),
+        false,
+        None,
+    );
+
+    let ecus = eng
+        .stage_all(&plan(&[("rt", disable_envelope.as_slice())]))
+        .await
+        .unwrap();
+    assert_eq!(ecus.len(), 1);
+    assert_eq!(
+        ecus[0].update_type,
+        UpdateType::Removal,
+        "a disable manifest must classify as Removal, not Policy"
+    );
+    assert_eq!(
+        ecus[0].state,
+        EcuState::Committed,
+        "a singleshot Removal auto-commits — irreversible, no trial/verdict"
+    );
+    // The Policy no-op path never calls prepare/execute, so the backend's flash
+    // lifecycle would stay at its initial `Complete`. Removal drives it forward.
+    assert_ne!(
+        *backend.flash_state.read(),
+        FlashState::Complete,
+        "Removal must route through prepare/execute (device enacted the disable), \
+         not the Policy no-op"
     );
 }
 

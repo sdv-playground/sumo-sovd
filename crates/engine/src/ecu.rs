@@ -81,6 +81,11 @@ fn classify_manifest(
 
     let update_type = if is_container_image_manifest(&manifest) {
         UpdateType::Application
+    } else if manifest.disable_target().is_some() {
+        // A signed SUIT *disable* manifest carries no install/invoke and no
+        // payload — without this it would fall through to Policy (a no-op) and
+        // the device would never enact the deactivation.
+        UpdateType::Removal
     } else if manifest.has_install() || manifest.has_invoke() {
         UpdateType::Firmware
     } else {
@@ -211,7 +216,7 @@ pub async fn flash_ecu_to_staging(
     }
 
     match update_type {
-        UpdateType::Firmware | UpdateType::Application => {
+        UpdateType::Firmware | UpdateType::Application | UpdateType::Removal => {
             // §7.18.5 prepare: server runs verify_part + waits for staging.
             info!(component = %comp, "running PUT /prepare");
             let prepared = flash_client
@@ -238,7 +243,8 @@ pub async fn flash_ecu_to_staging(
 
             // §7.18.6 execute. Firmware opts into orchestrated mode (banked
             // pauses at awaiting-verdict; singleshot ignores the flag and
-            // auto-completes). Application updates have no trial phase.
+            // auto-completes). Application and Removal have no trial phase —
+            // Removal (disable) is irreversible, so it never orchestrates.
             let want_orchestrated = matches!(update_type, UpdateType::Firmware);
             info!(component = %comp, orchestrated = want_orchestrated, "running PUT /execute");
             let executed = flash_client.execute(want_orchestrated).await.map_err(|e| {

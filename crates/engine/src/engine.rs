@@ -160,10 +160,15 @@ impl FlashEngine {
                     statuses[i].update_id = Some(result.update_id.clone());
                     // Banked components paused at awaiting-verdict enter the
                     // Staged → reset → commit pipeline; everything else (auto-
-                    // completed singleshot, application, policy) is done.
+                    // completed singleshot, application, policy, removal) is done.
                     statuses[i].state = match (result.update_type, result.awaiting_verdict) {
                         (UpdateType::Firmware, true) => EcuState::Staged,
                         (UpdateType::Firmware, false) => EcuState::Committed,
+                        // Disable/removal is singleshot-irreversible: it auto-
+                        // commits like singleshot firmware (never orchestrates, so
+                        // awaiting_verdict is always false), then reset_all reboots
+                        // it if it declares a reset_kind.
+                        (UpdateType::Removal, _) => EcuState::Committed,
                         (UpdateType::Application, _) | (UpdateType::Policy, _) => {
                             EcuState::Committed
                         }

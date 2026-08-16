@@ -128,6 +128,10 @@ pub enum UpdateType {
     Application,
     /// Policy-only (CRL, config) — applied immediately, no trial.
     Policy,
+    /// Removal — a signed SUIT *disable* manifest that deactivates a target
+    /// component. Singleshot-irreversible: routes through prepare/execute (the
+    /// device enacts the deactivation) and commits immediately, no trial/rollback.
+    Removal,
 }
 
 /// State of one component within a flash run.
