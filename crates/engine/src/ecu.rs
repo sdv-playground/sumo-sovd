@@ -994,6 +994,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn post_202_connect_fail_then_node_rotation_passes() {
+        // The field sequence: a first post-202 poll fails at the connect level
+        // (server mid-respawn) ⇒ saw_down; a later poll answers ready with a
+        // rotated node_boot_id ⇒ PassNodeBootId (the stronger witness wins over
+        // the down→up fallback). The loop continues across the down-window.
+        assert_eq!(
+            witness_decision(Some("old"), Some("new"), None, None, true, true),
+            Witness::PassNodeBootId
+        );
+    }
+
+    #[test]
+    fn witness_timeout_reason_names_the_missing_witness() {
+        // Repeated connect-fail-until-deadline ends the wait with a NAMED reason,
+        // never a propagated read error.
+        let no_baseline = witness_timeout_reason(false, false);
+        assert!(no_baseline.contains("node_boot_id absent on the wire"));
+        assert!(no_baseline.contains("no down→up transition observed"));
+        let down_but_not_ready = witness_timeout_reason(true, true);
+        assert!(down_but_not_ready.contains("never rotated"));
+        assert!(down_but_not_ready.contains("never came back ready"));
+    }
+
     // --- is_connect_level: the down-half classifier ---------------------------
 
     #[test]

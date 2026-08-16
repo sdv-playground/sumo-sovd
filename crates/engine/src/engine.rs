@@ -419,8 +419,16 @@ impl FlashEngine {
             let mut set = tokio::task::JoinSet::new();
             for (comp_id, _update_id) in comps {
                 let url = self.server_url.clone();
-                let token = self.token.token(&comp_id).await?;
                 let secs = self.timeouts.ecu_reset_activation_secs;
+                // Post-202 token: the device is mid-respawn, so a *minting*
+                // TokenSource (which reads the device boot_id to bind the token to
+                // the current boot) can transiently fail at the connect level. That
+                // is the reboot's down-window, NOT a fatal error — retry to a fresh
+                // post-reboot token within the activation budget instead of aborting
+                // the flash. (Field bug: this read PROPAGATED and killed the
+                // campaign. The pre-restart baseline token can't be reused — it is
+                // boot-bound and invalid once the boot moves.)
+                let token = self.token_through_reboot(&comp_id, secs).await?;
                 let baseline = baselines.get(&comp_id).copied().flatten();
                 let node_baseline = node_baselines.get(&comp_id).cloned().flatten();
                 let insecure = self.insecure;
@@ -926,6 +934,42 @@ impl FlashEngine {
         }
     }
 
+    /// Acquire `component_id`'s token, tolerating the device being transiently
+    /// unreachable — used ONLY on the witness path AFTER a restart 202. A minting
+    /// [`TokenSource`](crate::TokenSource) reads the device boot_id to bind the
+    /// token to the current boot; mid-respawn that read fails, which is the
+    /// reboot's down-window, NOT a fatal campaign error (the field abort this
+    /// guards). The token error is opaque, so ANY failure is retried within
+    /// `budget_secs` — by reset time staging has already minted tokens
+    /// successfully, so a failure here is the reboot window, not a config error.
+    /// Returns a FRESH post-reboot token once the node answers; only the deadline
+    /// surfaces the failure. Tokens minted BEFORE the restart stay fatal-on-error
+    /// (the device must be up to stage) and are never reused here — they are
+    /// boot-bound and rejected once the boot moves.
+    async fn token_through_reboot(
+        &self,
+        component_id: &str,
+        budget_secs: u64,
+    ) -> Result<String, EngineError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(budget_secs);
+        loop {
+            match self.token.token(component_id).await {
+                Ok(token) => return Ok(token),
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    warn!(
+                        component = %component_id,
+                        error = %e,
+                        "token unavailable (device likely mid-reboot) — retrying within the activation budget"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
     /// Build a base-URL `SovdClient` for `key` (a component or gateway id),
     /// bearing that key's token when non-empty. Used for entity-root restart
     /// and the update-mode guard.
@@ -976,5 +1020,82 @@ async fn collect_results(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn engine_with(token: Arc<dyn TokenSource>) -> FlashEngine {
+        FlashEngine::new(
+            "http://127.0.0.1:0",
+            token,
+            Vec::new(),
+            EngineTimeouts::default(),
+            false,
+            None,
+        )
+    }
+
+    /// A minting TokenSource that fails its first `fail_n` calls (the device
+    /// unreachable mid-respawn — the field error was a boot-id GET that could not
+    /// connect), then mints a token once the node answers.
+    struct FlakyToken {
+        calls: AtomicU32,
+        fail_n: u32,
+    }
+    #[async_trait::async_trait]
+    impl TokenSource for FlakyToken {
+        async fn token(&self, _component_id: &str) -> Result<String, EngineError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_n {
+                Err(EngineError::Internal(
+                    "read boot id from https://dev/vehicle/v1/status/x-sumo-boot-id: \
+                     error sending request"
+                        .into(),
+                ))
+            } else {
+                Ok("fresh-post-reboot-token".into())
+            }
+        }
+    }
+
+    struct AlwaysFail;
+    #[async_trait::async_trait]
+    impl TokenSource for AlwaysFail {
+        async fn token(&self, _component_id: &str) -> Result<String, EngineError> {
+            Err(EngineError::Internal(
+                "read boot id: error sending request".into(),
+            ))
+        }
+    }
+
+    // A post-202 token read that fails while the device is mid-reboot must NOT
+    // abort the flash — retry through the down-window and return the FRESH token
+    // once the node answers.
+    #[tokio::test(start_paused = true)]
+    async fn token_through_reboot_recovers_after_transient_failure() {
+        let src = Arc::new(FlakyToken {
+            calls: AtomicU32::new(0),
+            fail_n: 3,
+        });
+        let eng = engine_with(src.clone());
+        let token = eng.token_through_reboot("vm1", 300).await.unwrap();
+        assert_eq!(token, "fresh-post-reboot-token");
+        assert!(
+            src.calls.load(Ordering::SeqCst) >= 4,
+            "should have retried through the down-window"
+        );
+    }
+
+    // A device that never comes back ends the wait at the DEADLINE with the token
+    // error — bounded, never a hang and never an immediate abort.
+    #[tokio::test(start_paused = true)]
+    async fn token_through_reboot_errors_at_deadline_not_immediately() {
+        let eng = engine_with(Arc::new(AlwaysFail));
+        let err = eng.token_through_reboot("vm1", 10).await.unwrap_err();
+        assert!(matches!(err, EngineError::Internal(_)), "got: {err:?}");
     }
 }

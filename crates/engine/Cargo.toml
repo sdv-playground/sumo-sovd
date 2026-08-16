@@ -35,3 +35,6 @@ sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 axum = "0.8"
 parking_lot = "0.12"
+# `test-util` gives `#[tokio::test(start_paused = true)]` a mock clock, so the
+# token-through-reboot retry tests run instantly instead of sleeping real time.
+tokio = { version = "1", features = ["test-util"] }
