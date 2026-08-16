@@ -577,15 +577,18 @@ impl FlashEngine {
     /// node-reboot step finalizes. Used by `commit_all`'s node path and exposed
     /// for the manual `commit-trials` verb (no component list required).
     pub async fn commit_node_trials(&self) -> Result<(), EngineError> {
-        // Manual `commit-trials` verb: no component list, so the verdict's
-        // freshness + completed status are validated but not per-component content.
+        // Manual `commit-trials` verb: no component list, so the verdict is correlated
+        // (nonce / unique execution id) and its completed status enforced, but no
+        // per-component content is checked. An old constant-id device that cannot be
+        // correlated (and has no `expected` set to content-match) is refused.
         self.commit_node_trials_for(&[]).await
     }
 
     /// [`commit_node_trials`](Self::commit_node_trials) with the components the
     /// caller expects the verdict to have committed — they must appear in the
     /// record's `committed` set (else a verdict that acted on a stale/empty
-    /// in-trial set would pass). Empty ⇒ freshness/status only.
+    /// in-trial set would pass). Empty ⇒ correlation + completed status only, and an
+    /// uncorrelated old-device response has nothing to exact-match, so it is refused.
     async fn commit_node_trials_for(&self, expected: &[String]) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
         ecu::commit_node_trials(
@@ -818,7 +821,7 @@ impl FlashEngine {
         // spec_commit polls until the execute phase is *terminal* — but "terminal"
         // includes `failed`, which the poll returns as Ok(body). A bare terminal
         // is not success: require the verdict to have actually completed. (The
-        // §7.14 execution-record freshness/`result` fields validated on the node
+        // §7.14 execution-record correlation + `result` fields validated on the node
         // path are NOT part of the spec `UpdateStatusBody`; `status` is the
         // strongest check this per-component spec wire exposes.)
         if body.status != "completed" {

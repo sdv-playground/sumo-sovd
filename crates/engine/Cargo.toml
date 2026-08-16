@@ -20,9 +20,6 @@ serde_json = "1"
 tracing = "0.1"
 thiserror = "1"
 async-trait = "0.1"
-# Parse the §7.14 node-verdict execution record's RFC 3339 `completed_at` and
-# stamp the request window, for the commit freshness check (ecu::node_verdict).
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Stream a `PayloadSource::File` into the upload body without buffering it whole.
 # reqwest::Body is only constructed here and handed to sovd-client — the engine
 # never makes an HTTP call of its own.
@@ -38,6 +35,9 @@ sumo-offboard = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "
 sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
 axum = "0.8"
 parking_lot = "0.12"
+# The integration-test node-verdict mocks stamp a display `completed_at` (RFC 3339)
+# on the execution records they return — the engine itself no longer compares clocks.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # `test-util` gives `#[tokio::test(start_paused = true)]` a mock clock, so the
 # token-through-reboot retry tests run instantly instead of sleeping real time.
 tokio = { version = "1", features = ["test-util"] }

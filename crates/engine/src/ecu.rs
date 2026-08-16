@@ -610,33 +610,41 @@ pub async fn restart_and_verify(
     .await
 }
 
-/// Skew allowance (seconds) for the verdict freshness check: the device stamps
-/// `completed_at` off ITS clock while the orchestrator captures the request
-/// window off its own, so a small difference is tolerated.
-const VERDICT_SKEW_SECS: i64 = 30;
+/// The components a verdict record reports it acted on — the `committed` set for a
+/// commit, `rolled_back` for a rollback (`op_id` selects the key). `None` when the
+/// record does not report the set at all.
+fn acted_components(record: &OperationExecution, op_id: &str) -> Option<Vec<String>> {
+    let key = if op_id.contains("rollback") {
+        "rolled_back"
+    } else {
+        "committed"
+    };
+    record.result.as_ref()?.get(key)?.as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    })
+}
 
-/// `completed_at` below this (2000-01-01T00:00:00Z, unix 946684800) means the
-/// device clock is unsynced — the RDB3 boots at the epoch until NTP catches up
-/// and can commit seconds after the post-reboot ready, so a legitimate fresh
-/// record may carry a 1970 stamp. This is distinct from a real stale echo (which
-/// carries a REAL, post-2020, hours-old time), so the freshness window is skipped
-/// for such a record; status + content checks still apply.
-const CLOCK_SYNCED_FLOOR_SECS: i64 = 946_684_800;
-
-/// Validate a §7.14 node-verdict execution record — the fresh-and-correct content
-/// check the commit path was missing (a bare 2xx let stale/failed records
-/// through). Requires: `status == completed`; a `completed_at` that parses as
-/// RFC 3339 and is no older than `window_start − 30 s`; and, when the record
-/// reports the acted-on set, every `expected` component present in it. `op_id`
-/// selects the result key (`committed` for commit-trials, `rolled_back` for
-/// rollback-trials). Returns `Err(compact-echo-of-record)` on any violation.
+/// Validate a §7.14 node-verdict execution record's CONTENT — clock-free. Requires
+/// `status == completed` and, when the record reports the acted-on set, that every
+/// `expected` component appears in it (catches a verdict that acted on a stale/empty
+/// in-trial set — those show up under `skipped`, not `committed`). `op_id` selects the
+/// result key.
 ///
-/// Pure (all inputs are values) so the freshness/content rules are unit-testable.
+/// Freshness/replay is deliberately NOT judged here: device clocks are not comparable
+/// across boots or machines (every boot starts at a floor and ticks, so stamps from
+/// different boots overlap and are unordered; a fully-synced device can even lag the
+/// orchestrator), so ANY wall-clock comparison false-fails an honest commit — a field
+/// occurrence. Tying a record to our request is [`check_verdict`]'s job, by response
+/// CORRELATION (nonce echo / unique execution id), never by time. Returns
+/// `Err(compact-echo-of-record)` on a content violation.
+///
+/// Pure (all inputs are values) so the content rules are unit-testable.
 fn validate_verdict_record(
     record: &OperationExecution,
     op_id: &str,
     expected: &[String],
-    window_start: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     if record.status != OperationStatus::Completed {
         return Err(format!(
@@ -645,49 +653,17 @@ fn validate_verdict_record(
             compact_record(record)
         ));
     }
-    let completed_at = record
-        .completed_at
-        .as_deref()
-        .ok_or_else(|| format!("verdict has no completed_at: {}", compact_record(record)))?;
-    let completed = chrono::DateTime::parse_from_rfc3339(completed_at)
-        .map_err(|e| {
-            format!(
-                "verdict completed_at unparseable ({e}): {}",
-                compact_record(record)
-            )
-        })?
-        .timestamp();
-    // A pre-2000 `completed_at` means the device clock is unsynced (RDB3 at the
-    // epoch pre-NTP): a legitimate fresh record, NOT a stale echo — skip the
-    // window comparison for it. A synced (>= 2000) clock is checked as before.
-    if completed < CLOCK_SYNCED_FLOOR_SECS {
-        warn!("device clock unsynced (completed_at={completed_at}) — freshness check skipped");
-    } else {
-        let floor = window_start.timestamp() - VERDICT_SKEW_SECS;
-        if completed < floor {
-            return Err(format!(
-                "verdict is stale: completed_at {completed_at} precedes the request window: {}",
-                compact_record(record)
-            ));
-        }
-    }
-    // Content check: when the record reports the acted-on set, the components we
-    // asked to commit must appear there — catches a verdict that acted on a stale
-    // or empty in-trial set (they would show up under `skipped`, not `committed`).
-    let acted_key = if op_id.contains("rollback") {
-        "rolled_back"
-    } else {
-        "committed"
-    };
-    if let Some(acted) = record
-        .result
-        .as_ref()
-        .and_then(|r| r.get(acted_key))
-        .and_then(|v| v.as_array())
-    {
-        let acted: Vec<&str> = acted.iter().filter_map(|v| v.as_str()).collect();
+    // Content check: when the record reports the acted-on set, the components we asked
+    // to commit must appear there — catches a verdict that acted on a stale or empty
+    // in-trial set (they would show up under `skipped`, not `committed`).
+    if let Some(acted) = acted_components(record, op_id) {
+        let acted_key = if op_id.contains("rollback") {
+            "rolled_back"
+        } else {
+            "committed"
+        };
         for comp in expected {
-            if !acted.contains(&comp.as_str()) {
+            if !acted.contains(comp) {
                 return Err(format!(
                     "expected component {comp:?} absent from {acted_key} {acted:?}: {}",
                     compact_record(record)
@@ -724,76 +700,83 @@ fn echoed_nonce(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Whether a verdict response can be trusted — the nonce echo (replay guard) layered
-/// over [`validate_verdict_record`]. Three-way so [`node_verdict`] knows when a fresh
-/// connection could help ([`Retry`](VerdictOutcome::Retry)) versus a genuinely bad
-/// verdict ([`Fail`](VerdictOutcome::Fail)).
+/// Whether a verdict response is trustworthy — CORRELATION (does this record answer
+/// OUR request?) layered over the content check. Three-way so [`node_verdict`] knows
+/// when a virgin-connection retry could help ([`Retry`](VerdictOutcome::Retry)) versus
+/// a terminal outcome ([`Fail`](VerdictOutcome::Fail)).
 #[derive(Debug, PartialEq, Eq)]
 enum VerdictOutcome {
-    /// Replay-proof and valid — the commit is real.
-    Valid,
-    /// Replay suspected — the device echoed a *different* nonce, or (a device that
-    /// does not echo) the record is stale. A transport-level replay is defeated by a
-    /// virgin connection, so retry once. Carries the reason for the log/error.
+    /// Correlated to OUR request and content-valid — the commit is real.
+    /// `adopted_uncorrelated` marks the old-device fallback (no nonce echo, non-unique
+    /// execution id) accepted ONLY on an exact content match; the caller warns.
+    Valid { adopted_uncorrelated: bool },
+    /// The device echoed a *different* nonce than we sent — a stale/replayed response.
+    /// A virgin connection sidesteps a transport-level replay, so retry once.
     Retry(String),
-    /// A genuinely bad verdict (wrong status, missing component) — no retry.
+    /// Terminal refusal: a genuinely bad verdict (wrong status / missing component), or
+    /// an UNCORRELATED response we cannot tie to our request and cannot adopt.
     Fail(String),
 }
 
-/// True iff the record's `completed_at` proves it predates the request window — the
-/// stale-echo replay symptom, the same freshness rule [`validate_verdict_record`]
-/// enforces, isolated as a boolean so the replay-retry decision needn't string-match
-/// an error. A missing/unparseable stamp is NOT "stale" (malformed → a hard fail
-/// there); a pre-2000 unsynced clock is a legitimately-fresh record (see
-/// [`CLOCK_SYNCED_FLOOR_SECS`]).
-fn verdict_is_stale(
-    record: &OperationExecution,
-    window_start: chrono::DateTime<chrono::Utc>,
-) -> bool {
-    let Some(completed_at) = record.completed_at.as_deref() else {
-        return false;
-    };
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(completed_at) else {
-        return false;
-    };
-    let completed = parsed.timestamp();
-    completed >= CLOCK_SYNCED_FLOOR_SECS && completed < window_start.timestamp() - VERDICT_SKEW_SECS
-}
-
-/// Decide whether a verdict response is trustworthy, layering the client nonce (the
-/// replay guard) over [`validate_verdict_record`] (status/freshness/content).
-/// `echoed` is the `nonce` the device echoed: `Some` on a new device (enforce it),
-/// `None` on an old one (fall back to the freshness window as the only replay guard,
-/// staying wire-compatible). Pure, so the replay/retry rules are unit-testable.
+/// Decide whether a verdict response answers OUR request — clock-free CORRELATION,
+/// then the content check. Device clocks are not comparable across boots/machines, so
+/// NO wall-clock comparison is used (that false-failed an honest commit in the field).
+///
+/// Accept, in order: (1) the device echoed back the `nonce` we sent; (2) a UNIQUE
+/// per-POST `execution_id` (it differs from the constant `operation_id`) — the device
+/// minted a fresh id for this execution, read as the direct response of our
+/// virgin-connection POST. A *mismatched* nonce echo is a replay → retry. Otherwise the
+/// response is UNCORRELATED (an old constant-id device that does not echo): with no
+/// clock to fall back on, adopt ONLY when the acted-on set EXACTLY equals `expected`
+/// (and the caller says so loudly), else refuse and name the missing discriminator.
+/// Pure, so the correlation/content rules are unit-testable.
 fn check_verdict(
     record: &OperationExecution,
     echoed: Option<&str>,
     sent_nonce: &str,
     op_id: &str,
     expected: &[String],
-    window_start: chrono::DateTime<chrono::Utc>,
 ) -> VerdictOutcome {
-    match echoed {
-        // New device: a matching nonce proves this record answers THIS POST — the
-        // strong replay guard makes freshness implicit; status/content still apply.
-        Some(n) if n == sent_nonce => {
-            match validate_verdict_record(record, op_id, expected, window_start) {
-                Ok(()) => VerdictOutcome::Valid,
-                Err(e) => VerdictOutcome::Fail(e),
-            }
-        }
-        // Echoed but mismatched: a stale/replayed response — a virgin connection
-        // sidesteps a transport-level replay, so retry.
-        Some(_) => VerdictOutcome::Retry(
-            "verdict nonce missing/mismatched (stale or replayed response)".to_string(),
-        ),
-        // Old device (no echo): the freshness window is the only replay guard. A
-        // stale record is a replay symptom (retry); any other failure is genuine.
-        None => match validate_verdict_record(record, op_id, expected, window_start) {
-            Ok(()) => VerdictOutcome::Valid,
-            Err(e) if verdict_is_stale(record, window_start) => VerdictOutcome::Retry(e),
+    // A mismatched nonce echo is the replay symptom — a virgin connection sidesteps the
+    // transport-level replay, so retry (never accept a differently-nonced record).
+    if matches!(echoed, Some(n) if n != sent_nonce) {
+        return VerdictOutcome::Retry(
+            "verdict nonce mismatched (stale or replayed response)".to_string(),
+        );
+    }
+    // Correlated iff (1) our nonce echoed back, or (2) a unique per-POST execution id
+    // (≠ the constant operation_id) — either ties this record to our request,
+    // clock-free (a fresh device mints a fresh id per POST; constant-id devices reuse
+    // operation_id). We read the direct response of a virgin-connection POST.
+    let nonce_correlated = echoed == Some(sent_nonce);
+    let execid_correlated = record.execution_id != record.operation_id;
+    if nonce_correlated || execid_correlated {
+        return match validate_verdict_record(record, op_id, expected) {
+            Ok(()) => VerdictOutcome::Valid {
+                adopted_uncorrelated: false,
+            },
             Err(e) => VerdictOutcome::Fail(e),
-        },
+        };
+    }
+    // Uncorrelated: an old constant-id device that does not echo the nonce. No clock to
+    // judge freshness. Adopt ONLY on an exact content match — the acted-on set equals
+    // the requested set — leaving the caller to warn; otherwise refuse, naming the
+    // missing discriminator.
+    let acted = acted_components(record, op_id).unwrap_or_default();
+    let exact_match = !expected.is_empty()
+        && acted.len() == expected.len()
+        && expected.iter().all(|e| acted.contains(e));
+    if record.status == OperationStatus::Completed && exact_match {
+        VerdictOutcome::Valid {
+            adopted_uncorrelated: true,
+        }
+    } else {
+        VerdictOutcome::Fail(format!(
+            "uncorrelated verdict — no nonce echo and a non-unique execution id \
+             (execution_id == operation_id), so this record cannot be tied to our \
+             request; not adopting (acted-on set is not an exact match): {}",
+            compact_record(record)
+        ))
     }
 }
 
@@ -807,13 +790,16 @@ fn check_verdict(
 /// entity root).
 ///
 /// A 2xx is necessary but NOT sufficient: the §7.14 execution record in the body is
-/// parsed and [`check_verdict`]-checked — the client `nonce` echo (replay guard) over
-/// [`validate_verdict_record`] (completed + fresh + acted on the `expected`
-/// components). Each POST carries a fresh uuid4 `nonce` on a fresh one-off client (a
-/// virgin connection), and a stale/nonce-mismatched response is retried ONCE on
-/// another fresh connection before failing — the field bug was a transport-level
-/// replay a virgin connection sidesteps. A failed fan-out returns 5xx with the
-/// per-component errors; an unparseable body is an error, never a silent log.
+/// parsed and [`check_verdict`]-checked — clock-free response CORRELATION (the device
+/// echoed OUR `nonce`, or minted a unique per-POST `execution_id`) plus the content
+/// check ([`validate_verdict_record`]: completed + acted on the `expected` components).
+/// Each POST carries a fresh uuid4 `nonce` on a fresh one-off client (a virgin
+/// connection), and a nonce-mismatched response is retried ONCE on another fresh
+/// connection before failing — the field bug was a transport-level replay a virgin
+/// connection sidesteps. An uncorrelated response from an old constant-id device is
+/// adopted only on an exact content match (with a warning), else refused. A failed
+/// fan-out returns 5xx with the per-component errors; an unparseable body is an error,
+/// never a silent log.
 async fn node_verdict(
     server_url: &str,
     op_id: &str,
@@ -830,7 +816,6 @@ async fn node_verdict(
     // connection answering with a PRIOR execution's record). A VIRGIN connection
     // sidesteps it, so a stale/nonce-mismatched first response is retried ONCE.
     const MAX_ATTEMPTS: usize = 2;
-    let mut warned_no_echo = false;
     let mut last_retry_reason = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         // A fresh one-off client per attempt = a virgin connection pool: no
@@ -839,9 +824,6 @@ async fn node_verdict(
         // Unique per POST — the device echoes it verbatim in the execution record,
         // so a matching echo proves the record answers THIS request, not a replay.
         let nonce = uuid::Uuid::new_v4().to_string();
-        // Capture the request window BEFORE the POST — the record must be stamped
-        // at/after this instant (minus skew), else it is a stale prior record.
-        let window_start = chrono::Utc::now();
         let mut req = client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -869,26 +851,20 @@ async fn node_verdict(
                 ),
             })?;
         let echoed = echoed_nonce(&body);
-        // Old device that doesn't echo: warn ONCE (not per attempt) and lean on the
-        // freshness window. A new device's absent echo is indistinguishable, so
-        // enforcement gates on the field being PRESENT (see [`check_verdict`]).
-        if echoed.is_none() && !warned_no_echo {
-            warn!(
-                op = op_id,
-                "device does not echo verdict nonces — upgrade for replay-proof commits"
-            );
-            warned_no_echo = true;
-        }
-        match check_verdict(
-            &record,
-            echoed.as_deref(),
-            &nonce,
-            op_id,
-            expected,
-            window_start,
-        ) {
-            VerdictOutcome::Valid => {
-                info!(op = op_id, "node-level verdict applied and validated");
+        match check_verdict(&record, echoed.as_deref(), &nonce, op_id, expected) {
+            VerdictOutcome::Valid {
+                adopted_uncorrelated,
+            } => {
+                if adopted_uncorrelated {
+                    warn!(
+                        op = op_id,
+                        "adopted an UNCORRELATED verdict on exact content match (device does not \
+                         echo nonces and reuses the execution id) — upgrade the device for \
+                         replay-proof commits"
+                    );
+                } else {
+                    info!(op = op_id, "node-level verdict correlated and applied");
+                }
                 return Ok(());
             }
             VerdictOutcome::Fail(message) => {
@@ -903,7 +879,7 @@ async fn node_verdict(
                     warn!(
                         op = op_id,
                         reason = %last_retry_reason,
-                        "verdict looks stale/replayed — retrying once on a fresh connection"
+                        "verdict nonce mismatched (likely replayed) — retrying once on a fresh connection"
                     );
                 }
             }
@@ -943,8 +919,8 @@ fn build_verdict_client(
 }
 
 /// Commit every in-trial component on the node in one verdict. `expected` are the
-/// component ids that must appear in the record's `committed` set (empty ⇒ the
-/// manual verb, freshness/status still enforced).
+/// component ids that must appear in the record's `committed` set (empty ⇒ the manual
+/// verb, correlation + completed status still enforced, no per-component content).
 pub async fn commit_node_trials(
     server_url: &str,
     expected: &[String],
@@ -1196,69 +1172,49 @@ mod tests {
         )));
     }
 
-    // --- validate_verdict_record: freshness + content -------------------------
+    // --- validate_verdict_record: CONTENT only (status + acted-on set), no clock ----
 
-    fn record(
-        status: OperationStatus,
-        completed_at: Option<String>,
-        result: Option<serde_json::Value>,
-    ) -> OperationExecution {
+    fn record(status: OperationStatus, result: Option<serde_json::Value>) -> OperationExecution {
         OperationExecution {
+            // execution_id == operation_id ⇒ a constant-id device (pre-3b436b3); the
+            // correlation tests set a distinct execution_id for the unique-id case.
             execution_id: "x-sumo-commit-trials".into(),
             operation_id: "x-sumo-commit-trials".into(),
             status,
             result,
             error: None,
             started_at: "2026-01-01T00:00:00Z".into(),
-            completed_at,
+            // Timestamps are display-only now — they never gate acceptance.
+            completed_at: Some("2026-01-01T00:00:00Z".into()),
         }
     }
 
     #[test]
-    fn fresh_completed_verdict_passes() {
-        let now = chrono::Utc::now();
+    fn completed_verdict_with_expected_committed_passes() {
         let rec = record(
             OperationStatus::Completed,
-            Some(now.to_rfc3339()),
             Some(serde_json::json!({ "committed": ["vm1", "vm2"], "skipped": [] })),
         );
         assert!(
-            validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()], now)
-                .is_ok()
+            validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()]).is_ok()
         );
-    }
-
-    #[test]
-    fn stale_completed_at_fails() {
-        let now = chrono::Utc::now();
-        let stale = (now - chrono::Duration::hours(3)).to_rfc3339();
-        let rec = record(
-            OperationStatus::Completed,
-            Some(stale),
-            Some(serde_json::json!({ "committed": ["vm1"] })),
-        );
-        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).unwrap_err();
-        assert!(err.contains("stale"), "got: {err}");
     }
 
     #[test]
     fn wrong_status_fails() {
-        let now = chrono::Utc::now();
-        let rec = record(OperationStatus::Failed, Some(now.to_rfc3339()), None);
-        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).unwrap_err();
+        let rec = record(OperationStatus::Failed, None);
+        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[]).unwrap_err();
         assert!(err.contains("not completed"), "got: {err}");
     }
 
     #[test]
     fn missing_component_in_committed_fails() {
-        let now = chrono::Utc::now();
+        // vm1 was skipped, not committed — a stale/empty in-trial set.
         let rec = record(
             OperationStatus::Completed,
-            Some(now.to_rfc3339()),
-            // vm1 was skipped, not committed — a stale/empty in-trial set.
             Some(serde_json::json!({ "committed": ["vm2"], "skipped": ["vm1"] })),
         );
-        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()], now)
+        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()])
             .unwrap_err();
         assert!(
             err.contains("vm1") && err.contains("committed"),
@@ -1266,52 +1222,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unsynced_epoch_clock_skips_freshness() {
-        // RDB3 boots at the epoch until NTP syncs — a legitimate fresh commit can
-        // carry a 1970 stamp. Pre-2000 ⇒ skip the window check; status + content
-        // still enforced, so this passes.
-        let now = chrono::Utc::now();
-        let rec = record(
+    // --- check_verdict: clock-free response correlation ----------------------------
+
+    /// A record with a UNIQUE per-POST execution id (≠ operation_id) — a 3b436b3+
+    /// device. `committed` carries the acted-on set.
+    fn unique_record(committed: &[&str]) -> OperationExecution {
+        let mut rec = record(
             OperationStatus::Completed,
-            Some("1970-01-01T00:00:05Z".to_string()),
-            Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
+            Some(serde_json::json!({ "committed": committed, "skipped": [] })),
         );
-        assert!(
-            validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()], now)
-                .is_ok()
-        );
+        rec.execution_id = "a3f1e9c2-unique-per-post".into();
+        rec
     }
-
-    #[test]
-    fn missing_completed_at_fails() {
-        let now = chrono::Utc::now();
-        let rec = record(OperationStatus::Completed, None, None);
-        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).unwrap_err();
-        assert!(err.contains("completed_at"), "got: {err}");
-    }
-
-    #[test]
-    fn skew_boundary() {
-        let now = chrono::Utc::now();
-        // Exactly at the 30 s floor ⇒ passes (the check is `< floor`).
-        let at_floor = (now - chrono::Duration::seconds(VERDICT_SKEW_SECS)).to_rfc3339();
-        let rec = record(OperationStatus::Completed, Some(at_floor), None);
-        assert!(validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).is_ok());
-        // One second past the floor ⇒ fails.
-        let past = (now - chrono::Duration::seconds(VERDICT_SKEW_SECS + 1)).to_rfc3339();
-        let rec = record(OperationStatus::Completed, Some(past), None);
-        assert!(validate_verdict_record(&rec, "x-sumo-commit-trials", &[], now).is_err());
-    }
-
-    // --- check_verdict / echoed_nonce: the client-nonce replay guard ------------
 
     #[test]
     fn nonce_echoed_and_matching_is_valid() {
-        let now = chrono::Utc::now();
         let rec = record(
             OperationStatus::Completed,
-            Some(now.to_rfc3339()),
             Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
         );
         assert_eq!(
@@ -1320,21 +1247,20 @@ mod tests {
                 Some("n1"),
                 "n1",
                 "x-sumo-commit-trials",
-                &["vm1".to_string()],
-                now
+                &["vm1".to_string()]
             ),
-            VerdictOutcome::Valid
+            VerdictOutcome::Valid {
+                adopted_uncorrelated: false
+            }
         );
     }
 
     #[test]
     fn nonce_echoed_but_mismatched_retries() {
-        // A DIFFERENT echoed nonce is a stale/replayed response → retry, even though
-        // status + freshness + content would otherwise pass. This is the field bug.
-        let now = chrono::Utc::now();
+        // A DIFFERENT echoed nonce is a replayed response → retry, even though status +
+        // content would otherwise pass. This is the transport-replay field bug.
         let rec = record(
             OperationStatus::Completed,
-            Some(now.to_rfc3339()),
             Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
         );
         assert!(matches!(
@@ -1343,21 +1269,38 @@ mod tests {
                 Some("other"),
                 "n1",
                 "x-sumo-commit-trials",
-                &["vm1".to_string()],
-                now
+                &["vm1".to_string()]
             ),
             VerdictOutcome::Retry(_)
         ));
     }
 
     #[test]
-    fn nonce_absent_falls_back_to_freshness_only() {
-        // Old device (no echo): a fresh, valid record passes on the freshness path.
-        let now = chrono::Utc::now();
+    fn unique_execution_id_correlates_without_a_nonce_echo() {
+        // No nonce echo, but the device minted a unique per-POST execution id → the
+        // record is our direct response (rule 2), accepted on content.
+        let rec = unique_record(&["vm1"]);
+        assert_eq!(
+            check_verdict(
+                &rec,
+                None,
+                "n1",
+                "x-sumo-commit-trials",
+                &["vm1".to_string()]
+            ),
+            VerdictOutcome::Valid {
+                adopted_uncorrelated: false
+            }
+        );
+    }
+
+    #[test]
+    fn uncorrelated_constant_id_is_adopted_only_on_exact_content_match() {
+        // Old constant-id device (execution_id == operation_id), no nonce echo → cannot
+        // be correlated. Adopt ONLY when the acted-on set EXACTLY equals the request.
         let rec = record(
             OperationStatus::Completed,
-            Some(now.to_rfc3339()),
-            Some(serde_json::json!({ "committed": ["vm1"], "skipped": [] })),
+            Some(serde_json::json!({ "committed": ["vm1", "vm2"], "skipped": [] })),
         );
         assert_eq!(
             check_verdict(
@@ -1365,33 +1308,61 @@ mod tests {
                 None,
                 "n1",
                 "x-sumo-commit-trials",
-                &["vm1".to_string()],
-                now
+                &["vm1".to_string(), "vm2".to_string()],
             ),
-            VerdictOutcome::Valid
+            VerdictOutcome::Valid {
+                adopted_uncorrelated: true
+            }
         );
     }
 
     #[test]
-    fn nonce_absent_and_stale_record_retries() {
-        // Old device + a stale record = the transport-replay symptom → retry.
-        let now = chrono::Utc::now();
-        let stale = (now - chrono::Duration::hours(3)).to_rfc3339();
-        let rec = record(OperationStatus::Completed, Some(stale), None);
-        assert!(matches!(
-            check_verdict(&rec, None, "n1", "x-sumo-commit-trials", &[], now),
-            VerdictOutcome::Retry(_)
-        ));
+    fn uncorrelated_constant_id_without_exact_match_is_refused() {
+        // Uncorrelated + the acted-on set is not an exact match ⇒ refuse, naming the gap.
+        let rec = record(
+            OperationStatus::Completed,
+            // committed a DIFFERENT set than requested.
+            Some(serde_json::json!({ "committed": ["vm2"], "skipped": ["vm1"] })),
+        );
+        match check_verdict(
+            &rec,
+            None,
+            "n1",
+            "x-sumo-commit-trials",
+            &["vm1".to_string()],
+        ) {
+            VerdictOutcome::Fail(msg) => assert!(msg.contains("uncorrelated"), "got: {msg}"),
+            other => panic!("expected Fail(uncorrelated), got {other:?}"),
+        }
     }
 
     #[test]
     fn nonce_match_but_bad_status_is_a_hard_fail() {
-        // A matching nonce proves freshness, but a non-completed verdict is still a
-        // genuine failure — Fail, never Retry (a fresh connection can't fix it).
-        let now = chrono::Utc::now();
-        let rec = record(OperationStatus::Failed, Some(now.to_rfc3339()), None);
+        // A matching nonce correlates, but a non-completed verdict is still a genuine
+        // failure — Fail, never Retry (a fresh connection can't fix it).
+        let rec = record(OperationStatus::Failed, None);
         assert!(matches!(
-            check_verdict(&rec, Some("n1"), "n1", "x-sumo-commit-trials", &[], now),
+            check_verdict(&rec, Some("n1"), "n1", "x-sumo-commit-trials", &[]),
+            VerdictOutcome::Fail(_)
+        ));
+    }
+
+    #[test]
+    fn correlated_but_missing_expected_component_fails_on_content() {
+        // Correlated (nonce match), but the expected component is absent from committed
+        // → a hard content failure, never accepted.
+        let rec = record(
+            OperationStatus::Completed,
+            Some(serde_json::json!({ "committed": ["vm2"], "skipped": ["vm1"] })),
+        );
+        assert!(matches!(
+            check_verdict(
+                &rec,
+                Some("n1"),
+                "n1",
+                "x-sumo-commit-trials",
+                &["vm1".to_string()]
+            ),
             VerdictOutcome::Fail(_)
         ));
     }
