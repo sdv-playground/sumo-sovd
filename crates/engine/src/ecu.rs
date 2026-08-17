@@ -663,7 +663,7 @@ fn validate_verdict_record(
             "committed"
         };
         for comp in expected {
-            if !acted.contains(comp) {
+            if !acted.iter().any(|a| acted_matches(comp, a)) {
                 return Err(format!(
                     "expected component {comp:?} absent from {acted_key} {acted:?}: {}",
                     compact_record(record)
@@ -672,6 +672,15 @@ fn validate_verdict_record(
         }
     }
     Ok(())
+}
+
+/// Does an acted-on name in a verdict result satisfy an expected SOVD component id?
+/// Fielded machine-managers (≤ 2026-08) report the OS BANK-SET id "host-os" where the
+/// SOVD component id is "host" — the other bank sets reuse their component id verbatim,
+/// so only that one alias exists. Kept until fleet verdicts speak SOVD component ids
+/// (the device-side fix); a fixed device reports "host" and never takes the alias arm.
+fn acted_matches(expected: &str, acted: &str) -> bool {
+    acted == expected || (expected == "host" && acted == "host-os")
 }
 
 /// One-line echo of an execution record for error messages (no pretty-print).
@@ -765,7 +774,9 @@ fn check_verdict(
     let acted = acted_components(record, op_id).unwrap_or_default();
     let exact_match = !expected.is_empty()
         && acted.len() == expected.len()
-        && expected.iter().all(|e| acted.contains(e));
+        && expected
+            .iter()
+            .all(|e| acted.iter().any(|a| acted_matches(e, a)));
     if record.status == OperationStatus::Completed && exact_match {
         VerdictOutcome::Valid {
             adopted_uncorrelated: true,
@@ -1292,6 +1303,50 @@ mod tests {
                 adopted_uncorrelated: false
             }
         );
+    }
+
+    #[test]
+    fn host_os_bank_set_alias_satisfies_expected_host() {
+        // Fielded machine-managers report the OS BANK-SET id "host-os" where the SOVD
+        // component id is "host" (the field failure of 2026-08-17). The dated alias
+        // accepts it — on a correlated record and on the uncorrelated exact-match path.
+        let rec = record(
+            OperationStatus::Completed,
+            Some(serde_json::json!({ "committed": ["host-os"], "skipped": ["vm1"] })),
+        );
+        assert_eq!(
+            check_verdict(
+                &rec,
+                Some("n1"),
+                "n1",
+                "x-sumo-commit-trials",
+                &["host".to_string()]
+            ),
+            VerdictOutcome::Valid {
+                adopted_uncorrelated: false
+            }
+        );
+        // Uncorrelated old device, exact set via the alias: adopted (loudly).
+        let rec = record(
+            OperationStatus::Completed,
+            Some(serde_json::json!({ "committed": ["host-os"], "skipped": [] })),
+        );
+        assert_eq!(
+            check_verdict(
+                &rec,
+                None,
+                "n1",
+                "x-sumo-commit-trials",
+                &["host".to_string()]
+            ),
+            VerdictOutcome::Valid {
+                adopted_uncorrelated: true
+            }
+        );
+        // The alias is one-way and specific: "host-os" expected is NOT satisfied by
+        // "host", and no other component gets an alias.
+        assert!(!acted_matches("host-os", "host"));
+        assert!(!acted_matches("vm1", "vm1-os"));
     }
 
     #[test]
