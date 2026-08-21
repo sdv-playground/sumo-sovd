@@ -13,8 +13,8 @@ use tracing::{error, info, warn};
 use crate::ecu;
 use crate::error::EngineError;
 use crate::types::{
-    CampaignReport, CampaignStep, EcuState, EcuStatus, EngineTimeouts, FlashPlan, HealthCheck,
-    TokenSource, UpdateType,
+    CampaignReport, CampaignStep, EcuState, EcuStatus, EngineTimeouts, FlashJob, FlashPlan,
+    HealthCheck, TokenSource, UpdateType,
 };
 
 /// Subset of the device's `x-sumo-update-mode` payload the engine reads: the
@@ -139,9 +139,20 @@ impl FlashEngine {
 
         let mut staged: Vec<String> = Vec::new();
 
-        for (i, job) in plan.jobs.iter().enumerate() {
+        // Stage in an order that never trips the device's owed-reboot gate: a
+        // component whose staging ARMS a node-level activation reboot
+        // (`reset_kind = requires_ecu_reset`, banked → `execute` pauses at
+        // awaiting-verdict, leaving the bank owed) is staged LAST. The device
+        // refuses a new `/updates` open once a node bank is armed ("node owes an
+        // activation reboot … reboot or roll back before starting a new flash"),
+        // so every non-arming component must open first. `statuses` stays in plan
+        // order — only the staging sequence is reordered.
+        let order = self.stage_order(&plan.jobs).await;
+
+        for (progress, &i) in order.iter().enumerate() {
+            let job = &plan.jobs[i];
             let comp = &job.component_id;
-            info!(component = %comp, progress = format!("{}/{}", i + 1, total), "staging ECU");
+            info!(component = %comp, progress = format!("{}/{}", progress + 1, total), "staging ECU");
             statuses[i].state = EcuState::Flashing;
 
             let token = self.token.token(comp).await?;
@@ -898,6 +909,43 @@ impl FlashEngine {
                 Err(re) => warn!(component = %rc, error = %re, "rollback failed"),
             }
         }
+    }
+
+    /// Staging order for a step's jobs: any component whose staging ARMS a
+    /// node-level activation reboot — one declaring `reset_kind =
+    /// requires_ecu_reset` (banked, so `execute` pauses at awaiting-verdict and
+    /// leaves the node bank owed) — is staged LAST; every other component keeps
+    /// its plan order (stable sort). The device's owed-reboot gate refuses a new
+    /// `/updates` open once a node bank is armed, so a step mixing an arming
+    /// component (host) with non-arming ones (vm1/vm2, local reset) must open all
+    /// the non-arming ones first.
+    ///
+    /// The ordering key is the declared reset_kind read PRE-stage off the stable
+    /// `x-sumo-update-mode` capability (via [`component_reset_kind`]) — the only
+    /// pre-stage source, since `fetch_reset_kind` needs a live `/updates` session
+    /// staging hasn't opened yet. Unreadable ⇒ treated as non-arming (kept early:
+    /// the pre-fix behaviour, never worse). A single-job plan skips the probe
+    /// entirely, byte-identical to before this ordering existed.
+    ///
+    /// Residual: the gate fires per NODE, so two arming components on one node
+    /// would still collide (the first arms; the second's open is refused). That
+    /// configuration isn't produced today (one host per node) and is out of scope.
+    async fn stage_order(&self, jobs: &[FlashJob]) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..jobs.len()).collect();
+        if jobs.len() <= 1 {
+            return order;
+        }
+        let mut arms = vec![false; jobs.len()];
+        for (i, job) in jobs.iter().enumerate() {
+            arms[i] = matches!(
+                self.component_reset_kind(&job.component_id).await,
+                Some(sovd_core::ResetKind::RequiresEcuReset)
+            );
+        }
+        // Stable partition: non-arming (false) first, node-arming (true) LAST —
+        // arm the device's owed-reboot gate only after every other open is in.
+        order.sort_by_key(|&i| arms[i]);
+        order
     }
 
     /// Read a component's `reset_kind` from the stable `x-sumo-update-mode`

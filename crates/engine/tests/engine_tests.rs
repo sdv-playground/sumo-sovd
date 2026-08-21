@@ -5,7 +5,7 @@
 //! enforce security, exactly as the engine's `NoAuth` path assumes).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -433,6 +433,97 @@ async fn engine_stage_failure_triggers_rollback() {
     assert!(err.is_err(), "stage_all should fail when ecu2 fails");
     // ecu1 staged first, then the engine rolled it back when ecu2 failed.
     assert_eq!(*b1.flash_state.read(), FlashState::RolledBack);
+}
+
+#[tokio::test]
+async fn stage_all_stages_node_reboot_component_last_to_clear_owed_reboot_gate() {
+    // Field bug (autoloader, 2026-08-21): one step carried host
+    // (requires_ecu_reset, banked) + vm1 (local, banked). Staged in plan order,
+    // host went FIRST; its execute armed the device's owed-reboot gate, and vm1's
+    // open_update was then refused 409 precondition-not-fulfilled — the engine
+    // rolled the whole step back. The fix stages the node-arming component LAST,
+    // so every non-arming open lands before the node bank is armed.
+    //
+    // The plan lists host FIRST on purpose: the OLD (unordered) staging trips the
+    // gate here; the fix must reorder to [vm1, host].
+    let host = Arc::new(TestBackend::new("host"));
+    host.set_update_mode(true, "requires_ecu_reset");
+    let vm1 = Arc::new(TestBackend::new("vm1"));
+    vm1.set_update_mode(true, "local");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("host".into(), host);
+    backends.insert("vm1".into(), vm1);
+
+    // Mirror the device's per-NODE owed-reboot gate as a router layer over the
+    // real sovd-api: once the reboot-owing component (host) has executed, refuse
+    // any further `/updates` open with 409. Record the open order to prove the
+    // reorder, not merely that nothing failed.
+    use axum::response::IntoResponse;
+    let armed = Arc::new(AtomicBool::new(false));
+    let opens = Arc::new(RwLock::new(Vec::<String>::new()));
+    let (armed_l, opens_l) = (armed.clone(), opens.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).layer(
+        axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let (armed, opens) = (armed_l.clone(), opens_l.clone());
+                async move {
+                    let method = req.method().clone();
+                    let path = req.uri().path().to_string();
+                    let is_open = method == axum::http::Method::POST && path.ends_with("/updates");
+                    if is_open {
+                        if armed.load(Ordering::SeqCst) {
+                            // The device gate: no new flash while a reboot is owed.
+                            return (
+                                axum::http::StatusCode::CONFLICT,
+                                "node owes an activation reboot for [\"host\"] — reboot or \
+                                 roll back before starting a new flash",
+                            )
+                                .into_response();
+                        }
+                        if let Some(id) = path
+                            .strip_prefix("/vehicle/v1/components/")
+                            .and_then(|s| s.strip_suffix("/updates"))
+                        {
+                            opens.write().push(id.to_string());
+                        }
+                    }
+                    let resp = next.run(req).await;
+                    // host's execute (requires_ecu_reset, banked) arms the node.
+                    if path.starts_with("/vehicle/v1/components/host/updates/")
+                        && path.ends_with("/execute")
+                    {
+                        armed.store(true, Ordering::SeqCst);
+                    }
+                    resp
+                }
+            },
+        ),
+    );
+    let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let eng = engine(&url);
+
+    // Plan lists host first; the fix must stage it last.
+    let statuses = eng
+        .stage_all(&plan(&[("host", &[0x01]), ("vm1", &[0x02])]))
+        .await
+        .expect("staging the arming component last clears the owed-reboot gate");
+
+    // Both banked components reach Staged (awaiting-verdict) — none Failed.
+    assert!(
+        statuses.iter().all(|e| e.state == EcuState::Staged),
+        "every component staged to awaiting-verdict, got {statuses:?}"
+    );
+    // The gate armed (host executed) and vm1 opened BEFORE host — the reorder.
+    assert!(armed.load(Ordering::SeqCst), "host must have executed");
+    assert_eq!(
+        *opens.read(),
+        vec!["vm1".to_string(), "host".to_string()],
+        "the local-reset component must open before the node-arming one"
+    );
 }
 
 #[tokio::test]
