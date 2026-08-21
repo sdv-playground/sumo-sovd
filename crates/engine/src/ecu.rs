@@ -16,9 +16,14 @@ use tracing::{debug, info, warn};
 use crate::error::EngineError;
 use crate::types::{FlashJob, PayloadSource, UpdateType};
 
-/// Open a fresh `/updates` session, auto-rolling back any pending trial the
-/// backend may still be holding (vm-mgr refuses `start_flash` while the bank
-/// set is mid-trial). Returns the new update_id.
+/// Open a fresh `/updates` session. On the device's in-trial refusal, roll back
+/// the pending trial and retry — but ONLY after `x-sumo-update-state` positively
+/// confirms this component is genuinely mid-trial. `force_rollback` is
+/// destructive, so an unconfirmed state (phase not `Trial`, the component absent,
+/// or an unreadable probe) must NOT trigger it: the refusal is surfaced with the
+/// observed state instead. A blind rollback against a committed/absent component
+/// fails device-side (`NotInTrial`) and masks the true cause. Returns the new
+/// update_id.
 async fn open_update_or_rollback_pending(
     flash_client: &FlashClient,
     comp: &str,
@@ -28,31 +33,113 @@ async fn open_update_or_rollback_pending(
     match flash_client.open_update_with(name, version).await {
         Ok(id) => Ok(id),
         Err(FlashError::Server { ref message, .. }) if message.contains("trial mode") => {
-            tracing::info!(
-                component = %comp,
-                detail = %message,
-                "previous upgrade still in trial — auto-rolling back before new flash"
-            );
-            flash_client
-                .force_rollback()
-                .await
-                .map_err(|e| EngineError::FlashFailed {
+            // Positive confirmation gates the destructive rollback: read the node's
+            // update-state off the wire (connection recovered from the flash client).
+            let cfg = flash_client.config();
+            let state = read_node_update_state(
+                &cfg.connection.base_url,
+                cfg.connection.bearer.as_deref().unwrap_or(""),
+                cfg.insecure,
+                cfg.ca_cert_pem.as_deref(),
+            )
+            .await;
+            match state {
+                // `acted_matches` carries the one-way host-os→host bank-set alias.
+                Ok(s)
+                    if s.phase == "Trial"
+                        && s.components.iter().any(|c| acted_matches(comp, c)) =>
+                {
+                    tracing::info!(
+                        component = %comp,
+                        detail = %message,
+                        "previous upgrade still in trial — auto-rolling back before new flash"
+                    );
+                    flash_client
+                        .force_rollback()
+                        .await
+                        .map_err(|e| EngineError::FlashFailed {
+                            component: comp.to_string(),
+                            message: format!("force_rollback of pending trial: {e}"),
+                        })?;
+                    flash_client
+                        .open_update_with(name, version)
+                        .await
+                        .map_err(|e| EngineError::FlashFailed {
+                            component: comp.to_string(),
+                            message: format!("open_update after rollback: {e}"),
+                        })
+                }
+                Ok(s) => Err(EngineError::FlashFailed {
                     component: comp.to_string(),
-                    message: format!("force_rollback of pending trial: {e}"),
-                })?;
-            flash_client
-                .open_update_with(name, version)
-                .await
-                .map_err(|e| EngineError::FlashFailed {
+                    message: format!(
+                        "device refused open as in-trial but x-sumo-update-state reports \
+                         phase={} (components={:?}) — not auto-rolling back; inspect device \
+                         state: {message}",
+                        s.phase, s.components
+                    ),
+                }),
+                Err(e) => Err(EngineError::FlashFailed {
                     component: comp.to_string(),
-                    message: format!("open_update after rollback: {e}"),
-                })
+                    message: format!(
+                        "device refused open as in-trial but the x-sumo-update-state probe \
+                         failed ({e}) — not auto-rolling back; inspect device state: {message}"
+                    ),
+                }),
+            }
         }
         Err(e) => Err(EngineError::FlashFailed {
             component: comp.to_string(),
             message: format!("open_update: {e}"),
         }),
     }
+}
+
+/// The node's `x-sumo-update-state` — the update-transaction `phase` plus the
+/// component ids it covers (component-mgr `sovd/routes.rs` `UpdateStateResponse`).
+#[derive(serde::Deserialize)]
+struct NodeUpdateStateProbe {
+    phase: String,
+    #[serde(default)]
+    components: Vec<String>,
+}
+
+/// `GET /vehicle/v1/data/x-sumo-update-state` — a NODE-level vendor resource at
+/// the vehicle root, so it is read with a direct GET (not the per-component
+/// `SovdClient::read_data`). `Err` when the resource is unreachable/absent (an
+/// older device predating the field) or the body will not parse — the caller
+/// treats any failure as unconfirmed and refuses the destructive rollback.
+async fn read_node_update_state(
+    server_url: &str,
+    token: &str,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Result<NodeUpdateStateProbe, EngineError> {
+    let url = format!(
+        "{}/vehicle/v1/data/x-sumo-update-state",
+        server_url.trim_end_matches('/')
+    );
+    // Same one-off CA-trust seam as the node-verdict POST.
+    let client = build_verdict_client(insecure, ca_cert_pem, "x-sumo-update-state")?;
+    let mut req = client.get(&url);
+    if !token.is_empty() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
+        component: "node".to_string(),
+        message: format!("x-sumo-update-state: {e}"),
+    })?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(EngineError::FlashFailed {
+            component: "node".to_string(),
+            message: format!("x-sumo-update-state: HTTP {status}: {body}"),
+        });
+    }
+    serde_json::from_str(&body).map_err(|e| EngineError::FlashFailed {
+        component: "node".to_string(),
+        message: format!("x-sumo-update-state: unparseable body ({e}): {body}"),
+    })
 }
 
 /// Result of staging one ECU (before reset).

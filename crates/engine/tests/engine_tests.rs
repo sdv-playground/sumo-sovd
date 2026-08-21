@@ -526,6 +526,168 @@ async fn stage_all_stages_node_reboot_component_last_to_clear_owed_reboot_gate()
     );
 }
 
+/// Serve the real sovd-api with a middleware that reproduces the trial-recovery
+/// wire: the FIRST `/updates` open is refused "in trial mode"; the NODE-level
+/// `x-sumo-update-state` probe answers `state_reply` (`Some(json)` ⇒ 200, `None`
+/// ⇒ 404); `x-sumo-force-rollback` is counted and answered 204; every later open
+/// passes through to the real router. Returns `(url, force_rollback_hits,
+/// open_attempts, handle)`.
+async fn serve_trial_recovery(
+    state_reply: Option<serde_json::Value>,
+) -> (
+    String,
+    Arc<AtomicU32>,
+    Arc<AtomicU32>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::response::IntoResponse;
+    let backend = Arc::new(TestBackend::new("vm1"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), backend);
+
+    let rollbacks = Arc::new(AtomicU32::new(0));
+    let opens = Arc::new(AtomicU32::new(0));
+    let state_reply = Arc::new(state_reply);
+    let (rollbacks_l, opens_l, state_l) = (rollbacks.clone(), opens.clone(), state_reply.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).layer(
+        axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let (rollbacks, opens, state) =
+                    (rollbacks_l.clone(), opens_l.clone(), state_l.clone());
+                async move {
+                    let method = req.method().clone();
+                    let path = req.uri().path().to_string();
+                    // NODE-level update-state probe — a sumo-mm vendor route the
+                    // reference sovd-api doesn't carry, served here.
+                    if method == axum::http::Method::GET
+                        && path == "/vehicle/v1/data/x-sumo-update-state"
+                    {
+                        return match &*state {
+                            Some(v) => axum::Json(v.clone()).into_response(),
+                            None => (axum::http::StatusCode::NOT_FOUND, "no such resource")
+                                .into_response(),
+                        };
+                    }
+                    // Count + answer the trial-recovery rollback (204, like the device).
+                    if method == axum::http::Method::PUT && path.ends_with("/x-sumo-force-rollback")
+                    {
+                        rollbacks.fetch_add(1, Ordering::SeqCst);
+                        return axum::http::StatusCode::NO_CONTENT.into_response();
+                    }
+                    // First open refused "in trial mode" (drives the recovery path);
+                    // any later open passes through to the real router. `fetch_add`
+                    // counts every open POST; only the first (== 0) is refused.
+                    if method == axum::http::Method::POST
+                        && path.ends_with("/updates")
+                        && opens.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        return (
+                            axum::http::StatusCode::CONFLICT,
+                            "start_flash refused: bank set is in trial mode",
+                        )
+                            .into_response();
+                    }
+                    next.run(req).await
+                }
+            },
+        ),
+    );
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), rollbacks, opens, handle)
+}
+
+#[tokio::test]
+async fn open_refused_in_trial_with_confirming_state_rolls_back_and_retries() {
+    // x-sumo-update-state confirms vm1 is genuinely mid-trial ⇒ the EXISTING
+    // recovery fires: force_rollback once, then the open is retried and staging
+    // completes.
+    let (url, rollbacks, opens, _h) = serve_trial_recovery(Some(serde_json::json!({
+        "phase": "Trial",
+        "components": ["vm1"],
+    })))
+    .await;
+    let eng = engine(&url);
+
+    let statuses = eng
+        .stage_all(&plan(&[("vm1", &[0xDE, 0xAD])]))
+        .await
+        .expect("confirmed in-trial ⇒ rollback + reopen succeeds");
+
+    assert_eq!(
+        rollbacks.load(Ordering::SeqCst),
+        1,
+        "force_rollback must fire exactly once on a confirmed trial"
+    );
+    assert!(
+        opens.load(Ordering::SeqCst) >= 2,
+        "open must be retried after the rollback"
+    );
+    assert_ne!(
+        statuses[0].state,
+        EcuState::Failed,
+        "staging succeeds after recovery, got {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn open_refused_in_trial_but_state_idle_does_not_roll_back() {
+    // The refusal said "trial mode" but x-sumo-update-state reports Idle (nothing
+    // in trial) — a stale message / different gate. Rollback is destructive, so it
+    // must NOT fire; the refusal is surfaced with the observed state.
+    let (url, rollbacks, _opens, _h) = serve_trial_recovery(Some(serde_json::json!({
+        "phase": "Idle",
+        "components": [],
+    })))
+    .await;
+    let eng = engine(&url);
+
+    let err = eng
+        .stage_all(&plan(&[("vm1", &[0xDE, 0xAD])]))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        rollbacks.load(Ordering::SeqCst),
+        0,
+        "no rollback when the observed state is not an open trial"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("phase=Idle") && msg.contains("not auto-rolling back"),
+        "error must carry the observed state: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn open_refused_in_trial_but_state_probe_fails_does_not_roll_back() {
+    // The update-state probe 404s (an older device lacking the resource). Without
+    // positive confirmation the destructive rollback must NOT fire — the recovery
+    // no longer auto-triggers for such devices (deliberate); the error notes the
+    // failed probe.
+    let (url, rollbacks, _opens, _h) = serve_trial_recovery(None).await;
+    let eng = engine(&url);
+
+    let err = eng
+        .stage_all(&plan(&[("vm1", &[0xDE, 0xAD])]))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        rollbacks.load(Ordering::SeqCst),
+        0,
+        "no rollback when the state probe fails"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("probe") && msg.contains("not auto-rolling back"),
+        "error must note the failed state probe: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn engine_reboots_committed_singleshot_with_reset_kind() {
     // A singleshot component (e.g. RT/M7) commits in stage_all but still needs a
