@@ -1026,6 +1026,189 @@ async fn node_verdict_fails_after_one_retry_on_persistent_replay() {
     );
 }
 
+#[tokio::test]
+async fn commit_trials_does_not_clear_owed_reboot_gate_reflash_refused_cleanly() {
+    // Field scenario: campaign 1 flashes "host" (banked, requires_ecu_reset) and
+    // commits its trial via the node-verdict path (x-sumo-commit-trials). Commit
+    // makes the trial PERMANENT, but — mirroring the real device — does NOT clear
+    // the node's owed-activation-reboot gate: that gate arms at `execute`
+    // (staging-time; see
+    // `stage_all_stages_node_reboot_component_last_to_clear_owed_reboot_gate`) and
+    // only an actual reboot clears it. This test never calls `reset_all` — no
+    // reboot happens anywhere in it — so campaign 2's IMMEDIATE re-flash of the
+    // same node must still find the gate armed and be refused 409. The engine must
+    // fail cleanly (FlashFailed), fire no rollback remedy, never reset the device
+    // itself, and its stage_all abort-unwind must behave on the refusal.
+    use axum::response::IntoResponse;
+
+    let backend = Arc::new(TestBackend::new("host"));
+    backend.set_update_mode(true, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("host".into(), backend.clone());
+
+    // Node-verdict stub for x-sumo-commit-trials — same uncorrelated-but-exact-
+    // content-match shape as `node_reboot_step_commits_via_node_verdict_not_per_component`.
+    let commit_hits = Arc::new(AtomicU32::new(0));
+    let commit_hits_route = commit_hits.clone();
+    let node_op = axum::Router::new().route(
+        "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+        axum::routing::post(move || {
+            let commit_hits = commit_hits_route.clone();
+            async move {
+                commit_hits.fetch_add(1, Ordering::SeqCst);
+                let now = chrono::Utc::now().to_rfc3339();
+                axum::Json(serde_json::json!({
+                    "execution_id": "x-sumo-commit-trials",
+                    "operation_id": "x-sumo-commit-trials",
+                    "status": "completed",
+                    "result": { "committed": ["host"], "skipped": [] },
+                    "started_at": now,
+                    "completed_at": now,
+                }))
+            }
+        }),
+    );
+
+    // The device's owed-reboot gate — same middleware pattern (and exact 409 wire
+    // text) as `stage_all_stages_node_reboot_component_last_to_clear_owed_reboot_gate`:
+    // armed once host's `execute` lands; while armed, any new `/updates` open is
+    // refused. Also counts any rollback-shaped request (force-rollback, or the
+    // per-component spec rollback) — must stay at 0 through campaign 2.
+    let armed = Arc::new(AtomicBool::new(false));
+    let opens = Arc::new(RwLock::new(Vec::<String>::new()));
+    let rollback_hits = Arc::new(AtomicU32::new(0));
+    let (armed_l, opens_l, rollback_hits_l) = (armed.clone(), opens.clone(), rollback_hits.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends))
+        .merge(node_op)
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let (armed, opens, rollback_hits) =
+                    (armed_l.clone(), opens_l.clone(), rollback_hits_l.clone());
+                async move {
+                    let method = req.method().clone();
+                    let path = req.uri().path().to_string();
+                    if path.contains("rollback") {
+                        rollback_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let is_open = method == axum::http::Method::POST && path.ends_with("/updates");
+                    if is_open {
+                        if armed.load(Ordering::SeqCst) {
+                            // The device gate: no new flash while a reboot is owed.
+                            // Only a reboot clears this — commit-trials does NOT.
+                            return (
+                                axum::http::StatusCode::CONFLICT,
+                                "node owes an activation reboot for [\"host\"] — reboot or \
+                                 roll back before starting a new flash",
+                            )
+                                .into_response();
+                        }
+                        if let Some(id) = path
+                            .strip_prefix("/vehicle/v1/components/")
+                            .and_then(|s| s.strip_suffix("/updates"))
+                        {
+                            opens.write().push(id.to_string());
+                        }
+                    }
+                    let resp = next.run(req).await;
+                    if path.starts_with("/vehicle/v1/components/host/updates/")
+                        && path.ends_with("/execute")
+                    {
+                        armed.store(true, Ordering::SeqCst);
+                    }
+                    resp
+                }
+            },
+        ));
+    let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let eng = force_reset_engine(url);
+
+    // --- Campaign 1: stage host (arms the gate at execute), then commit via the
+    // node-verdict path. No `reset_all` call anywhere in this test — campaign 1's
+    // activation is set directly on the status (as
+    // `node_reboot_step_commits_via_node_verdict_not_per_component` also does), so
+    // `commit_all`'s node path has an Activated component to commit WITHOUT the
+    // engine ever issuing a real device reboot. That isolates exactly the
+    // distinction under test: commit succeeding is not the same as a reboot.
+    let mut ecus = eng
+        .stage_all(&plan(&[("host", &[0x01])]))
+        .await
+        .expect("campaign 1 staging succeeds — the gate isn't armed yet");
+    assert_eq!(ecus[0].state, EcuState::Staged);
+    assert!(
+        armed.load(Ordering::SeqCst),
+        "host's execute must arm the owed-reboot gate"
+    );
+
+    ecus[0].state = EcuState::Activated;
+    eng.commit_all(&mut ecus)
+        .await
+        .expect("commit-trials succeeds");
+    assert_eq!(ecus[0].state, EcuState::Committed);
+    assert_eq!(
+        commit_hits.load(Ordering::SeqCst),
+        1,
+        "commit-trials must have been issued exactly once"
+    );
+    let reset_count_after_c1 = backend.reset_count();
+    assert_eq!(
+        reset_count_after_c1, 0,
+        "no reboot occurs anywhere in this test, campaign 1 included"
+    );
+
+    // --- Campaign 2: an IMMEDIATE re-flash of the same node, no reboot in between.
+    let err = eng
+        .stage_all(&plan(&[("host", &[0x02])]))
+        .await
+        .expect_err("commit does not clear the owed-reboot gate — the reopen must be refused");
+
+    // (a) A clean FlashFailed outcome for the right component — not a hang, not a
+    // misrouted success.
+    assert!(
+        matches!(&err, EngineError::FlashFailed { component, .. } if component.as_str() == "host"),
+        "expected FlashFailed for host, got {err:?}"
+    );
+    let msg = err.to_string();
+    // (e) The owed-reboot refusal text, NOT the trial-recovery text — the
+    // "trial mode" special case (ecu.rs open_update_or_rollback_pending) must not
+    // trigger on this message.
+    assert!(
+        msg.contains("owes an activation reboot"),
+        "must surface the owed-reboot refusal, got: {msg}"
+    );
+    assert!(
+        !msg.contains("trial mode"),
+        "must NOT be misclassified as the trial-recovery path, got: {msg}"
+    );
+
+    // (b) No rollback of any kind was issued by the engine.
+    assert_eq!(
+        rollback_hits.load(Ordering::SeqCst),
+        0,
+        "the engine must not fire any rollback/force-rollback remedy"
+    );
+    // (d) Nothing from campaign 2 ever reached a successful open — the recorded
+    // open order stops at campaign 1's single entry, proving stage_all's abort
+    // unwind had nothing staged from campaign 2 to roll back (consistent with the
+    // 0 rollback calls above).
+    assert_eq!(
+        *opens.read(),
+        vec!["host".to_string()],
+        "campaign 2's open must be refused before it is ever recorded as opened"
+    );
+
+    // (c) The device itself was never reset/rebooted, in either campaign.
+    assert_eq!(
+        backend.reset_count(),
+        reset_count_after_c1,
+        "the engine must not reset the device itself on this refusal"
+    );
+}
+
 // =============================================================================
 // run_campaign — the shared multi-step loop (health-gate + per-step commit/abort)
 // =============================================================================
