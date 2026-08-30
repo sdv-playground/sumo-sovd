@@ -454,6 +454,9 @@ impl FlashEngine {
                         &token,
                         insecure,
                         ca_cert_pem.as_deref(),
+                        // Staged (banked, awaiting-verdict) components: the new
+                        // firmware must come back READY before the verdict.
+                        ecu::WitnessKind::RebootAndReady,
                     )
                     .await;
                     (comp_id, result)
@@ -469,7 +472,7 @@ impl FlashEngine {
             info!(
                 local = ss_local.len(),
                 requires_ecu_reset = ss_by_ecu.values().map(|v| v.len()).sum::<usize>(),
-                "rebooting committed singleshot components to run new firmware"
+                "rebooting committed singleshot components — new firmware and/or removals"
             );
         }
         for (comp, gw) in ss_local {
@@ -502,7 +505,7 @@ impl FlashEngine {
         }
         for (gateway_id, comps) in ss_by_ecu {
             let restart_key = gateway_id.as_deref().unwrap_or("");
-            info!(gateway = ?gateway_id, components = ?comps, "rebooting node for committed singleshot (RequiresEcuReset)");
+            info!(gateway = ?gateway_id, components = ?comps, "rebooting node for committed singleshot (RequiresEcuReset) — new firmware and/or removals");
             // Witness the reboot, don't just ping. `system_restart` is async — it
             // returns 202 while the OLD supernova is still up, and the actual
             // restart fires seconds later (esp. behind the reboot_host VM/loopback
@@ -511,11 +514,27 @@ impl FlashEngine {
             // opens a /updates session, and the delayed restart then wipes the
             // in-memory session → `prepare` 404 (reliably, on high-latency links).
             // So: capture the node per-boot nonce BEFORE the restart, then wait for
-            // it to CHANGE (+ status ready) via wait_activated — the same
-            // reboot-witnessed converge the banked/trial path uses. The next step
-            // only starts once the node is genuinely back on a fresh boot. Use the
-            // first component as the witness (node_boot_id is node-wide).
-            let witness = comps.first().cloned().unwrap_or_default();
+            // it to CHANGE (+ status ready, per the witness kind below) via
+            // wait_activated — the same reboot-witnessed converge the banked/trial
+            // path uses. The next step only starts once the node is genuinely back
+            // on a fresh boot.
+            //
+            // Witness SELECTION (node_boot_id is node-wide, so any component of
+            // the group can carry it): prefer a NON-Removal one — its readiness
+            // proves more than the reboot alone. A Removal (disable) component was
+            // just deactivated and never reports `ready` again, so an all-Removal
+            // group is witnessed by the node reboot itself (WitnessKind::RebootOnly);
+            // requiring `ready` there burned the whole activation budget, every run.
+            let (witness, witness_kind) = match comps.iter().find(|c| {
+                ecus.iter()
+                    .any(|s| &s.component_id == *c && s.update_type != UpdateType::Removal)
+            }) {
+                Some(c) => (c.clone(), ecu::WitnessKind::RebootAndReady),
+                None => (
+                    comps.first().cloned().unwrap_or_default(),
+                    ecu::WitnessKind::RebootOnly,
+                ),
+            };
             let witness_token = self.token.token(&witness).await.unwrap_or_default();
             // Capture BOTH baselines before the restart (mirror the banked path):
             // the node per-boot nonce (the unmissable no-heartbeat witness) AND the
@@ -539,26 +558,46 @@ impl FlashEngine {
                 self.ca_cert_pem.as_deref(),
             )
             .await;
-            let outcome = match self.sovd_client(restart_key).await {
+            let restart = match self.sovd_client(restart_key).await {
                 Ok(client) => match client.system_restart(gateway_id.as_deref(), "hard").await {
-                    Ok(_) => {
-                        ecu::wait_activated(
-                            &self.server_url,
-                            &witness,
-                            hb_baseline,
-                            node_baseline,
-                            self.timeouts.ecu_reset_activation_secs,
-                            &witness_token,
-                            self.insecure,
-                            self.ca_cert_pem.as_deref(),
-                        )
-                        .await
+                    Ok(()) => Ok(()),
+                    // The device reboots kernel-direct, so when the reboot wins the
+                    // race the connection dies before the response flushes. That is
+                    // the reboot HAPPENING, not a failure — carry on to the witness
+                    // poll, which stays the arbiter (a node that never comes back
+                    // rotated still fails on the activation deadline). An answer we
+                    // actually received (4xx/5xx) is a real refusal and stays fatal.
+                    Err(e) if ecu::is_connect_level(&e) => {
+                        info!(
+                            gateway = ?gateway_id,
+                            error = %e,
+                            "restart request did not return — node likely rebooted mid-request; \
+                             verifying via boot-id witness"
+                        );
+                        Ok(())
                     }
                     Err(e) => Err(EngineError::FlashFailed {
                         component: comps.first().cloned().unwrap_or_default(),
                         message: format!("ECU restart: {e}"),
                     }),
                 },
+                Err(e) => Err(e),
+            };
+            let outcome = match restart {
+                Ok(()) => {
+                    ecu::wait_activated(
+                        &self.server_url,
+                        &witness,
+                        hb_baseline,
+                        node_baseline,
+                        self.timeouts.ecu_reset_activation_secs,
+                        &witness_token,
+                        self.insecure,
+                        self.ca_cert_pem.as_deref(),
+                        witness_kind,
+                    )
+                    .await
+                }
                 Err(e) => Err(e),
             };
             if let Err(err) = outcome {

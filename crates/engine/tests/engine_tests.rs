@@ -46,6 +46,14 @@ struct TestBackend {
     /// Heartbeat boot_id surfaced in `/status`; `ecu_reset` bumps it to simulate
     /// a fresh guest lifetime (the reboot the orchestrator witnesses).
     boot_id: AtomicU32,
+    /// Node-wide per-boot nonce surfaced as `x-runtime.node_boot_id` — the
+    /// unmissable node-reboot witness. `None` (the default) leaves it off the
+    /// wire, like an MM that predates the field. SHARED across the node's
+    /// backends, so one node restart rotates it for every component.
+    node_boot: Option<Arc<AtomicU32>>,
+    /// What `/status` reports. A component the campaign just REMOVED (disabled)
+    /// never comes back `Ready` — the case the removal witness must tolerate.
+    status: RwLock<EntityStatus>,
     update_mode: RwLock<Option<(bool, String)>>,
     fail_flash: RwLock<Option<String>>,
 }
@@ -74,9 +82,24 @@ impl TestBackend {
             transfer_counter: AtomicU32::new(0),
             reset_count: AtomicU32::new(0),
             boot_id: AtomicU32::new(1),
+            node_boot: None,
+            status: RwLock::new(EntityStatus::Ready),
             update_mode: RwLock::new(None),
             fail_flash: RwLock::new(None),
         }
+    }
+
+    /// Report the node's shared per-boot nonce as `x-runtime.node_boot_id` — the
+    /// witness a node reboot rotates for every component on the node.
+    fn with_node_boot(mut self, node_boot: Arc<AtomicU32>) -> Self {
+        self.node_boot = Some(node_boot);
+        self
+    }
+
+    /// Report a `/status` other than `Ready` — a removed (disabled) component.
+    fn with_status(self, status: EntityStatus) -> Self {
+        *self.status.write() = status;
+        self
     }
 
     /// Make this backend report `x-ota-update-mode` (supports_rollback +
@@ -276,10 +299,16 @@ impl DiagnosticBackend for TestBackend {
             "boot_id".into(),
             serde_json::json!(self.boot_id.load(Ordering::SeqCst)),
         );
+        if let Some(node_boot) = &self.node_boot {
+            runtime.insert(
+                "node_boot_id".into(),
+                serde_json::json!(format!("boot-{}", node_boot.load(Ordering::SeqCst))),
+            );
+        }
         let mut extensions = serde_json::Map::new();
         extensions.insert("x-runtime".into(), serde_json::Value::Object(runtime));
         Ok(EntityStatusBody {
-            status: EntityStatus::Ready,
+            status: *self.status.read(),
             extensions,
             ..Default::default()
         })
@@ -722,6 +751,229 @@ async fn engine_reboots_committed_singleshot_with_reset_kind() {
         EcuState::Committed,
         "singleshot stays committed — no trial/verdict"
     );
+}
+
+/// How the mocked node answers the committed-singleshot restart PUT.
+#[derive(Clone, Copy)]
+enum Restart {
+    /// 202 Accepted + a rotated node nonce — the device's async restart.
+    RotatesNonce,
+    /// The connection dies with no reply at all, and the node reboots anyway —
+    /// the kernel-direct reboot beating the response out the door.
+    DropsConnection,
+    /// 202 Accepted, but the node never actually reboots (nonce unchanged) — the
+    /// fail-closed case no witness may pass.
+    NeverReboots,
+}
+
+/// Serve the real sovd-api behind a middleware that plays the NODE restart the
+/// committed-singleshot branch issues (`PUT /vehicle/v1/status/restart`) per
+/// `restart`, and records every component `/status` GET so a test can prove WHICH
+/// component was polled as the reboot witness.
+async fn serve_node_restart(
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+    node_boot: Arc<AtomicU32>,
+    restart: Restart,
+) -> (
+    String,
+    Arc<RwLock<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::response::IntoResponse;
+    let polls = Arc::new(RwLock::new(Vec::<String>::new()));
+    let (boot_l, polls_l) = (node_boot.clone(), polls.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).layer(
+        axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let (node_boot, polls) = (boot_l.clone(), polls_l.clone());
+                async move {
+                    let method = req.method().clone();
+                    let path = req.uri().path().to_string();
+                    if method == axum::http::Method::PUT && path == "/vehicle/v1/status/restart" {
+                        if !matches!(restart, Restart::NeverReboots) {
+                            // The node reboots: a fresh per-kernel-boot nonce.
+                            node_boot.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if matches!(restart, Restart::DropsConnection) {
+                            // No reply at all: panicking here unwinds THIS
+                            // connection's task, so hyper drops the socket without
+                            // writing a response — what the client sees when the
+                            // kernel-direct reboot cuts the PUT. (The panic line in
+                            // the test log is the simulation, not a failure; axum
+                            // keeps accepting on every other connection.)
+                            panic!("simulated mid-request reboot: connection dropped");
+                        }
+                        // The device's restart is async: 202 now, reboot moments later.
+                        return axum::http::StatusCode::ACCEPTED.into_response();
+                    }
+                    if method == axum::http::Method::GET {
+                        if let Some(id) = path
+                            .strip_prefix("/vehicle/v1/components/")
+                            .and_then(|s| s.strip_suffix("/status"))
+                        {
+                            polls.write().push(id.to_string());
+                        }
+                    }
+                    next.run(req).await
+                }
+            },
+        ),
+    );
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), polls, handle)
+}
+
+/// The engine with a SHORT node-reset budget: these tests assert the flow
+/// completes (or fails) on the WITNESS, so the 300s field budget would only make
+/// a regression take 300s to report itself.
+fn engine_with_reset_budget(server_url: &str, ecu_reset_activation_secs: u64) -> FlashEngine {
+    FlashEngine::new(
+        server_url.to_string(),
+        Arc::new(NoAuth),
+        dummy_trust_anchor(),
+        EngineTimeouts {
+            local_reset_secs: 180,
+            ecu_reset_activation_secs,
+        },
+        false,
+        None,
+    )
+}
+
+/// As `stage_all` leaves a committed singleshot component: Committed, carrying
+/// its update_id, with the update type the manifest classified as.
+fn committed_singleshot(component_id: &str, update_type: UpdateType) -> EcuStatus {
+    EcuStatus {
+        component_id: component_id.into(),
+        gateway_id: None,
+        state: EcuState::Committed,
+        update_type,
+        active_version: None,
+        previous_version: None,
+        error: None,
+        update_id: Some("xfer-0".into()),
+    }
+}
+
+#[tokio::test]
+async fn removal_node_reset_is_witnessed_by_the_reboot_not_by_readiness() {
+    // Field bug: a committed Removal (disable) that requires a node reset was
+    // witnessed with the component ITSELF as witness under the ready-rule — but a
+    // removed component never reports `ready` again, so every run burned the full
+    // 300s activation budget and failed. The node reboot (rotated node_boot_id,
+    // read back off a device answering /status) is the witness for a removal.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(
+        TestBackend::new("rt")
+            .with_node_boot(node_boot.clone())
+            .with_status(EntityStatus::NotReady),
+    );
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    let (url, _polls, _h) = serve_node_restart(backends, node_boot, Restart::RotatesNonce).await;
+    let eng = engine_with_reset_budget(&url, 10);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Removal)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("a rotated node_boot_id is the whole witness for an all-Removal group");
+
+    assert_eq!(
+        ecus[0].state,
+        EcuState::Committed,
+        "a removal stays committed — no trial/verdict"
+    );
+    assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+}
+
+#[tokio::test]
+async fn node_reset_tolerates_the_restart_call_dying_mid_request() {
+    // The device reboots kernel-direct, so the restart PUT's connection dies
+    // before the response flushes whenever the reboot wins the race. That is the
+    // reboot happening — the witness poll (not the PUT's reply) is the arbiter.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(TestBackend::new("rt").with_node_boot(node_boot.clone()));
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    let (url, _polls, _h) = serve_node_restart(backends, node_boot, Restart::DropsConnection).await;
+    let eng = engine_with_reset_budget(&url, 10);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("a dropped restart connection is the reboot, not a failure");
+
+    assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+}
+
+#[tokio::test]
+async fn mixed_reset_group_witnesses_the_non_removal_component() {
+    // A group of one Removal + one firmware singleshot: the firmware component is
+    // the witness (its readiness proves more than the reboot alone), so the
+    // ready-rule still applies. The Removal is listed FIRST on purpose — picking
+    // `comps.first()` would witness the removed component instead.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(
+        TestBackend::new("rt")
+            .with_node_boot(node_boot.clone())
+            .with_status(EntityStatus::NotReady),
+    );
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let vm1 = Arc::new(TestBackend::new("vm1").with_node_boot(node_boot.clone()));
+    vm1.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    backends.insert("vm1".into(), vm1);
+    let (url, polls, _h) = serve_node_restart(backends, node_boot, Restart::RotatesNonce).await;
+    let eng = engine_with_reset_budget(&url, 10);
+
+    let mut ecus = vec![
+        committed_singleshot("rt", UpdateType::Removal),
+        committed_singleshot("vm1", UpdateType::Firmware),
+    ];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("node reboot witnessed");
+
+    let polled = polls.read().clone();
+    assert!(
+        polled.iter().all(|c| c == "vm1"),
+        "the non-Removal component must be the witness, polled {polled:?}"
+    );
+    assert!(!polled.is_empty(), "the witness must have been polled");
+    assert!(ecus.iter().all(|e| e.error.is_none()), "got {ecus:?}");
+}
+
+#[tokio::test]
+async fn removal_node_reset_fails_closed_when_the_node_never_reboots() {
+    // Fail-closed: dropping the ready-conjunct for a removal must NOT turn the
+    // wait into a vacuous pass. The node answers the restart 202 but never
+    // reboots (the nonce never rotates) ⇒ the flow still times out.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(
+        TestBackend::new("rt")
+            .with_node_boot(node_boot.clone())
+            .with_status(EntityStatus::NotReady),
+    );
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    let (url, _polls, _h) = serve_node_restart(backends, node_boot, Restart::NeverReboots).await;
+    let eng = engine_with_reset_budget(&url, 3);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Removal)];
+    let err = eng.reset_all(&mut ecus).await;
+
+    assert!(
+        matches!(err, Err(EngineError::Timeout { ref operation, .. }) if operation.contains("never rotated")),
+        "an unrotated node nonce must fail the removal witness, got {err:?}"
+    );
+    assert_eq!(ecus[0].state, EcuState::Failed);
 }
 
 #[tokio::test]

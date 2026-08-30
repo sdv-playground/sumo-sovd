@@ -505,6 +505,20 @@ enum Witness {
     NotYet,
 }
 
+/// What a reboot witness must observe for the kind of update being activated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WitnessKind {
+    /// The default: a witnessed reboot AND the component reporting `ready`
+    /// again — the write is not just enacted, the component is running healthy.
+    RebootAndReady,
+    /// A [`UpdateType::Removal`](crate::types::UpdateType::Removal) (disable)
+    /// witness: the component was just deactivated, so it never reports `ready`
+    /// again and `ready` cannot be part of its pass. The node reboot ITSELF is
+    /// the pass — a rotated `node_boot_id` read back off a device answering
+    /// `/status`.
+    RebootOnly,
+}
+
 /// Pure, fail-closed reboot-witness decision. Passes ONLY on:
 /// - (a) a positive boot-id transition — `node_boot_id` OR heartbeat `boot_id`
 ///   with BOTH baseline and current present and differing; OR
@@ -513,8 +527,9 @@ enum Witness {
 ///
 /// Every other input yields [`Witness::NotYet`] (times out): both baselines
 /// `None` with no down→up, unchanged boot ids, or a boot id that merely
-/// *appeared* (`None`→`Some`) — none of which prove a reboot. A pass ALWAYS
-/// requires `ready`; a rebooted-but-not-yet-ready node keeps waiting.
+/// *appeared* (`None`→`Some`) — none of which prove a reboot. A
+/// [`WitnessKind::RebootAndReady`] pass ALWAYS requires `ready`; a
+/// rebooted-but-not-yet-ready node keeps waiting.
 fn witness_decision(
     node_baseline: Option<&str>,
     cur_node: Option<&str>,
@@ -522,14 +537,25 @@ fn witness_decision(
     cur_hb: Option<u32>,
     ready: bool,
     saw_down: bool,
+    kind: WitnessKind,
 ) -> Witness {
+    let node_rotated = matches!((node_baseline, cur_node), (Some(b), Some(c)) if b != c);
+    if kind == WitnessKind::RebootOnly {
+        // A removed component never comes back `ready`, so its only witness is
+        // the node-wide nonce rotating on a device that is answering `/status`
+        // again. The heartbeat boot_id (a fresh guest lifetime) and the down→up
+        // fallback are both readiness-bound, so neither applies here.
+        return if node_rotated {
+            Witness::PassNodeBootId
+        } else {
+            Witness::NotYet
+        };
+    }
     if !ready {
         return Witness::NotYet;
     }
-    if let (Some(b), Some(c)) = (node_baseline, cur_node) {
-        if b != c {
-            return Witness::PassNodeBootId;
-        }
+    if node_rotated {
+        return Witness::PassNodeBootId;
     }
     if let (Some(b), Some(c)) = (hb_baseline, cur_hb) {
         if b != c {
@@ -547,8 +573,9 @@ fn witness_decision(
 /// reboot witness. An HTTP status *response* (4xx/5xx → [`SovdClientError::ServerError`])
 /// or a body that will not parse ([`SovdClientError::ParseError`]) proves the
 /// server is UP, so it is NEVER a down observation (that conflation was the old
-/// vacuous-pass hole).
-fn is_connect_level(e: &SovdClientError) -> bool {
+/// vacuous-pass hole). Also the "the reboot cut the call" classifier for the
+/// node-restart PUT (see `FlashEngine::reset_all`).
+pub fn is_connect_level(e: &SovdClientError) -> bool {
     matches!(
         e,
         SovdClientError::HttpError(_)
@@ -560,12 +587,17 @@ fn is_connect_level(e: &SovdClientError) -> bool {
 
 /// Name what the witness never saw, for the timeout error (fix: "an error that
 /// names what was missing").
-fn witness_timeout_reason(had_boot_baseline: bool, saw_down: bool) -> String {
+fn witness_timeout_reason(had_boot_baseline: bool, saw_down: bool, kind: WitnessKind) -> String {
     let boot = if had_boot_baseline {
         "boot id(s) captured but never rotated"
     } else {
         "node_boot_id absent on the wire"
     };
+    if kind == WitnessKind::RebootOnly {
+        // A removal witness has only the node-nonce half — naming down→up, which
+        // it never uses, would misdescribe what was missing.
+        return format!("no reboot witness: {boot}");
+    }
     let downup = if saw_down {
         "down observed but the node never came back ready"
     } else {
@@ -583,6 +615,10 @@ fn witness_timeout_reason(had_boot_baseline: bool, saw_down: bool) -> String {
 /// - an OBSERVED connect-level down→up transition (the node was seen unreachable,
 ///   then answered ready) — the fallback for components with no boot-id witness.
 ///
+/// A [`WitnessKind::RebootOnly`] witness (a Removal, which never reports `ready`
+/// again) drops the `ready` conjunct and passes on the rotated `node_boot_id`
+/// alone — see [`witness_decision`].
+///
 /// Fail-closed: if the deadline expires with none of the above, it errors naming
 /// the missing witness. A boot id that merely *appears* (`None`→`Some`), an HTTP
 /// error response, or a transient non-connect read error do **not** pass — only a
@@ -597,6 +633,7 @@ pub async fn wait_activated(
     token: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    kind: WitnessKind,
 ) -> Result<(), EngineError> {
     let client = status_client(server_url, token, insecure, ca_cert_pem)?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
@@ -626,6 +663,7 @@ pub async fn wait_activated(
                     cur,
                     ready,
                     saw_down,
+                    kind,
                 ) {
                     Witness::NotYet => {}
                     pass => {
@@ -647,12 +685,15 @@ pub async fn wait_activated(
             }
         }
         if tokio::time::Instant::now() > deadline {
+            // A removal witness passes on the node nonce alone, so only ITS
+            // presence belongs in the reason.
+            let had_boot_baseline = match kind {
+                WitnessKind::RebootOnly => node_baseline.is_some(),
+                WitnessKind::RebootAndReady => node_baseline.is_some() || baseline.is_some(),
+            };
             return Err(EngineError::Timeout {
                 component: component_id.to_string(),
-                operation: witness_timeout_reason(
-                    node_baseline.is_some() || baseline.is_some(),
-                    saw_down,
-                ),
+                operation: witness_timeout_reason(had_boot_baseline, saw_down, kind),
             });
         }
     }
@@ -693,6 +734,7 @@ pub async fn restart_and_verify(
         token,
         insecure,
         ca_cert_pem,
+        WitnessKind::RebootAndReady,
     )
     .await
 }
@@ -1162,7 +1204,15 @@ mod tests {
     #[test]
     fn node_boot_id_transition_passes() {
         assert_eq!(
-            witness_decision(Some("A"), Some("B"), None, None, true, false),
+            witness_decision(
+                Some("A"),
+                Some("B"),
+                None,
+                None,
+                true,
+                false,
+                WitnessKind::RebootAndReady
+            ),
             Witness::PassNodeBootId
         );
     }
@@ -1170,7 +1220,15 @@ mod tests {
     #[test]
     fn heartbeat_boot_id_transition_passes() {
         assert_eq!(
-            witness_decision(None, None, Some(1), Some(2), true, false),
+            witness_decision(
+                None,
+                None,
+                Some(1),
+                Some(2),
+                true,
+                false,
+                WitnessKind::RebootAndReady
+            ),
             Witness::PassHeartbeatBootId
         );
     }
@@ -1180,12 +1238,28 @@ mod tests {
         // The vacuous-pass hole, closed: no boot-id baseline, server up, no
         // down→up ⇒ keep waiting (times out) — never a pass.
         assert_eq!(
-            witness_decision(None, None, None, None, true, false),
+            witness_decision(
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                WitnessKind::RebootAndReady
+            ),
             Witness::NotYet
         );
         // A boot id that merely *appears* (None→Some) is not a transition either.
         assert_eq!(
-            witness_decision(None, Some("A"), None, Some(1), true, false),
+            witness_decision(
+                None,
+                Some("A"),
+                None,
+                Some(1),
+                true,
+                false,
+                WitnessKind::RebootAndReady
+            ),
             Witness::NotYet
         );
     }
@@ -1193,7 +1267,15 @@ mod tests {
     #[test]
     fn unchanged_boot_ids_do_not_pass() {
         assert_eq!(
-            witness_decision(Some("A"), Some("A"), Some(1), Some(1), true, false),
+            witness_decision(
+                Some("A"),
+                Some("A"),
+                Some(1),
+                Some(1),
+                true,
+                false,
+                WitnessKind::RebootAndReady
+            ),
             Witness::NotYet
         );
     }
@@ -1202,12 +1284,28 @@ mod tests {
     fn connect_fail_then_up_passes_but_only_when_ready() {
         // down observed earlier this wait + now ready ⇒ down→up pass.
         assert_eq!(
-            witness_decision(None, None, None, None, true, true),
+            witness_decision(
+                None,
+                None,
+                None,
+                None,
+                true,
+                true,
+                WitnessKind::RebootAndReady
+            ),
             Witness::PassDownUp
         );
         // down observed but not yet ready ⇒ keep waiting (no vacuous pass).
         assert_eq!(
-            witness_decision(None, None, None, None, false, true),
+            witness_decision(
+                None,
+                None,
+                None,
+                None,
+                false,
+                true,
+                WitnessKind::RebootAndReady
+            ),
             Witness::NotYet
         );
     }
@@ -1215,7 +1313,15 @@ mod tests {
     #[test]
     fn not_ready_never_passes_even_with_a_boot_id_transition() {
         assert_eq!(
-            witness_decision(Some("A"), Some("B"), Some(1), Some(2), false, true),
+            witness_decision(
+                Some("A"),
+                Some("B"),
+                Some(1),
+                Some(2),
+                false,
+                true,
+                WitnessKind::RebootAndReady
+            ),
             Witness::NotYet
         );
     }
@@ -1227,8 +1333,59 @@ mod tests {
         // rotated node_boot_id ⇒ PassNodeBootId (the stronger witness wins over
         // the down→up fallback). The loop continues across the down-window.
         assert_eq!(
-            witness_decision(Some("old"), Some("new"), None, None, true, true),
+            witness_decision(
+                Some("old"),
+                Some("new"),
+                None,
+                None,
+                true,
+                true,
+                WitnessKind::RebootAndReady
+            ),
             Witness::PassNodeBootId
+        );
+    }
+
+    // --- witness_decision, RebootOnly: the Removal (disable) witness -----------
+
+    #[test]
+    fn removal_witness_passes_on_node_rotation_without_ready() {
+        // The field bug: a disabled component never reports `ready` again, so the
+        // ready-conjunct rule burned the whole activation budget on every run.
+        assert_eq!(
+            witness_decision(
+                Some("old"),
+                Some("new"),
+                None,
+                None,
+                false,
+                false,
+                WitnessKind::RebootOnly
+            ),
+            Witness::PassNodeBootId
+        );
+    }
+
+    #[test]
+    fn removal_witness_without_node_rotation_never_passes() {
+        // Fail-closed, same as ever: no rotated node nonce ⇒ no witness. The
+        // readiness-bound signals (heartbeat boot_id, down→up) do NOT stand in
+        // for it — a removed component cannot produce them honestly.
+        assert_eq!(
+            witness_decision(
+                Some("same"),
+                Some("same"),
+                Some(1),
+                Some(2),
+                true,
+                true,
+                WitnessKind::RebootOnly
+            ),
+            Witness::NotYet
+        );
+        assert_eq!(
+            witness_decision(None, None, None, None, true, true, WitnessKind::RebootOnly),
+            Witness::NotYet
         );
     }
 
@@ -1236,12 +1393,16 @@ mod tests {
     fn witness_timeout_reason_names_the_missing_witness() {
         // Repeated connect-fail-until-deadline ends the wait with a NAMED reason,
         // never a propagated read error.
-        let no_baseline = witness_timeout_reason(false, false);
+        let no_baseline = witness_timeout_reason(false, false, WitnessKind::RebootAndReady);
         assert!(no_baseline.contains("node_boot_id absent on the wire"));
         assert!(no_baseline.contains("no down→up transition observed"));
-        let down_but_not_ready = witness_timeout_reason(true, true);
+        let down_but_not_ready = witness_timeout_reason(true, true, WitnessKind::RebootAndReady);
         assert!(down_but_not_ready.contains("never rotated"));
         assert!(down_but_not_ready.contains("never came back ready"));
+        // A removal witness names only the half it uses.
+        let removal = witness_timeout_reason(true, true, WitnessKind::RebootOnly);
+        assert!(removal.contains("never rotated"));
+        assert!(!removal.contains("down→up"));
     }
 
     // --- is_connect_level: the down-half classifier ---------------------------
