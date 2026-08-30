@@ -529,7 +529,7 @@ async fn stage_all_stages_node_reboot_component_last_to_clear_owed_reboot_gate()
 /// Serve the real sovd-api with a middleware that reproduces the trial-recovery
 /// wire: the FIRST `/updates` open is refused "in trial mode"; the NODE-level
 /// `x-sumo-update-state` probe answers `state_reply` (`Some(json)` ⇒ 200, `None`
-/// ⇒ 404); `x-sumo-force-rollback` is counted and answered 204; every later open
+/// ⇒ 404); `x-ota-force-rollback` is counted and answered 204; every later open
 /// passes through to the real router. Returns `(url, force_rollback_hits,
 /// open_attempts, handle)`.
 async fn serve_trial_recovery(
@@ -572,7 +572,7 @@ async fn serve_trial_recovery(
                         };
                     }
                     // Count + answer the trial-recovery rollback (204, like the device).
-                    if method == axum::http::Method::PUT && path.ends_with("/x-sumo-force-rollback")
+                    if method == axum::http::Method::PUT && path.ends_with("/x-ota-force-rollback")
                     {
                         rollbacks.fetch_add(1, Ordering::SeqCst);
                         return axum::http::StatusCode::NO_CONTENT.into_response();
