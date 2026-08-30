@@ -35,7 +35,7 @@ struct TestBackend {
     transfer_counter: AtomicU32,
     fail_flash: RwLock<Option<String>>,
     // Heartbeat boot counter — bumped by ecu_reset so the engine's
-    // reboot-witness (`/status` x-sumo-runtime boot_id change) can pass
+    // reboot-witness (`/status` x-runtime boot_id change) can pass
     // against the in-process server, which never actually goes down.
     boot_id: AtomicU32,
 }
@@ -255,7 +255,7 @@ impl DiagnosticBackend for TestBackend {
     async fn read_entity_status(&self) -> BackendResult<EntityStatusBody> {
         let mut extensions = serde_json::Map::new();
         extensions.insert(
-            "x-sumo-runtime".into(),
+            "x-runtime".into(),
             serde_json::json!({ "boot_id": self.boot_id.load(Ordering::SeqCst) }),
         );
         Ok(EntityStatusBody {

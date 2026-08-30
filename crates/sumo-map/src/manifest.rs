@@ -1,4 +1,4 @@
-//! Typed model of the `x-sumo-installed-manifest` SOVD vendor read, plus the
+//! Typed model of the `x-ota-installed-manifest` SOVD vendor read, plus the
 //! signature-verify and release-diff logic.
 //!
 //! Contract: `sumo-machine-manager/specs/sovd-vm-app-installation.md` §17.
@@ -45,7 +45,7 @@ pub struct FileEntry {
     pub sha256: String,
 }
 
-/// The full `x-sumo-installed-manifest` read value.
+/// The full `x-ota-installed-manifest` read value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledManifest {
     #[serde(default)]

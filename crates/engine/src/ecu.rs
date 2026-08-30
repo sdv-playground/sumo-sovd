@@ -17,7 +17,7 @@ use crate::error::EngineError;
 use crate::types::{FlashJob, PayloadSource, UpdateType};
 
 /// Open a fresh `/updates` session. On the device's in-trial refusal, roll back
-/// the pending trial and retry — but ONLY after `x-sumo-update-state` positively
+/// the pending trial and retry — but ONLY after `x-ota-update-state` positively
 /// confirms this component is genuinely mid-trial. `force_rollback` is
 /// destructive, so an unconfirmed state (phase not `Trial`, the component absent,
 /// or an unreadable probe) must NOT trigger it: the refusal is surfaced with the
@@ -72,7 +72,7 @@ async fn open_update_or_rollback_pending(
                 Ok(s) => Err(EngineError::FlashFailed {
                     component: comp.to_string(),
                     message: format!(
-                        "device refused open as in-trial but x-sumo-update-state reports \
+                        "device refused open as in-trial but x-ota-update-state reports \
                          phase={} (components={:?}) — not auto-rolling back; inspect device \
                          state: {message}",
                         s.phase, s.components
@@ -81,7 +81,7 @@ async fn open_update_or_rollback_pending(
                 Err(e) => Err(EngineError::FlashFailed {
                     component: comp.to_string(),
                     message: format!(
-                        "device refused open as in-trial but the x-sumo-update-state probe \
+                        "device refused open as in-trial but the x-ota-update-state probe \
                          failed ({e}) — not auto-rolling back; inspect device state: {message}"
                     ),
                 }),
@@ -94,7 +94,7 @@ async fn open_update_or_rollback_pending(
     }
 }
 
-/// The node's `x-sumo-update-state` — the update-transaction `phase` plus the
+/// The node's `x-ota-update-state` — the update-transaction `phase` plus the
 /// component ids it covers (component-mgr `sovd/routes.rs` `UpdateStateResponse`).
 #[derive(serde::Deserialize)]
 struct NodeUpdateStateProbe {
@@ -103,7 +103,7 @@ struct NodeUpdateStateProbe {
     components: Vec<String>,
 }
 
-/// `GET /vehicle/v1/data/x-sumo-update-state` — a NODE-level vendor resource at
+/// `GET /vehicle/v1/data/x-ota-update-state` — a NODE-level vendor resource at
 /// the vehicle root, so it is read with a direct GET (not the per-component
 /// `SovdClient::read_data`). `Err` when the resource is unreachable/absent (an
 /// older device predating the field) or the body will not parse — the caller
@@ -115,30 +115,30 @@ async fn read_node_update_state(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<NodeUpdateStateProbe, EngineError> {
     let url = format!(
-        "{}/vehicle/v1/data/x-sumo-update-state",
+        "{}/vehicle/v1/data/x-ota-update-state",
         server_url.trim_end_matches('/')
     );
     // Same one-off CA-trust seam as the node-verdict POST.
-    let client = build_verdict_client(insecure, ca_cert_pem, "x-sumo-update-state")?;
+    let client = build_verdict_client(insecure, ca_cert_pem, "x-ota-update-state")?;
     let mut req = client.get(&url);
     if !token.is_empty() {
         req = req.bearer_auth(token);
     }
     let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
         component: "node".to_string(),
-        message: format!("x-sumo-update-state: {e}"),
+        message: format!("x-ota-update-state: {e}"),
     })?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(EngineError::FlashFailed {
             component: "node".to_string(),
-            message: format!("x-sumo-update-state: HTTP {status}: {body}"),
+            message: format!("x-ota-update-state: HTTP {status}: {body}"),
         });
     }
     serde_json::from_str(&body).map_err(|e| EngineError::FlashFailed {
         component: "node".to_string(),
-        message: format!("x-sumo-update-state: unparseable body ({e}): {body}"),
+        message: format!("x-ota-update-state: unparseable body ({e}): {body}"),
     })
 }
 
@@ -407,7 +407,7 @@ fn status_client(
     })
 }
 
-/// Read a component's heartbeat `boot_id` from `/status` `x-sumo-runtime`.
+/// Read a component's heartbeat `boot_id` from `/status` `x-runtime`.
 /// `None` when the component reports no heartbeat (offline, or a non-heartbeat
 /// component like host-os) or `/status` is unreachable — callers treat absence
 /// as "no boot_id witness" and fall back to the observed server down→up.
@@ -432,19 +432,19 @@ pub async fn read_boot_id(
     // capture. (The node-wide witness is `node_boot_id`; see `read_node_boot_id`.)
     match body
         .extensions
-        .get("x-sumo-runtime")
+        .get("x-runtime")
         .and_then(|r| r.get("boot_id"))
         .and_then(|v| v.as_u64())
     {
         Some(v) => Some(v as u32),
         None => {
-            debug!(component = %component_id, "x-sumo-runtime.boot_id absent — no heartbeat (or wire mismatch)");
+            debug!(component = %component_id, "x-runtime.boot_id absent — no heartbeat (or wire mismatch)");
             None
         }
     }
 }
 
-/// Read the NODE per-boot nonce from `/status` `x-sumo-runtime.node_boot_id` — a
+/// Read the NODE per-boot nonce from `/status` `x-runtime.node_boot_id` — a
 /// string (UUID) the machine-manager stamps on EVERY component's status, changing
 /// on every node reboot. This is the UNMISSABLE reboot witness for components with
 /// no per-component heartbeat (`host-os`): unlike the transient SOVD down→up window
@@ -473,7 +473,7 @@ pub async fn read_node_boot_id(
     // (once per baseline capture, i.e. once per component per wait).
     match body
         .extensions
-        .get("x-sumo-runtime")
+        .get("x-runtime")
         .and_then(|r| r.get("node_boot_id"))
         .and_then(|v| v.as_str())
     {
@@ -481,7 +481,7 @@ pub async fn read_node_boot_id(
         None => {
             warn!(
                 component = %component_id,
-                "x-sumo-runtime.node_boot_id absent — wire mismatch or MM predates it"
+                "x-runtime.node_boot_id absent — wire mismatch or MM predates it"
             );
             None
         }
@@ -611,7 +611,7 @@ pub async fn wait_activated(
         match client.read_status(component_id).await {
             Ok(body) => {
                 let ready = matches!(body.status, EntityStatus::Ready);
-                let runtime = body.extensions.get("x-sumo-runtime");
+                let runtime = body.extensions.get("x-runtime");
                 let cur = runtime
                     .and_then(|r| r.get("boot_id"))
                     .and_then(|v| v.as_u64())
@@ -1028,7 +1028,7 @@ pub async fn commit_node_trials(
 ) -> Result<(), EngineError> {
     node_verdict(
         server_url,
-        "x-sumo-commit-trials",
+        "x-ota-commit-trials",
         expected,
         token,
         insecure,
@@ -1048,7 +1048,7 @@ pub async fn rollback_node_trials(
 ) -> Result<(), EngineError> {
     node_verdict(
         server_url,
-        "x-sumo-rollback-trials",
+        "x-ota-rollback-trials",
         expected,
         token,
         insecure,
@@ -1087,7 +1087,7 @@ pub async fn trigger_local_restart(
 }
 
 /// Read a component's declared `reset_kind` off the `/updates` wire (the
-/// `x-sumo-reset-kind` vendor field SOVDd captures at register time). Servers
+/// `x-ota-reset-kind` vendor field SOVDd captures at register time). Servers
 /// that omit it deserialise to `Local`.
 pub async fn fetch_reset_kind(
     server_url: &str,
@@ -1276,8 +1276,8 @@ mod tests {
         OperationExecution {
             // execution_id == operation_id ⇒ a constant-id device (pre-3b436b3); the
             // correlation tests set a distinct execution_id for the unique-id case.
-            execution_id: "x-sumo-commit-trials".into(),
-            operation_id: "x-sumo-commit-trials".into(),
+            execution_id: "x-ota-commit-trials".into(),
+            operation_id: "x-ota-commit-trials".into(),
             status,
             result,
             error: None,
@@ -1293,15 +1293,13 @@ mod tests {
             OperationStatus::Completed,
             Some(serde_json::json!({ "committed": ["vm1", "vm2"], "skipped": [] })),
         );
-        assert!(
-            validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()]).is_ok()
-        );
+        assert!(validate_verdict_record(&rec, "x-ota-commit-trials", &["vm1".to_string()]).is_ok());
     }
 
     #[test]
     fn wrong_status_fails() {
         let rec = record(OperationStatus::Failed, None);
-        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &[]).unwrap_err();
+        let err = validate_verdict_record(&rec, "x-ota-commit-trials", &[]).unwrap_err();
         assert!(err.contains("not completed"), "got: {err}");
     }
 
@@ -1312,8 +1310,8 @@ mod tests {
             OperationStatus::Completed,
             Some(serde_json::json!({ "committed": ["vm2"], "skipped": ["vm1"] })),
         );
-        let err = validate_verdict_record(&rec, "x-sumo-commit-trials", &["vm1".to_string()])
-            .unwrap_err();
+        let err =
+            validate_verdict_record(&rec, "x-ota-commit-trials", &["vm1".to_string()]).unwrap_err();
         assert!(
             err.contains("vm1") && err.contains("committed"),
             "got: {err}"
@@ -1344,7 +1342,7 @@ mod tests {
                 &rec,
                 Some("n1"),
                 "n1",
-                "x-sumo-commit-trials",
+                "x-ota-commit-trials",
                 &["vm1".to_string()]
             ),
             VerdictOutcome::Valid {
@@ -1366,7 +1364,7 @@ mod tests {
                 &rec,
                 Some("other"),
                 "n1",
-                "x-sumo-commit-trials",
+                "x-ota-commit-trials",
                 &["vm1".to_string()]
             ),
             VerdictOutcome::Retry(_)
@@ -1383,7 +1381,7 @@ mod tests {
                 &rec,
                 None,
                 "n1",
-                "x-sumo-commit-trials",
+                "x-ota-commit-trials",
                 &["vm1".to_string()]
             ),
             VerdictOutcome::Valid {
@@ -1406,7 +1404,7 @@ mod tests {
                 &rec,
                 Some("n1"),
                 "n1",
-                "x-sumo-commit-trials",
+                "x-ota-commit-trials",
                 &["host".to_string()]
             ),
             VerdictOutcome::Valid {
@@ -1423,7 +1421,7 @@ mod tests {
                 &rec,
                 None,
                 "n1",
-                "x-sumo-commit-trials",
+                "x-ota-commit-trials",
                 &["host".to_string()]
             ),
             VerdictOutcome::Valid {
@@ -1449,7 +1447,7 @@ mod tests {
                 &rec,
                 None,
                 "n1",
-                "x-sumo-commit-trials",
+                "x-ota-commit-trials",
                 &["vm1".to_string(), "vm2".to_string()],
             ),
             VerdictOutcome::Valid {
@@ -1470,7 +1468,7 @@ mod tests {
             &rec,
             None,
             "n1",
-            "x-sumo-commit-trials",
+            "x-ota-commit-trials",
             &["vm1".to_string()],
         ) {
             VerdictOutcome::Fail(msg) => assert!(msg.contains("uncorrelated"), "got: {msg}"),
@@ -1484,7 +1482,7 @@ mod tests {
         // failure — Fail, never Retry (a fresh connection can't fix it).
         let rec = record(OperationStatus::Failed, None);
         assert!(matches!(
-            check_verdict(&rec, Some("n1"), "n1", "x-sumo-commit-trials", &[]),
+            check_verdict(&rec, Some("n1"), "n1", "x-ota-commit-trials", &[]),
             VerdictOutcome::Fail(_)
         ));
     }
@@ -1502,7 +1500,7 @@ mod tests {
                 &rec,
                 Some("n1"),
                 "n1",
-                "x-sumo-commit-trials",
+                "x-ota-commit-trials",
                 &["vm1".to_string()]
             ),
             VerdictOutcome::Fail(_)

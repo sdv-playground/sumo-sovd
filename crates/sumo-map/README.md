@@ -12,7 +12,7 @@ extend it as your mapping workflow grows.
 For each VM (SOVD component) it issues the vendor SOVD data read
 
 ```
-GET /vehicle/v1/components/{vm}/data/x-sumo-installed-manifest
+GET /vehicle/v1/components/{vm}/data/x-ota-installed-manifest
 ```
 
 whose `value` is the running/committed bank's **signed IVD manifest**:

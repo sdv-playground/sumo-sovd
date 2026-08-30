@@ -1,6 +1,6 @@
 //! `sumo-map` — inventory installed software across a device's VMs.
 //!
-//! Reads the `x-sumo-installed-manifest` SOVD vendor data point per VM
+//! Reads the `x-ota-installed-manifest` SOVD vendor data point per VM
 //! (the running/committed bank's signed IVD manifest), optionally verifies its
 //! `ivd-signing` signature, prints the per-file inventory, and can diff the
 //! installed set against a release to show the "what to flash" view.
@@ -17,14 +17,14 @@ use sovd_client::{SovdClient, SovdClientError};
 
 /// The SOVD vendor data point that carries the committed bank's signed IVD
 /// manifest (§17). Vendor-namespaced; lives entirely in vm-mgr.
-const INSTALLED_MANIFEST_PARAM_ID: &str = "x-sumo-installed-manifest";
+const INSTALLED_MANIFEST_PARAM_ID: &str = "x-ota-installed-manifest";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "sumo-map",
-    about = "Inventory installed software per VM via the x-sumo-installed-manifest SOVD read",
+    about = "Inventory installed software per VM via the x-ota-installed-manifest SOVD read",
     long_about = "Reads the signed IVD manifest each VM serves at \
-        GET /vehicle/v1/components/{vm}/data/x-sumo-installed-manifest, verifies it \
+        GET /vehicle/v1/components/{vm}/data/x-ota-installed-manifest, verifies it \
         against the device's ivd-signing public key, prints the per-file inventory, \
         and (with --release) diffs the installed set against a release to show what \
         would need flashing. Contract: sovd-vm-app-installation.md §17."

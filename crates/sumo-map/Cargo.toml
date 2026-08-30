@@ -3,7 +3,7 @@ name = "sumo-map"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SW-mapping CLI — inventories installed software per VM via the x-sumo-installed-manifest SOVD read, verifies its IVD signature, and diffs against a release"
+description = "SW-mapping CLI — inventories installed software per VM via the x-ota-installed-manifest SOVD read, verifies its IVD signature, and diffs against a release"
 
 [[bin]]
 name = "sumo-map"

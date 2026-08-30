@@ -79,7 +79,7 @@ impl TestBackend {
         }
     }
 
-    /// Make this backend report `x-sumo-update-mode` (supports_rollback +
+    /// Make this backend report `x-ota-update-mode` (supports_rollback +
     /// reset_kind) — for the no-mix guard + committed-singleshot reset tests.
     fn set_update_mode(&self, supports_rollback: bool, reset_kind: &str) {
         *self.update_mode.write() = Some((supports_rollback, reset_kind.to_string()));
@@ -102,11 +102,11 @@ impl DiagnosticBackend for TestBackend {
         Ok(vec![])
     }
     async fn read_data(&self, param_ids: &[String]) -> BackendResult<Vec<DataValue>> {
-        if param_ids.iter().any(|p| p == "x-sumo-update-mode") {
+        if param_ids.iter().any(|p| p == "x-ota-update-mode") {
             if let Some((supports_rollback, reset_kind)) = self.update_mode.read().clone() {
                 return Ok(vec![DataValue::new(
-                    "x-sumo-update-mode",
-                    "x-sumo-update-mode",
+                    "x-ota-update-mode",
+                    "x-ota-update-mode",
                     serde_json::json!({
                         "update_mode": if supports_rollback { "banked" } else { "singleshot" },
                         "supports_rollback": supports_rollback,
@@ -277,7 +277,7 @@ impl DiagnosticBackend for TestBackend {
             serde_json::json!(self.boot_id.load(Ordering::SeqCst)),
         );
         let mut extensions = serde_json::Map::new();
-        extensions.insert("x-sumo-runtime".into(), serde_json::Value::Object(runtime));
+        extensions.insert("x-runtime".into(), serde_json::Value::Object(runtime));
         Ok(EntityStatusBody {
             status: EntityStatus::Ready,
             extensions,
@@ -528,7 +528,7 @@ async fn stage_all_stages_node_reboot_component_last_to_clear_owed_reboot_gate()
 
 /// Serve the real sovd-api with a middleware that reproduces the trial-recovery
 /// wire: the FIRST `/updates` open is refused "in trial mode"; the NODE-level
-/// `x-sumo-update-state` probe answers `state_reply` (`Some(json)` ⇒ 200, `None`
+/// `x-ota-update-state` probe answers `state_reply` (`Some(json)` ⇒ 200, `None`
 /// ⇒ 404); `x-ota-force-rollback` is counted and answered 204; every later open
 /// passes through to the real router. Returns `(url, force_rollback_hits,
 /// open_attempts, handle)`.
@@ -563,7 +563,7 @@ async fn serve_trial_recovery(
                     // NODE-level update-state probe — a sumo-mm vendor route the
                     // reference sovd-api doesn't carry, served here.
                     if method == axum::http::Method::GET
-                        && path == "/vehicle/v1/data/x-sumo-update-state"
+                        && path == "/vehicle/v1/data/x-ota-update-state"
                     {
                         return match &*state {
                             Some(v) => axum::Json(v.clone()).into_response(),
@@ -602,7 +602,7 @@ async fn serve_trial_recovery(
 
 #[tokio::test]
 async fn open_refused_in_trial_with_confirming_state_rolls_back_and_retries() {
-    // x-sumo-update-state confirms vm1 is genuinely mid-trial ⇒ the EXISTING
+    // x-ota-update-state confirms vm1 is genuinely mid-trial ⇒ the EXISTING
     // recovery fires: force_rollback once, then the open is retried and staging
     // completes.
     let (url, rollbacks, opens, _h) = serve_trial_recovery(Some(serde_json::json!({
@@ -635,7 +635,7 @@ async fn open_refused_in_trial_with_confirming_state_rolls_back_and_retries() {
 
 #[tokio::test]
 async fn open_refused_in_trial_but_state_idle_does_not_roll_back() {
-    // The refusal said "trial mode" but x-sumo-update-state reports Idle (nothing
+    // The refusal said "trial mode" but x-ota-update-state reports Idle (nothing
     // in trial) — a stale message / different gate. Rollback is destructive, so it
     // must NOT fire; the refusal is surfaced with the observed state.
     let (url, rollbacks, _opens, _h) = serve_trial_recovery(Some(serde_json::json!({
@@ -692,7 +692,7 @@ async fn open_refused_in_trial_but_state_probe_fails_does_not_roll_back() {
 async fn engine_reboots_committed_singleshot_with_reset_kind() {
     // A singleshot component (e.g. RT/M7) commits in stage_all but still needs a
     // reboot to RUN the new firmware. reset_all must reset it — driven by the
-    // reset_kind it declares on x-sumo-update-mode — with no trial/verdict.
+    // reset_kind it declares on x-ota-update-mode — with no trial/verdict.
     let backend = Arc::new(TestBackend::new("rt"));
     backend.set_update_mode(false, "local");
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
@@ -839,7 +839,7 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let node_op = axum::Router::new().route(
-        "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+        "/vehicle/v1/operations/x-ota-commit-trials/executions",
         axum::routing::post(move || {
             let hits = hits_route.clone();
             async move {
@@ -849,8 +849,8 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
                 // that the expected component (vm1) landed in `committed`.
                 let now = chrono::Utc::now().to_rfc3339();
                 axum::Json(serde_json::json!({
-                    "execution_id": "x-sumo-commit-trials",
-                    "operation_id": "x-sumo-commit-trials",
+                    "execution_id": "x-ota-commit-trials",
+                    "operation_id": "x-ota-commit-trials",
                     "status": "completed",
                     "result": { "committed": ["vm1"], "skipped": [] },
                     "started_at": now,
@@ -912,7 +912,7 @@ async fn serve_nonce_echo_verdict(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let node_op = axum::Router::new().route(
-        "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+        "/vehicle/v1/operations/x-ota-commit-trials/executions",
         axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let hits = hits_route.clone();
             let echo_for = echo_for.clone();
@@ -927,7 +927,7 @@ async fn serve_nonce_echo_verdict(
                 let now = chrono::Utc::now().to_rfc3339();
                 axum::Json(serde_json::json!({
                     "execution_id": format!("exec-{n}"),
-                    "operation_id": "x-sumo-commit-trials",
+                    "operation_id": "x-ota-commit-trials",
                     "status": "completed",
                     "result": { "committed": ["vm1"], "skipped": [] },
                     "started_at": now,
@@ -1029,7 +1029,7 @@ async fn node_verdict_fails_after_one_retry_on_persistent_replay() {
 #[tokio::test]
 async fn commit_trials_does_not_clear_owed_reboot_gate_reflash_refused_cleanly() {
     // Field scenario: campaign 1 flashes "host" (banked, requires_ecu_reset) and
-    // commits its trial via the node-verdict path (x-sumo-commit-trials). Commit
+    // commits its trial via the node-verdict path (x-ota-commit-trials). Commit
     // makes the trial PERMANENT, but — mirroring the real device — does NOT clear
     // the node's owed-activation-reboot gate: that gate arms at `execute`
     // (staging-time; see
@@ -1046,20 +1046,20 @@ async fn commit_trials_does_not_clear_owed_reboot_gate_reflash_refused_cleanly()
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("host".into(), backend.clone());
 
-    // Node-verdict stub for x-sumo-commit-trials — same uncorrelated-but-exact-
+    // Node-verdict stub for x-ota-commit-trials — same uncorrelated-but-exact-
     // content-match shape as `node_reboot_step_commits_via_node_verdict_not_per_component`.
     let commit_hits = Arc::new(AtomicU32::new(0));
     let commit_hits_route = commit_hits.clone();
     let node_op = axum::Router::new().route(
-        "/vehicle/v1/operations/x-sumo-commit-trials/executions",
+        "/vehicle/v1/operations/x-ota-commit-trials/executions",
         axum::routing::post(move || {
             let commit_hits = commit_hits_route.clone();
             async move {
                 commit_hits.fetch_add(1, Ordering::SeqCst);
                 let now = chrono::Utc::now().to_rfc3339();
                 axum::Json(serde_json::json!({
-                    "execution_id": "x-sumo-commit-trials",
-                    "operation_id": "x-sumo-commit-trials",
+                    "execution_id": "x-ota-commit-trials",
+                    "operation_id": "x-ota-commit-trials",
                     "status": "completed",
                     "result": { "committed": ["host"], "skipped": [] },
                     "started_at": now,

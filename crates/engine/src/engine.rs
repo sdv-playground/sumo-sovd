@@ -17,7 +17,7 @@ use crate::types::{
     HealthCheck, TokenSource, UpdateType,
 };
 
-/// Subset of the device's `x-sumo-update-mode` payload the engine reads: the
+/// Subset of the device's `x-ota-update-mode` payload the engine reads: the
 /// no-mix guard uses `supports_rollback`; the singleshot reset uses `reset_kind`.
 #[derive(serde::Deserialize)]
 struct UpdateModeProbe {
@@ -82,7 +82,7 @@ impl FlashEngine {
         self
     }
 
-    /// No-mix guard: read each component's `x-sumo-update-mode` and reject a
+    /// No-mix guard: read each component's `x-ota-update-mode` and reject a
     /// plan that mixes rollbackable (banked) + irreversible (singleshot, e.g.
     /// the HSM keystore) components — a rollback would leave the device
     /// undefined. Components the device doesn't report are skipped (graceful on
@@ -94,7 +94,7 @@ impl FlashEngine {
         for job in &plan.jobs {
             let client = self.sovd_client(&job.component_id).await?;
             if let Ok(resp) = client
-                .read_data(&job.component_id, "x-sumo-update-mode")
+                .read_data(&job.component_id, "x-ota-update-mode")
                 .await
             {
                 if let Ok(mode) = serde_json::from_value::<UpdateModeProbe>(resp.value) {
@@ -244,7 +244,7 @@ impl FlashEngine {
         // Committed singleshot components (e.g. RT/M7) still need a reboot to RUN
         // the firmware just written, when they declare a reset_kind — there is no
         // trial/verdict (already committed). reset_kind comes off the stable
-        // `x-sumo-update-mode` (no live update to attach for a committed component).
+        // `x-ota-update-mode` (no live update to attach for a committed component).
         let mut ss_local: Vec<(String, Option<String>)> = Vec::new();
         let mut ss_by_ecu: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
         for e in ecus.iter().filter(|e| e.state == EcuState::Committed) {
@@ -921,7 +921,7 @@ impl FlashEngine {
     /// the non-arming ones first.
     ///
     /// The ordering key is the declared reset_kind read PRE-stage off the stable
-    /// `x-sumo-update-mode` capability (via [`component_reset_kind`]) — the only
+    /// `x-ota-update-mode` capability (via [`component_reset_kind`]) — the only
     /// pre-stage source, since `fetch_reset_kind` needs a live `/updates` session
     /// staging hasn't opened yet. Unreadable ⇒ treated as non-arming (kept early:
     /// the pre-fix behaviour, never worse). A single-job plan skips the probe
@@ -948,11 +948,11 @@ impl FlashEngine {
         order
     }
 
-    /// Read a component's `reset_kind` from the stable `x-sumo-update-mode`
+    /// Read a component's `reset_kind` from the stable `x-ota-update-mode`
     /// capability — available without a live update (unlike the per-update
     /// `/updates` status that `fetch_reset_kind` reads). Unknown / unreported /
     /// unreachable → `None` (no reboot).
-    /// The component's declared reset kind, off the stable `x-sumo-update-mode`
+    /// The component's declared reset kind, off the stable `x-ota-update-mode`
     /// data param. `None` = the probe FAILED (client/read/parse — each logged);
     /// the caller picks the safe default. A device legitimately declaring "no
     /// reset needed" comes back as `Some(ResetKind::None)` — the two must not
@@ -965,7 +965,7 @@ impl FlashEngine {
                 return None;
             }
         };
-        let resp = match client.read_data(comp, "x-sumo-update-mode").await {
+        let resp = match client.read_data(comp, "x-ota-update-mode").await {
             Ok(r) => r,
             Err(e) => {
                 warn!(component = %comp, error = %e, "update-mode probe: read failed");
@@ -1103,7 +1103,7 @@ mod tests {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_n {
                 Err(EngineError::Internal(
-                    "read boot id from https://dev/vehicle/v1/status/x-sumo-boot-id: \
+                    "read boot id from https://dev/vehicle/v1/status/x-boot-id: \
                      error sending request"
                         .into(),
                 ))

@@ -19,7 +19,7 @@ pub struct FlashPlan {
 /// `force_ecu_reset = true` (a banked group) coalesces the whole set through ONE
 /// node reboot; `false` (a singleshot component) respects each component's declared
 /// `reset_kind`. The driver groups an ordered plan into steps — singleshot ones
-/// alone, then the banked group — from the device's `x-sumo-update-mode`.
+/// alone, then the banked group — from the device's `x-ota-update-mode`.
 pub struct CampaignStep {
     pub jobs: Vec<FlashJob>,
     pub force_ecu_reset: bool,
