@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 # SOVD REST API client — same git source the orchestrator pins.
-sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

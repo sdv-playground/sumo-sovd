@@ -16,8 +16,8 @@ sumo-codec = { git = "https://github.com/tr-sdv-sandbox/sumo-rs.git", tag = "v0.
 sumo-sovd-flash-engine = { path = "../engine" }
 
 # SOVD REST API client
-sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
-sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-client = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
+sovd-core = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
@@ -31,6 +31,6 @@ async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", branch = "main" }
+sovd-api = { git = "https://github.com/sdv-playground/SOVDd.git", tag = "v0.1.0" }
 axum = "0.8"
 parking_lot = "0.12"
