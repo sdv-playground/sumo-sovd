@@ -235,73 +235,174 @@ pub async fn flash_ecu_to_staging(
 
     let update_id =
         open_update_or_rollback_pending(&flash_client, comp, &pkg_name, &pkg_version).await?;
+    let e_update_id = update_id.clone();
     info!(component = %comp, update_id = %update_id, "opened /updates session");
 
-    info!(component = %comp, size = job.envelope.len(), "uploading manifest");
-    flash_client
-        .upload_part("manifest", &job.envelope)
-        .await
-        .map_err(|e| EngineError::FlashFailed {
-            component: comp.clone(),
-            message: format!("manifest upload: {e}"),
-        })?;
+    // Stage to completion; on ANY staging failure, best-effort DELETE the
+    // session so the device aborts and wipes the staging bank dir — otherwise
+    // a failed upload (e.g. ENOSPC mid-payload) leaves partial files that eat
+    // the partition until the next flash's prepare_target reclaims them, which
+    // is exactly what makes the retry fail again on a full disk.
+    let staged: Result<EcuFlashResult, EngineError> = async {
+        info!(component = %comp, size = job.envelope.len(), "uploading manifest");
+        flash_client
+            .upload_part("manifest", &job.envelope)
+            .await
+            .map_err(|e| EngineError::FlashFailed {
+                component: comp.to_string(),
+                message: format!("manifest upload: {e}"),
+            })?;
 
-    if !opaque_firmware {
-        // SUIT-backed: upload detached payloads in component order, streaming
-        // files so a multi-hundred-MB image never lands in RAM.
-        for payload in &job.payloads {
-            // Size up front so the per-payload log reports it *before* a big
-            // (hundreds-of-MB) upload starts, then throughput after it finishes.
-            let size: u64 = match &payload.source {
-                PayloadSource::File(path) => tokio::fs::metadata(path)
-                    .await
-                    .map_err(|e| EngineError::FlashFailed {
-                        component: comp.clone(),
-                        message: format!("stat payload {}: {e}", path.display()),
-                    })?
-                    .len(),
-                PayloadSource::Bytes(bytes) => bytes.len() as u64,
-            };
-            let mb = size as f64 / 1_048_576.0;
-            info!(component = %comp, uri = %payload.uri, "uploading payload ({mb:.2} MB)");
-            let started = std::time::Instant::now();
-            match &payload.source {
-                PayloadSource::File(path) => {
-                    let file = tokio::fs::File::open(path).await.map_err(|e| {
-                        EngineError::FlashFailed {
-                            component: comp.clone(),
-                            message: format!("open payload {}: {e}", path.display()),
-                        }
-                    })?;
-                    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-                    flash_client
-                        .upload_part_stream(&payload.uri, body, Some(size))
+        if !opaque_firmware {
+            // SUIT-backed: upload detached payloads in component order, streaming
+            // files so a multi-hundred-MB image never lands in RAM.
+            for payload in &job.payloads {
+                // Size up front so the per-payload log reports it *before* a big
+                // (hundreds-of-MB) upload starts, then throughput after it finishes.
+                let size: u64 = match &payload.source {
+                    PayloadSource::File(path) => tokio::fs::metadata(path)
                         .await
                         .map_err(|e| EngineError::FlashFailed {
-                            component: comp.clone(),
-                            message: format!("payload upload ({}): {e}", payload.uri),
+                            component: comp.to_string(),
+                            message: format!("stat payload {}: {e}", path.display()),
+                        })?
+                        .len(),
+                    PayloadSource::Bytes(bytes) => bytes.len() as u64,
+                };
+                let mb = size as f64 / 1_048_576.0;
+                info!(component = %comp, uri = %payload.uri, "uploading payload ({mb:.2} MB)");
+                let started = std::time::Instant::now();
+                match &payload.source {
+                    PayloadSource::File(path) => {
+                        let file = tokio::fs::File::open(path).await.map_err(|e| {
+                            EngineError::FlashFailed {
+                                component: comp.to_string(),
+                                message: format!("open payload {}: {e}", path.display()),
+                            }
                         })?;
+                        let body =
+                            reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+                        flash_client
+                            .upload_part_stream(&payload.uri, body, Some(size))
+                            .await
+                            .map_err(|e| EngineError::FlashFailed {
+                                component: comp.to_string(),
+                                message: format!("payload upload ({}): {e}", payload.uri),
+                            })?;
+                    }
+                    PayloadSource::Bytes(bytes) => {
+                        flash_client
+                            .upload_part(&payload.uri, bytes)
+                            .await
+                            .map_err(|e| EngineError::FlashFailed {
+                                component: comp.to_string(),
+                                message: format!("payload upload ({}): {e}", payload.uri),
+                            })?;
+                    }
                 }
-                PayloadSource::Bytes(bytes) => {
-                    flash_client
-                        .upload_part(&payload.uri, bytes)
-                        .await
-                        .map_err(|e| EngineError::FlashFailed {
-                            component: comp.clone(),
-                            message: format!("payload upload ({}): {e}", payload.uri),
-                        })?;
-                }
+                let secs = started.elapsed().as_secs_f64();
+                let rate = if secs > 0.0 { mb / secs } else { 0.0 };
+                info!(
+                    component = %comp,
+                    uri = %payload.uri,
+                    "uploaded payload: {mb:.2} MB in {secs:.2}s ({rate:.2} MB/s)"
+                );
             }
-            let secs = started.elapsed().as_secs_f64();
-            let rate = if secs > 0.0 { mb / secs } else { 0.0 };
-            info!(
-                component = %comp,
-                uri = %payload.uri,
-                "uploaded payload: {mb:.2} MB in {secs:.2}s ({rate:.2} MB/s)"
-            );
+        }
+
+        stage_lifecycle(&flash_client, comp, update_type, update_id).await
+    }
+    .await;
+
+    match staged {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            if let Err(de) =
+                abort_update_session(server_url, comp, gw, &e_update_id, token, insecure, ca_cert_pem)
+                    .await
+            {
+                tracing::warn!(
+                    component = %comp,
+                    update_id = %e_update_id,
+                    error = %de,
+                    "staging failed AND session abort failed — partial staging may remain on device"
+                );
+            }
+            Err(e)
         }
     }
+}
 
+/// `DELETE /updates/{update_id}` — abort the session server-side (drops it
+/// from the updates store; the device's `abort_flash` wipes the staging bank
+/// dir). Bare reqwest with the same TLS/auth seams as `node_verdict`, not a
+/// `FlashClient` method, so it doesn't wait on an upstream SOVDd
+/// release/tag/bump wave for one verb. Best-effort: 404 (session already
+/// gone) is success.
+async fn abort_update_session(
+    server_url: &str,
+    comp: &str,
+    gateway_id: Option<&str>,
+    update_id: &str,
+    token: &str,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Result<(), EngineError> {
+    // Same base-prefix shape as FlashConfig::base_prefix — sub-entity
+    // components live under /components/{gateway}/apps/{app}.
+    let comp_path = match gateway_id {
+        Some(gw) => format!("{gw}/apps/{}", comp.replace('/', "%2F")),
+        None => comp.to_string(),
+    };
+    let url = format!(
+        "{}/vehicle/v1/components/{comp_path}/updates/{update_id}",
+        server_url.trim_end_matches('/')
+    );
+    let builder = reqwest::Client::builder();
+    let builder = match ca_cert_pem {
+        Some(pem) => {
+            builder.add_root_certificate(reqwest::Certificate::from_pem(pem).map_err(|e| {
+                EngineError::FlashFailed {
+                    component: comp.to_string(),
+                    message: format!("abort: parse ca_cert_pem: {e}"),
+                }
+            })?)
+        }
+        None => builder.danger_accept_invalid_certs(insecure),
+    };
+    let client = builder.build().map_err(|e| EngineError::FlashFailed {
+        component: comp.to_string(),
+        message: format!("abort: build client: {e}"),
+    })?;
+    let mut req = client.delete(&url);
+    if !token.is_empty() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
+        component: comp.to_string(),
+        message: format!("abort: {e}"),
+    })?;
+    let status = resp.status();
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        Ok(())
+    } else {
+        Err(EngineError::FlashFailed {
+            component: comp.to_string(),
+            message: format!("abort session: HTTP {status}"),
+        })
+    }
+}
+
+/// §7.18 prepare/execute lifecycle — called by [`flash_ecu_to_staging`]
+/// after the uploads succeed. The trailing half of what used to be inline
+/// in that function, extracted so the failure-abort wrapper above covers
+/// it too (execute failures must also abort + wipe, not just upload ones).
+async fn stage_lifecycle(
+    flash_client: &FlashClient,
+    comp: &str,
+    update_type: UpdateType,
+    update_id: String,
+) -> Result<EcuFlashResult, EngineError> {
     match update_type {
         UpdateType::Firmware | UpdateType::Application | UpdateType::Removal => {
             // §7.18.5 prepare: server runs verify_part + waits for staging.
@@ -310,12 +411,12 @@ pub async fn flash_ecu_to_staging(
                 .prepare()
                 .await
                 .map_err(|e| EngineError::FlashFailed {
-                    component: comp.clone(),
+                    component: comp.to_string(),
                     message: format!("prepare: {e}"),
                 })?;
             if prepared.status != "completed" {
                 return Err(EngineError::FlashFailed {
-                    component: comp.clone(),
+                    component: comp.to_string(),
                     message: format!(
                         "prepare ended at {}/{}: {}",
                         prepared.phase,
@@ -336,7 +437,7 @@ pub async fn flash_ecu_to_staging(
             info!(component = %comp, orchestrated = want_orchestrated, "running PUT /execute");
             let executed = flash_client.execute(want_orchestrated).await.map_err(|e| {
                 EngineError::FlashFailed {
-                    component: comp.clone(),
+                    component: comp.to_string(),
                     message: format!("execute: {e}"),
                 }
             })?;
@@ -351,7 +452,7 @@ pub async fn flash_ecu_to_staging(
                 }
                 _ => {
                     return Err(EngineError::FlashFailed {
-                        component: comp.clone(),
+                        component: comp.to_string(),
                         message: format!(
                             "execute ended at {}/{} substate={:?}: {}",
                             executed.phase,
