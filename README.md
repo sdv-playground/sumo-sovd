@@ -111,3 +111,7 @@ Launches:
 - [vm-mgr](https://github.com/sdv-playground/vm-mgr) — VM lifecycle manager with SUIT + SOVD
 - [SOVD Explorer](https://github.com/skarlsson/SOVD-explorer) — Diagnostic GUI
 - [SUMO specs](https://github.com/tr-sdv-sandbox/sumo) — Specifications and test vectors
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
