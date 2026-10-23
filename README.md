@@ -26,6 +26,10 @@ SOVD writes carry a JWT bearer (the flash engine's `TokenSource` seam);
 UDS session/security unlock happens transparently server-side in the
 SOVD server. There is no client-side seed/key choreography.
 
+Verdicts and the node update state use the x-update aliases
+(`x-update-verdict`, `x-update-state`); this needs sumo v0.1.13+ on the
+node and SOVDd v0.1.1+.
+
 ## Key Concepts
 
 - **Campaign manifest (L1)**: Declares which ECUs get which firmware, in what order. The manifest's SUIT command sequences (`install`, `validate`, `invoke`) program the update flow.

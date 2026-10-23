@@ -557,7 +557,7 @@ async fn stage_all_stages_node_reboot_component_last_to_clear_owed_reboot_gate()
 
 /// Serve the real sovd-api with a middleware that reproduces the trial-recovery
 /// wire: the FIRST `/updates` open is refused "in trial mode"; the NODE-level
-/// `x-ota-update-state` probe answers `state_reply` (`Some(json)` ⇒ 200, `None`
+/// `x-update-state` probe answers `state_reply` (`Some(json)` ⇒ 200, `None`
 /// ⇒ 404); `x-ota-force-rollback` is counted and answered 204; every later open
 /// passes through to the real router. Returns `(url, force_rollback_hits,
 /// open_attempts, handle)`.
@@ -592,7 +592,7 @@ async fn serve_trial_recovery(
                     // NODE-level update-state probe — a sumo-mm vendor route the
                     // reference sovd-api doesn't carry, served here.
                     if method == axum::http::Method::GET
-                        && path == "/vehicle/v1/data/x-ota-update-state"
+                        && path == "/vehicle/v1/data/x-update-state"
                     {
                         return match &*state {
                             Some(v) => axum::Json(v.clone()).into_response(),
@@ -631,7 +631,7 @@ async fn serve_trial_recovery(
 
 #[tokio::test]
 async fn open_refused_in_trial_with_confirming_state_rolls_back_and_retries() {
-    // x-ota-update-state confirms vm1 is genuinely mid-trial ⇒ the EXISTING
+    // x-update-state confirms vm1 is genuinely mid-trial ⇒ the EXISTING
     // recovery fires: force_rollback once, then the open is retried and staging
     // completes.
     let (url, rollbacks, opens, _h) = serve_trial_recovery(Some(serde_json::json!({
@@ -664,7 +664,7 @@ async fn open_refused_in_trial_with_confirming_state_rolls_back_and_retries() {
 
 #[tokio::test]
 async fn open_refused_in_trial_but_state_idle_does_not_roll_back() {
-    // The refusal said "trial mode" but x-ota-update-state reports Idle (nothing
+    // The refusal said "trial mode" but x-update-state reports Idle (nothing
     // in trial) — a stale message / different gate. Rollback is destructive, so it
     // must NOT fire; the refusal is surfaced with the observed state.
     let (url, rollbacks, _opens, _h) = serve_trial_recovery(Some(serde_json::json!({
@@ -1079,7 +1079,7 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
     // each component — the per-component `/updates` session is wiped by the
     // reboot, and the update *session* is the commit unit. `commit_all` under
     // `force_ecu_reset` must issue ONE entity-root node verdict and never touch
-    // the per-component commit path (`attach` + `spec_commit` → `commit_flash`).
+    // the per-component commit path (`attach` + `spec_verdict` → `commit_flash`).
     let backend = Arc::new(TestBackend::new("vm1"));
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), backend.clone());
@@ -1091,18 +1091,19 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let node_op = axum::Router::new().route(
-        "/vehicle/v1/operations/x-ota-commit-trials/executions",
-        axum::routing::post(move || {
+        "/vehicle/v1/operations/x-update-verdict/executions",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let hits = hits_route.clone();
             async move {
+                assert_eq!(body["verdict"], "commit");
                 hits.fetch_add(1, Ordering::SeqCst);
                 // A fresh, complete §7.14 execution record — what a real device
                 // returns. The engine now validates completed status + freshness +
                 // that the expected component (vm1) landed in `committed`.
                 let now = chrono::Utc::now().to_rfc3339();
                 axum::Json(serde_json::json!({
-                    "execution_id": "x-ota-commit-trials",
-                    "operation_id": "x-ota-commit-trials",
+                    "execution_id": "x-update-verdict",
+                    "operation_id": "x-update-verdict",
                     "status": "completed",
                     "result": { "committed": ["vm1"], "skipped": [] },
                     "started_at": now,
@@ -1152,6 +1153,56 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
     assert_eq!(*backend.flash_state.read(), FlashState::Complete);
 }
 
+#[tokio::test]
+async fn node_reboot_step_rolls_back_via_node_verdict() {
+    // The rollback twin of `node_reboot_step_commits_via_node_verdict_not_per_component`:
+    // `rollback_all` under `force_ecu_reset` issues ONE `x-update-verdict` with
+    // `"verdict":"rollback"`, and the acted-on set is read from `rolled_back` — the key
+    // comes from the verdict, not the operation id. Uncorrelated constant-id shape, so
+    // the engine adopts it only on an exact `rolled_back` match.
+    let backend = Arc::new(TestBackend::new("vm1"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), backend.clone());
+
+    let hits = Arc::new(AtomicU32::new(0));
+    let hits_route = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let node_op = axum::Router::new().route(
+        "/vehicle/v1/operations/x-update-verdict/executions",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let hits = hits_route.clone();
+            async move {
+                assert_eq!(body["verdict"], "rollback");
+                hits.fetch_add(1, Ordering::SeqCst);
+                let now = chrono::Utc::now().to_rfc3339();
+                axum::Json(serde_json::json!({
+                    "execution_id": "x-update-verdict",
+                    "operation_id": "x-update-verdict",
+                    "status": "completed",
+                    "result": { "rolled_back": ["vm1"], "skipped": [] },
+                    "started_at": now,
+                    "completed_at": now,
+                }))
+            }
+        }),
+    );
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op);
+    let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let eng = force_reset_engine(format!("http://127.0.0.1:{port}"));
+    let mut ecus = activated_vm1();
+    eng.rollback_all(&mut ecus).await.unwrap();
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "exactly one node-level verdict must be issued"
+    );
+    assert_eq!(ecus[0].state, EcuState::RolledBack);
+}
+
 /// Build a node-verdict mock whose commit handler echoes a nonce chosen by
 /// `echo_for(attempt_index, sent_nonce)` and counts hits — for the replay-retry
 /// tests. Returns the base URL + the hit counter.
@@ -1164,11 +1215,12 @@ async fn serve_nonce_echo_verdict(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let node_op = axum::Router::new().route(
-        "/vehicle/v1/operations/x-ota-commit-trials/executions",
+        "/vehicle/v1/operations/x-update-verdict/executions",
         axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let hits = hits_route.clone();
             let echo_for = echo_for.clone();
             async move {
+                assert_eq!(body["verdict"], "commit");
                 let n = hits.fetch_add(1, Ordering::SeqCst);
                 let sent = body
                     .get("nonce")
@@ -1179,7 +1231,7 @@ async fn serve_nonce_echo_verdict(
                 let now = chrono::Utc::now().to_rfc3339();
                 axum::Json(serde_json::json!({
                     "execution_id": format!("exec-{n}"),
-                    "operation_id": "x-ota-commit-trials",
+                    "operation_id": "x-update-verdict",
                     "status": "completed",
                     "result": { "committed": ["vm1"], "skipped": [] },
                     "started_at": now,
@@ -1281,7 +1333,7 @@ async fn node_verdict_fails_after_one_retry_on_persistent_replay() {
 #[tokio::test]
 async fn commit_trials_does_not_clear_owed_reboot_gate_reflash_refused_cleanly() {
     // Field scenario: campaign 1 flashes "host" (banked, requires_ecu_reset) and
-    // commits its trial via the node-verdict path (x-ota-commit-trials). Commit
+    // commits its trial via the node-verdict path (x-update-verdict). Commit
     // makes the trial PERMANENT, but — mirroring the real device — does NOT clear
     // the node's owed-activation-reboot gate: that gate arms at `execute`
     // (staging-time; see
@@ -1298,20 +1350,21 @@ async fn commit_trials_does_not_clear_owed_reboot_gate_reflash_refused_cleanly()
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("host".into(), backend.clone());
 
-    // Node-verdict stub for x-ota-commit-trials — same uncorrelated-but-exact-
+    // Node-verdict stub for x-update-verdict (commit) — same uncorrelated-but-exact-
     // content-match shape as `node_reboot_step_commits_via_node_verdict_not_per_component`.
     let commit_hits = Arc::new(AtomicU32::new(0));
     let commit_hits_route = commit_hits.clone();
     let node_op = axum::Router::new().route(
-        "/vehicle/v1/operations/x-ota-commit-trials/executions",
-        axum::routing::post(move || {
+        "/vehicle/v1/operations/x-update-verdict/executions",
+        axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
             let commit_hits = commit_hits_route.clone();
             async move {
+                assert_eq!(body["verdict"], "commit");
                 commit_hits.fetch_add(1, Ordering::SeqCst);
                 let now = chrono::Utc::now().to_rfc3339();
                 axum::Json(serde_json::json!({
-                    "execution_id": "x-ota-commit-trials",
-                    "operation_id": "x-ota-commit-trials",
+                    "execution_id": "x-update-verdict",
+                    "operation_id": "x-update-verdict",
                     "status": "completed",
                     "result": { "committed": ["host"], "skipped": [] },
                     "started_at": now,
@@ -1342,7 +1395,10 @@ async fn commit_trials_does_not_clear_owed_reboot_gate_reflash_refused_cleanly()
                 async move {
                     let method = req.method().clone();
                     let path = req.uri().path().to_string();
-                    if path.contains("rollback") {
+                    // The per-component verdict PUT (`…/updates/{id}/x-update-verdict`)
+                    // carries the word in its body; campaign 1 commits via the node
+                    // POST, so any per-component verdict here is a rollback remedy.
+                    if path.contains("rollback") || path.ends_with("/x-update-verdict") {
                         rollback_hits.fetch_add(1, Ordering::SeqCst);
                     }
                     let is_open = method == axum::http::Method::POST && path.ends_with("/updates");
