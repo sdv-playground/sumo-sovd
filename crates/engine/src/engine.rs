@@ -837,7 +837,7 @@ impl FlashEngine {
 
     // --- internals ---------------------------------------------------------
 
-    /// Commit one component — pure SOVD (attach + spec_commit). The driver
+    /// Commit one component — pure SOVD (attach + spec_verdict("commit")). The driver
     /// re-unlocks (UDS) before calling, if its security model needs it.
     async fn commit_one(
         &self,
@@ -861,14 +861,15 @@ impl FlashEngine {
                 component: component_id.to_string(),
                 message: format!("attach: {e}"),
             })?;
-        let body = flash_client
-            .spec_commit()
-            .await
-            .map_err(|e| EngineError::FlashFailed {
-                component: component_id.to_string(),
-                message: format!("spec_commit: {e}"),
-            })?;
-        // spec_commit polls until the execute phase is *terminal* — but "terminal"
+        let body =
+            flash_client
+                .spec_verdict("commit")
+                .await
+                .map_err(|e| EngineError::FlashFailed {
+                    component: component_id.to_string(),
+                    message: format!("spec_verdict(commit): {e}"),
+                })?;
+        // spec_verdict polls until the execute phase is *terminal* — but "terminal"
         // includes `failed`, which the poll returns as Ok(body). A bare terminal
         // is not success: require the verdict to have actually completed. (The
         // §7.14 execution-record correlation + `result` fields validated on the node
@@ -878,7 +879,7 @@ impl FlashEngine {
             return Err(EngineError::FlashFailed {
                 component: component_id.to_string(),
                 message: format!(
-                    "spec_commit ended at {}/{}{}",
+                    "spec_verdict(commit) ended at {}/{}{}",
                     body.phase,
                     body.status,
                     body.error
@@ -890,7 +891,7 @@ impl FlashEngine {
         Ok(())
     }
 
-    /// Rollback one component — pure SOVD (attach + spec_rollback).
+    /// Rollback one component — pure SOVD (attach + spec_verdict("rollback")).
     async fn rollback_one(
         &self,
         component_id: &str,
@@ -914,12 +915,12 @@ impl FlashEngine {
                 message: format!("attach: {e}"),
             })?;
         flash_client
-            .spec_rollback()
+            .spec_verdict("rollback")
             .await
             .map(|_| ())
             .map_err(|e| EngineError::FlashFailed {
                 component: component_id.to_string(),
-                message: format!("spec_rollback: {e}"),
+                message: format!("spec_verdict(rollback): {e}"),
             })
     }
 

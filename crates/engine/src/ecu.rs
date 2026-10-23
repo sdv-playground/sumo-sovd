@@ -17,7 +17,7 @@ use crate::error::EngineError;
 use crate::types::{FlashJob, PayloadSource, UpdateType};
 
 /// Open a fresh `/updates` session. On the device's in-trial refusal, roll back
-/// the pending trial and retry — but ONLY after `x-ota-update-state` positively
+/// the pending trial and retry — but ONLY after `x-update-state` positively
 /// confirms this component is genuinely mid-trial. `force_rollback` is
 /// destructive, so an unconfirmed state (phase not `Trial`, the component absent,
 /// or an unreadable probe) must NOT trigger it: the refusal is surfaced with the
@@ -72,7 +72,7 @@ async fn open_update_or_rollback_pending(
                 Ok(s) => Err(EngineError::FlashFailed {
                     component: comp.to_string(),
                     message: format!(
-                        "device refused open as in-trial but x-ota-update-state reports \
+                        "device refused open as in-trial but x-update-state reports \
                          phase={} (components={:?}) — not auto-rolling back; inspect device \
                          state: {message}",
                         s.phase, s.components
@@ -81,7 +81,7 @@ async fn open_update_or_rollback_pending(
                 Err(e) => Err(EngineError::FlashFailed {
                     component: comp.to_string(),
                     message: format!(
-                        "device refused open as in-trial but the x-ota-update-state probe \
+                        "device refused open as in-trial but the x-update-state probe \
                          failed ({e}) — not auto-rolling back; inspect device state: {message}"
                     ),
                 }),
@@ -94,16 +94,20 @@ async fn open_update_or_rollback_pending(
     }
 }
 
-/// The node's `x-ota-update-state` — the update-transaction `phase` plus the
+/// The node's `x-update-state` — the update-transaction `phase` plus the
 /// component ids it covers (component-mgr `sovd/routes.rs` `UpdateStateResponse`).
 #[derive(serde::Deserialize)]
 struct NodeUpdateStateProbe {
     phase: String,
     #[serde(default)]
     components: Vec<String>,
+    /// The node's boot id (x-update addition) — carried, not yet used.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub node_boot_id: Option<String>,
 }
 
-/// `GET /vehicle/v1/data/x-ota-update-state` — a NODE-level vendor resource at
+/// `GET /vehicle/v1/data/x-update-state` — a NODE-level vendor resource at
 /// the vehicle root, so it is read with a direct GET (not the per-component
 /// `SovdClient::read_data`). `Err` when the resource is unreachable/absent (an
 /// older device predating the field) or the body will not parse — the caller
@@ -115,30 +119,30 @@ async fn read_node_update_state(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<NodeUpdateStateProbe, EngineError> {
     let url = format!(
-        "{}/vehicle/v1/data/x-ota-update-state",
+        "{}/vehicle/v1/data/x-update-state",
         server_url.trim_end_matches('/')
     );
     // Same one-off CA-trust seam as the node-verdict POST.
-    let client = build_verdict_client(insecure, ca_cert_pem, "x-ota-update-state")?;
+    let client = build_verdict_client(insecure, ca_cert_pem, "x-update-state")?;
     let mut req = client.get(&url);
     if !token.is_empty() {
         req = req.bearer_auth(token);
     }
     let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
         component: "node".to_string(),
-        message: format!("x-ota-update-state: {e}"),
+        message: format!("x-update-state: {e}"),
     })?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(EngineError::FlashFailed {
             component: "node".to_string(),
-            message: format!("x-ota-update-state: HTTP {status}: {body}"),
+            message: format!("x-update-state: HTTP {status}: {body}"),
         });
     }
     serde_json::from_str(&body).map_err(|e| EngineError::FlashFailed {
         component: "node".to_string(),
-        message: format!("x-ota-update-state: unparseable body ({e}): {body}"),
+        message: format!("x-update-state: unparseable body ({e}): {body}"),
     })
 }
 
@@ -151,7 +155,7 @@ pub struct EcuFlashResult {
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
     /// `true` when `execute()` paused at `substate=awaiting-verdict` (banked +
-    /// orchestrated) — reset then `spec_commit`/`spec_rollback` follow.
+    /// orchestrated) — reset then `spec_verdict` follow.
     pub awaiting_verdict: bool,
 }
 
@@ -317,9 +321,16 @@ pub async fn flash_ecu_to_staging(
     match staged {
         Ok(result) => Ok(result),
         Err(e) => {
-            if let Err(de) =
-                abort_update_session(server_url, comp, gw, &e_update_id, token, insecure, ca_cert_pem)
-                    .await
+            if let Err(de) = abort_update_session(
+                server_url,
+                comp,
+                gw,
+                &e_update_id,
+                token,
+                insecure,
+                ca_cert_pem,
+            )
+            .await
             {
                 tracing::warn!(
                     component = %comp,
@@ -840,27 +851,56 @@ pub async fn restart_and_verify(
     .await
 }
 
+/// The node-level `x-update-verdict` operation id (one operation, the verdict word in
+/// the body).
+const NODE_VERDICT_OP: &str = "x-update-verdict";
+
+/// The verdict of a node-level `x-update-verdict` execution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NodeVerdict {
+    Commit,
+    Rollback,
+}
+
+impl NodeVerdict {
+    /// The `verdict` word in the POST body.
+    fn word(self) -> &'static str {
+        match self {
+            NodeVerdict::Commit => "commit",
+            NodeVerdict::Rollback => "rollback",
+        }
+    }
+
+    /// The execution record's `result` key listing the components acted on.
+    fn acted_key(self) -> &'static str {
+        match self {
+            NodeVerdict::Commit => "committed",
+            NodeVerdict::Rollback => "rolled_back",
+        }
+    }
+}
+
 /// The components a verdict record reports it acted on — the `committed` set for a
-/// commit, `rolled_back` for a rollback (`op_id` selects the key). `None` when the
+/// commit, `rolled_back` for a rollback (`verdict` selects the key). `None` when the
 /// record does not report the set at all.
-fn acted_components(record: &OperationExecution, op_id: &str) -> Option<Vec<String>> {
-    let key = if op_id.contains("rollback") {
-        "rolled_back"
-    } else {
-        "committed"
-    };
-    record.result.as_ref()?.get(key)?.as_array().map(|a| {
-        a.iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect()
-    })
+fn acted_components(record: &OperationExecution, verdict: NodeVerdict) -> Option<Vec<String>> {
+    record
+        .result
+        .as_ref()?
+        .get(verdict.acted_key())?
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
 }
 
 /// Validate a §7.14 node-verdict execution record's CONTENT — clock-free. Requires
 /// `status == completed` and, when the record reports the acted-on set, that every
 /// `expected` component appears in it (catches a verdict that acted on a stale/empty
-/// in-trial set — those show up under `skipped`, not `committed`). `op_id` selects the
-/// result key.
+/// in-trial set — those show up under `skipped`, not `committed`). `verdict` selects
+/// the result key.
 ///
 /// Freshness/replay is deliberately NOT judged here: device clocks are not comparable
 /// across boots or machines (every boot starts at a floor and ticks, so stamps from
@@ -873,7 +913,7 @@ fn acted_components(record: &OperationExecution, op_id: &str) -> Option<Vec<Stri
 /// Pure (all inputs are values) so the content rules are unit-testable.
 fn validate_verdict_record(
     record: &OperationExecution,
-    op_id: &str,
+    verdict: NodeVerdict,
     expected: &[String],
 ) -> Result<(), String> {
     if record.status != OperationStatus::Completed {
@@ -886,12 +926,8 @@ fn validate_verdict_record(
     // Content check: when the record reports the acted-on set, the components we asked
     // to commit must appear there — catches a verdict that acted on a stale or empty
     // in-trial set (they would show up under `skipped`, not `committed`).
-    if let Some(acted) = acted_components(record, op_id) {
-        let acted_key = if op_id.contains("rollback") {
-            "rolled_back"
-        } else {
-            "committed"
-        };
+    if let Some(acted) = acted_components(record, verdict) {
+        let acted_key = verdict.acted_key();
         for comp in expected {
             if !acted.iter().any(|a| acted_matches(comp, a)) {
                 return Err(format!(
@@ -973,7 +1009,7 @@ fn check_verdict(
     record: &OperationExecution,
     echoed: Option<&str>,
     sent_nonce: &str,
-    op_id: &str,
+    verdict: NodeVerdict,
     expected: &[String],
 ) -> VerdictOutcome {
     // A mismatched nonce echo is the replay symptom — a virgin connection sidesteps the
@@ -990,7 +1026,7 @@ fn check_verdict(
     let nonce_correlated = echoed == Some(sent_nonce);
     let execid_correlated = record.execution_id != record.operation_id;
     if nonce_correlated || execid_correlated {
-        return match validate_verdict_record(record, op_id, expected) {
+        return match validate_verdict_record(record, verdict, expected) {
             Ok(()) => VerdictOutcome::Valid {
                 adopted_uncorrelated: false,
             },
@@ -1001,7 +1037,7 @@ fn check_verdict(
     // judge freshness. Adopt ONLY on an exact content match — the acted-on set equals
     // the requested set — leaving the caller to warn; otherwise refuse, naming the
     // missing discriminator.
-    let acted = acted_components(record, op_id).unwrap_or_default();
+    let acted = acted_components(record, verdict).unwrap_or_default();
     let exact_match = !expected.is_empty()
         && acted.len() == expected.len()
         && expected
@@ -1027,8 +1063,9 @@ fn check_verdict(
 /// `/updates` sessions are gone after the reboot, so the orchestrator never
 /// re-attaches per component — it issues ONE verdict and the node fans it out
 /// from NV (the update *session* is the commit unit). Wire:
-/// `POST /vehicle/v1/operations/{op_id}/executions` (ISO 17978-3 §7.14, at the
-/// entity root).
+/// `POST /vehicle/v1/operations/x-update-verdict/executions` with body
+/// `{"verdict": "commit"|"rollback", "nonce": …}` (ISO 17978-3 §7.14, at the entity
+/// root).
 ///
 /// A 2xx is necessary but NOT sufficient: the §7.14 execution record in the body is
 /// parsed and [`check_verdict`]-checked — clock-free response CORRELATION (the device
@@ -1043,12 +1080,13 @@ fn check_verdict(
 /// never a silent log.
 async fn node_verdict(
     server_url: &str,
-    op_id: &str,
+    verdict: NodeVerdict,
     expected: &[String],
     token: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
+    let op_id = NODE_VERDICT_OP;
     let url = format!(
         "{}/vehicle/v1/operations/{op_id}/executions",
         server_url.trim_end_matches('/')
@@ -1068,7 +1106,7 @@ async fn node_verdict(
         let mut req = client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(serde_json::json!({ "nonce": nonce }).to_string());
+            .body(serde_json::json!({ "verdict": verdict.word(), "nonce": nonce }).to_string());
         if !token.is_empty() {
             req = req.bearer_auth(token);
         }
@@ -1092,7 +1130,7 @@ async fn node_verdict(
                 ),
             })?;
         let echoed = echoed_nonce(&body);
-        match check_verdict(&record, echoed.as_deref(), &nonce, op_id, expected) {
+        match check_verdict(&record, echoed.as_deref(), &nonce, verdict, expected) {
             VerdictOutcome::Valid {
                 adopted_uncorrelated,
             } => {
@@ -1171,7 +1209,7 @@ pub async fn commit_node_trials(
 ) -> Result<(), EngineError> {
     node_verdict(
         server_url,
-        "x-ota-commit-trials",
+        NodeVerdict::Commit,
         expected,
         token,
         insecure,
@@ -1191,7 +1229,7 @@ pub async fn rollback_node_trials(
 ) -> Result<(), EngineError> {
     node_verdict(
         server_url,
-        "x-ota-rollback-trials",
+        NodeVerdict::Rollback,
         expected,
         token,
         insecure,
@@ -1538,8 +1576,8 @@ mod tests {
         OperationExecution {
             // execution_id == operation_id ⇒ a constant-id device (pre-3b436b3); the
             // correlation tests set a distinct execution_id for the unique-id case.
-            execution_id: "x-ota-commit-trials".into(),
-            operation_id: "x-ota-commit-trials".into(),
+            execution_id: "x-update-verdict".into(),
+            operation_id: "x-update-verdict".into(),
             status,
             result,
             error: None,
@@ -1555,13 +1593,13 @@ mod tests {
             OperationStatus::Completed,
             Some(serde_json::json!({ "committed": ["vm1", "vm2"], "skipped": [] })),
         );
-        assert!(validate_verdict_record(&rec, "x-ota-commit-trials", &["vm1".to_string()]).is_ok());
+        assert!(validate_verdict_record(&rec, NodeVerdict::Commit, &["vm1".to_string()]).is_ok());
     }
 
     #[test]
     fn wrong_status_fails() {
         let rec = record(OperationStatus::Failed, None);
-        let err = validate_verdict_record(&rec, "x-ota-commit-trials", &[]).unwrap_err();
+        let err = validate_verdict_record(&rec, NodeVerdict::Commit, &[]).unwrap_err();
         assert!(err.contains("not completed"), "got: {err}");
     }
 
@@ -1573,9 +1611,38 @@ mod tests {
             Some(serde_json::json!({ "committed": ["vm2"], "skipped": ["vm1"] })),
         );
         let err =
-            validate_verdict_record(&rec, "x-ota-commit-trials", &["vm1".to_string()]).unwrap_err();
+            validate_verdict_record(&rec, NodeVerdict::Commit, &["vm1".to_string()]).unwrap_err();
         assert!(
             err.contains("vm1") && err.contains("committed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rollback_verdict_reads_rolled_back() {
+        // The acted-on key comes from the verdict: a rollback record reports `rolled_back`.
+        let rec = record(
+            OperationStatus::Completed,
+            Some(serde_json::json!({ "rolled_back": ["vm1"], "skipped": [] })),
+        );
+        assert_eq!(
+            acted_components(&rec, NodeVerdict::Rollback),
+            Some(vec!["vm1".to_string()])
+        );
+        assert!(validate_verdict_record(&rec, NodeVerdict::Rollback, &["vm1".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn rollback_verdict_rejects_a_committed_only_record() {
+        // A rollback answered with `committed` did not roll anything back.
+        let rec = record(
+            OperationStatus::Completed,
+            Some(serde_json::json!({ "committed": ["vm1"], "rolled_back": [], "skipped": [] })),
+        );
+        let err =
+            validate_verdict_record(&rec, NodeVerdict::Rollback, &["vm1".to_string()]).unwrap_err();
+        assert!(
+            err.contains("vm1") && err.contains("rolled_back"),
             "got: {err}"
         );
     }
@@ -1604,7 +1671,7 @@ mod tests {
                 &rec,
                 Some("n1"),
                 "n1",
-                "x-ota-commit-trials",
+                NodeVerdict::Commit,
                 &["vm1".to_string()]
             ),
             VerdictOutcome::Valid {
@@ -1626,7 +1693,7 @@ mod tests {
                 &rec,
                 Some("other"),
                 "n1",
-                "x-ota-commit-trials",
+                NodeVerdict::Commit,
                 &["vm1".to_string()]
             ),
             VerdictOutcome::Retry(_)
@@ -1639,13 +1706,7 @@ mod tests {
         // record is our direct response (rule 2), accepted on content.
         let rec = unique_record(&["vm1"]);
         assert_eq!(
-            check_verdict(
-                &rec,
-                None,
-                "n1",
-                "x-ota-commit-trials",
-                &["vm1".to_string()]
-            ),
+            check_verdict(&rec, None, "n1", NodeVerdict::Commit, &["vm1".to_string()]),
             VerdictOutcome::Valid {
                 adopted_uncorrelated: false
             }
@@ -1666,7 +1727,7 @@ mod tests {
                 &rec,
                 Some("n1"),
                 "n1",
-                "x-ota-commit-trials",
+                NodeVerdict::Commit,
                 &["host".to_string()]
             ),
             VerdictOutcome::Valid {
@@ -1679,13 +1740,7 @@ mod tests {
             Some(serde_json::json!({ "committed": ["host-os"], "skipped": [] })),
         );
         assert_eq!(
-            check_verdict(
-                &rec,
-                None,
-                "n1",
-                "x-ota-commit-trials",
-                &["host".to_string()]
-            ),
+            check_verdict(&rec, None, "n1", NodeVerdict::Commit, &["host".to_string()]),
             VerdictOutcome::Valid {
                 adopted_uncorrelated: true
             }
@@ -1709,7 +1764,7 @@ mod tests {
                 &rec,
                 None,
                 "n1",
-                "x-ota-commit-trials",
+                NodeVerdict::Commit,
                 &["vm1".to_string(), "vm2".to_string()],
             ),
             VerdictOutcome::Valid {
@@ -1726,13 +1781,7 @@ mod tests {
             // committed a DIFFERENT set than requested.
             Some(serde_json::json!({ "committed": ["vm2"], "skipped": ["vm1"] })),
         );
-        match check_verdict(
-            &rec,
-            None,
-            "n1",
-            "x-ota-commit-trials",
-            &["vm1".to_string()],
-        ) {
+        match check_verdict(&rec, None, "n1", NodeVerdict::Commit, &["vm1".to_string()]) {
             VerdictOutcome::Fail(msg) => assert!(msg.contains("uncorrelated"), "got: {msg}"),
             other => panic!("expected Fail(uncorrelated), got {other:?}"),
         }
@@ -1744,7 +1793,7 @@ mod tests {
         // failure — Fail, never Retry (a fresh connection can't fix it).
         let rec = record(OperationStatus::Failed, None);
         assert!(matches!(
-            check_verdict(&rec, Some("n1"), "n1", "x-ota-commit-trials", &[]),
+            check_verdict(&rec, Some("n1"), "n1", NodeVerdict::Commit, &[]),
             VerdictOutcome::Fail(_)
         ));
     }
@@ -1762,7 +1811,7 @@ mod tests {
                 &rec,
                 Some("n1"),
                 "n1",
-                "x-ota-commit-trials",
+                NodeVerdict::Commit,
                 &["vm1".to_string()]
             ),
             VerdictOutcome::Fail(_)
