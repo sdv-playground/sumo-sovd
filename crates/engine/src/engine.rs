@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sovd_client::SovdClient;
+use sovd_client::{FlashError, SovdClient};
 use tracing::{error, info, warn};
 
 use crate::ecu;
@@ -861,14 +861,16 @@ impl FlashEngine {
                 component: component_id.to_string(),
                 message: format!("attach: {e}"),
             })?;
-        let body =
-            flash_client
-                .spec_verdict("commit")
-                .await
-                .map_err(|e| EngineError::FlashFailed {
-                    component: component_id.to_string(),
-                    message: format!("spec_verdict(commit): {e}"),
-                })?;
+        let body = match flash_client.spec_verdict("commit").await {
+            // Transitional: hosts before the x-update aliases (sumo-machine-manager <
+            // v0.1.13 / SOVDd v0.1.0) answer 404 here; remove with the x-ota retirement.
+            Err(FlashError::Server { status: 404, .. }) => flash_client.spec_commit().await,
+            other => other,
+        }
+        .map_err(|e| EngineError::FlashFailed {
+            component: component_id.to_string(),
+            message: format!("spec_verdict(commit): {e}"),
+        })?;
         // spec_verdict polls until the execute phase is *terminal* — but "terminal"
         // includes `failed`, which the poll returns as Ok(body). A bare terminal
         // is not success: require the verdict to have actually completed. (The
@@ -914,14 +916,17 @@ impl FlashEngine {
                 component: component_id.to_string(),
                 message: format!("attach: {e}"),
             })?;
-        flash_client
-            .spec_verdict("rollback")
-            .await
-            .map(|_| ())
-            .map_err(|e| EngineError::FlashFailed {
-                component: component_id.to_string(),
-                message: format!("spec_verdict(rollback): {e}"),
-            })
+        match flash_client.spec_verdict("rollback").await {
+            // Transitional: hosts before the x-update aliases (sumo-machine-manager <
+            // v0.1.13 / SOVDd v0.1.0) answer 404 here; remove with the x-ota retirement.
+            Err(FlashError::Server { status: 404, .. }) => flash_client.spec_rollback().await,
+            other => other,
+        }
+        .map(|_| ())
+        .map_err(|e| EngineError::FlashFailed {
+            component: component_id.to_string(),
+            message: format!("spec_verdict(rollback): {e}"),
+        })
     }
 
     /// Roll back already-staged components after a mid-stage failure.
