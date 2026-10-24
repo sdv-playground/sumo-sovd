@@ -118,32 +118,58 @@ async fn read_node_update_state(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<NodeUpdateStateProbe, EngineError> {
-    let url = format!(
-        "{}/vehicle/v1/data/x-update-state",
-        server_url.trim_end_matches('/')
-    );
     // Same one-off CA-trust seam as the node-verdict POST.
     let client = build_verdict_client(insecure, ca_cert_pem, "x-update-state")?;
-    let mut req = client.get(&url);
-    if !token.is_empty() {
-        req = req.bearer_auth(token);
+    let base = server_url.trim_end_matches('/');
+    let mut resource = "x-update-state";
+    let (mut status, mut body) = send_node_request(
+        client.get(format!("{base}/vehicle/v1/data/{resource}")),
+        token,
+        resource,
+    )
+    .await?;
+    // Transitional: hosts before the x-update aliases (sumo-machine-manager <
+    // v0.1.13 / SOVDd v0.1.0) answer 404 here; remove with the x-ota retirement.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        resource = "x-ota-update-state";
+        info!("x-update-state not served (404) — falling back to legacy {resource}");
+        (status, body) = send_node_request(
+            client.get(format!("{base}/vehicle/v1/data/{resource}")),
+            token,
+            resource,
+        )
+        .await?;
     }
-    let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
-        component: "node".to_string(),
-        message: format!("x-update-state: {e}"),
-    })?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(EngineError::FlashFailed {
             component: "node".to_string(),
-            message: format!("x-update-state: HTTP {status}: {body}"),
+            message: format!("{resource}: HTTP {status}: {body}"),
         });
     }
     serde_json::from_str(&body).map_err(|e| EngineError::FlashFailed {
         component: "node".to_string(),
-        message: format!("x-update-state: unparseable body ({e}): {body}"),
+        message: format!("{resource}: unparseable body ({e}): {body}"),
     })
+}
+
+/// Send one node-level request (bearer attached when `token` is set) and return
+/// the status and body text. A transport failure is a `FlashFailed` naming `label`.
+async fn send_node_request(
+    req: reqwest::RequestBuilder,
+    token: &str,
+    label: &str,
+) -> Result<(reqwest::StatusCode, String), EngineError> {
+    let req = if token.is_empty() {
+        req
+    } else {
+        req.bearer_auth(token)
+    };
+    let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
+        component: "node".to_string(),
+        message: format!("{label}: {e}"),
+    })?;
+    let status = resp.status();
+    Ok((status, resp.text().await.unwrap_or_default()))
 }
 
 /// Result of staging one ECU (before reset).
@@ -871,6 +897,17 @@ impl NodeVerdict {
         }
     }
 
+    /// The legacy per-verdict x-ota operation id.
+    // Transitional: hosts before the x-update aliases (sumo-machine-manager <
+    // v0.1.13 / SOVDd v0.1.0) answer 404 on `x-update-verdict`; remove with the
+    // x-ota retirement.
+    fn legacy_op_id(self) -> &'static str {
+        match self {
+            NodeVerdict::Commit => "x-ota-commit-trials",
+            NodeVerdict::Rollback => "x-ota-rollback-trials",
+        }
+    }
+
     /// The execution record's `result` key listing the components acted on.
     fn acted_key(self) -> &'static str {
         match self {
@@ -1086,11 +1123,9 @@ async fn node_verdict(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let op_id = NODE_VERDICT_OP;
-    let url = format!(
-        "{}/vehicle/v1/operations/{op_id}/executions",
-        server_url.trim_end_matches('/')
-    );
+    let base = server_url.trim_end_matches('/');
+    let url_for = |op_id: &str| format!("{base}/vehicle/v1/operations/{op_id}/executions");
+    let mut op_id = NODE_VERDICT_OP;
     // Two attempts max: the field bug was a transport-level replay (a pooled
     // connection answering with a PRIOR execution's record). A VIRGIN connection
     // sidesteps it, so a stale/nonce-mismatched first response is retried ONCE.
@@ -1103,19 +1138,26 @@ async fn node_verdict(
         // Unique per POST — the device echoes it verbatim in the execution record,
         // so a matching echo proves the record answers THIS request, not a replay.
         let nonce = uuid::Uuid::new_v4().to_string();
-        let mut req = client
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(serde_json::json!({ "verdict": verdict.word(), "nonce": nonce }).to_string());
-        if !token.is_empty() {
-            req = req.bearer_auth(token);
+        let payload = serde_json::json!({ "verdict": verdict.word(), "nonce": nonce }).to_string();
+        let post = |op_id: &str| {
+            client
+                .post(url_for(op_id))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(payload.clone())
+        };
+        let (mut status, mut body) = send_node_request(post(op_id), token, op_id).await?;
+        // Transitional: hosts before the x-update aliases (sumo-machine-manager <
+        // v0.1.13 / SOVDd v0.1.0) answer 404 here; remove with the x-ota retirement.
+        // The legacy op takes the same body (it ignores `verdict`) and answers the
+        // same record shape.
+        if status == reqwest::StatusCode::NOT_FOUND && op_id == NODE_VERDICT_OP {
+            op_id = verdict.legacy_op_id();
+            info!(
+                op = op_id,
+                "x-update-verdict not served (404) — falling back to legacy op"
+            );
+            (status, body) = send_node_request(post(op_id), token, op_id).await?;
         }
-        let resp = req.send().await.map_err(|e| EngineError::FlashFailed {
-            component: "node".to_string(),
-            message: format!("{op_id}: {e}"),
-        })?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(EngineError::FlashFailed {
                 component: "node".to_string(),

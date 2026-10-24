@@ -28,7 +28,8 @@ SOVD server. There is no client-side seed/key choreography.
 
 Verdicts and the node update state use the x-update aliases
 (`x-update-verdict`, `x-update-state`); this needs sumo v0.1.13+ on the
-node and SOVDd v0.1.1+.
+node and SOVDd v0.1.1+. Until the x-ota retirement, a 404 on an x-update
+route is retried once on the legacy x-ota route, so older hosts keep working.
 
 ## Key Concepts
 
