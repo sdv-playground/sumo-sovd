@@ -26,10 +26,11 @@ SOVD writes carry a JWT bearer (the flash engine's `TokenSource` seam);
 UDS session/security unlock happens transparently server-side in the
 SOVD server. There is no client-side seed/key choreography.
 
-Verdicts and the node update state use the x-update aliases
-(`x-update-verdict`, `x-update-state`); this needs sumo v0.1.13+ on the
-node and SOVDd v0.1.1+. Until the x-ota retirement, a 404 on an x-update
-route is retried once on the legacy x-ota route, so older hosts keep working.
+Verdicts use the x-update verbs (`x-update-commit`, `x-update-rollback`)
+and the node update state `x-update-state`; this needs sumo v0.1.19+ on the
+node and SOVDd v0.1.2+. Until the x-ota retirement, a 404 on an x-update
+route falls back to the older route (a node verdict tries `x-update-verdict`,
+then the x-ota op), so older hosts keep working.
 
 ## Key Concepts
 

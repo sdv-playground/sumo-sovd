@@ -181,7 +181,7 @@ pub struct EcuFlashResult {
     pub active_version: Option<String>,
     pub previous_version: Option<String>,
     /// `true` when `execute()` paused at `substate=awaiting-verdict` (banked +
-    /// orchestrated) — reset then `spec_verdict` follow.
+    /// orchestrated) — reset then the verdict follow.
     pub awaiting_verdict: bool,
 }
 
@@ -877,11 +877,13 @@ pub async fn restart_and_verify(
     .await
 }
 
-/// The node-level `x-update-verdict` operation id (one operation, the verdict word in
-/// the body).
+/// The single node-level verdict operation id (the verdict word in the body) of machine
+/// managers before v0.1.19.
+// Transitional: those hosts answer 404 on `x-update-commit` / `x-update-rollback`;
+// remove with the x-ota retirement.
 const NODE_VERDICT_OP: &str = "x-update-verdict";
 
-/// The verdict of a node-level `x-update-verdict` execution.
+/// The verdict of a node-level `x-update-commit` / `x-update-rollback` execution.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NodeVerdict {
     Commit,
@@ -889,7 +891,27 @@ pub(crate) enum NodeVerdict {
 }
 
 impl NodeVerdict {
-    /// The `verdict` word in the POST body.
+    /// The node-level operation id of this verdict.
+    fn op_id(self) -> &'static str {
+        match self {
+            NodeVerdict::Commit => "x-update-commit",
+            NodeVerdict::Rollback => "x-update-rollback",
+        }
+    }
+
+    /// The operation tried when `op_id` answers 404: `x-update-commit` /
+    /// `x-update-rollback` → `x-update-verdict` → the legacy x-ota op → none.
+    fn fallback_op_id(self, op_id: &str) -> Option<&'static str> {
+        if op_id == self.op_id() {
+            Some(NODE_VERDICT_OP)
+        } else if op_id == NODE_VERDICT_OP {
+            Some(self.legacy_op_id())
+        } else {
+            None
+        }
+    }
+
+    /// The `verdict` word in the `x-update-verdict` / legacy POST body.
     fn word(self) -> &'static str {
         match self {
             NodeVerdict::Commit => "commit",
@@ -899,8 +921,8 @@ impl NodeVerdict {
 
     /// The legacy per-verdict x-ota operation id.
     // Transitional: hosts before the x-update aliases (sumo-machine-manager <
-    // v0.1.13 / SOVDd v0.1.0) answer 404 on `x-update-verdict`; remove with the
-    // x-ota retirement.
+    // v0.1.13 / SOVDd v0.1.0) answer 404 on `x-update-*`; remove with the x-ota
+    // retirement.
     fn legacy_op_id(self) -> &'static str {
         match self {
             NodeVerdict::Commit => "x-ota-commit-trials",
@@ -1100,9 +1122,10 @@ fn check_verdict(
 /// `/updates` sessions are gone after the reboot, so the orchestrator never
 /// re-attaches per component — it issues ONE verdict and the node fans it out
 /// from NV (the update *session* is the commit unit). Wire:
-/// `POST /vehicle/v1/operations/x-update-verdict/executions` with body
-/// `{"verdict": "commit"|"rollback", "nonce": …}` (ISO 17978-3 §7.14, at the entity
-/// root).
+/// `POST /vehicle/v1/operations/x-update-commit/executions` (or `x-update-rollback`)
+/// with body `{"nonce": …}` (ISO 17978-3 §7.14, at the entity root). A 404 falls back
+/// to `x-update-verdict` with `{"verdict": "commit"|"rollback", "nonce": …}`, then to
+/// the legacy x-ota trials op.
 ///
 /// A 2xx is necessary but NOT sufficient: the §7.14 execution record in the body is
 /// parsed and [`check_verdict`]-checked — clock-free response CORRELATION (the device
@@ -1125,7 +1148,7 @@ async fn node_verdict(
 ) -> Result<(), EngineError> {
     let base = server_url.trim_end_matches('/');
     let url_for = |op_id: &str| format!("{base}/vehicle/v1/operations/{op_id}/executions");
-    let mut op_id = NODE_VERDICT_OP;
+    let mut op_id = verdict.op_id();
     // Two attempts max: the field bug was a transport-level replay (a pooled
     // connection answering with a PRIOR execution's record). A VIRGIN connection
     // sidesteps it, so a stale/nonce-mismatched first response is retried ONCE.
@@ -1138,24 +1161,33 @@ async fn node_verdict(
         // Unique per POST — the device echoes it verbatim in the execution record,
         // so a matching echo proves the record answers THIS request, not a replay.
         let nonce = uuid::Uuid::new_v4().to_string();
-        let payload = serde_json::json!({ "verdict": verdict.word(), "nonce": nonce }).to_string();
+        // The per-verdict op carries only the nonce; `x-update-verdict` and the legacy
+        // op take the verdict word too (the legacy op ignores it).
         let post = |op_id: &str| {
+            let payload = if op_id == verdict.op_id() {
+                serde_json::json!({ "nonce": nonce })
+            } else {
+                serde_json::json!({ "verdict": verdict.word(), "nonce": nonce })
+            };
             client
                 .post(url_for(op_id))
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(payload.clone())
+                .body(payload.to_string())
         };
         let (mut status, mut body) = send_node_request(post(op_id), token, op_id).await?;
-        // Transitional: hosts before the x-update aliases (sumo-machine-manager <
-        // v0.1.13 / SOVDd v0.1.0) answer 404 here; remove with the x-ota retirement.
-        // The legacy op takes the same body (it ignores `verdict`) and answers the
+        // Transitional: older hosts answer 404 on the newer ops (see
+        // `fallback_op_id`); remove with the x-ota retirement. Every op answers the
         // same record shape.
-        if status == reqwest::StatusCode::NOT_FOUND && op_id == NODE_VERDICT_OP {
-            op_id = verdict.legacy_op_id();
+        while status == reqwest::StatusCode::NOT_FOUND {
+            let Some(next) = verdict.fallback_op_id(op_id) else {
+                break;
+            };
             info!(
-                op = op_id,
-                "x-update-verdict not served (404) — falling back to legacy op"
+                from = op_id,
+                op = next,
+                "node verdict op not served (404) — falling back"
             );
+            op_id = next;
             (status, body) = send_node_request(post(op_id), token, op_id).await?;
         }
         if !status.is_success() {
@@ -1618,8 +1650,8 @@ mod tests {
         OperationExecution {
             // execution_id == operation_id ⇒ a constant-id device (pre-3b436b3); the
             // correlation tests set a distinct execution_id for the unique-id case.
-            execution_id: "x-update-verdict".into(),
-            operation_id: "x-update-verdict".into(),
+            execution_id: "x-update-commit".into(),
+            operation_id: "x-update-commit".into(),
             status,
             result,
             error: None,
