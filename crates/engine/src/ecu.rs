@@ -6,6 +6,8 @@
 //! This module is the SOVD flash protocol only — it does **not** touch session
 //! or security state. The driver unlocks the ECU (UDS) before staging.
 
+use std::collections::{HashMap, HashSet};
+
 use sovd_client::flash::{FlashClient, FlashConfig, FlashError};
 use sovd_client::{OperationExecution, OperationStatus, SovdClient, SovdClientError};
 use sovd_core::EntityStatus;
@@ -105,6 +107,57 @@ struct NodeUpdateStateProbe {
     #[serde(default)]
     #[allow(dead_code)]
     pub node_boot_id: Option<String>,
+    /// Per-component bank facts (machine-manager v0.1.14+); absent on older servers.
+    #[serde(default)]
+    banks: Vec<BankProbe>,
+}
+
+/// One `banks[]` entry of `x-update-state` — only what part resume reads.
+#[derive(serde::Deserialize)]
+struct BankProbe {
+    id: String,
+    /// The bank being staged; `null` when nothing is staged. A half-staged bank
+    /// reports its verified parts with `sealed: false`.
+    #[serde(default)]
+    inactive: Option<BankSideProbe>,
+}
+
+#[derive(serde::Deserialize)]
+struct BankSideProbe {
+    #[serde(default)]
+    images: HashMap<String, ImageProbe>,
+}
+
+#[derive(serde::Deserialize)]
+struct ImageProbe {
+    /// Lowercase hex of the inner (plaintext) digest — the manifest's `image_digest`.
+    sha256: String,
+}
+
+/// The digests of the parts `comp`'s inactive bank already holds (sealed or
+/// not) — the payloads a resumed staging need not send again. Empty when the
+/// component has no bank entry or nothing is staged.
+fn staged_part_digests(state: &NodeUpdateStateProbe, comp: &str) -> HashSet<String> {
+    state
+        .banks
+        .iter()
+        .filter(|b| acted_matches(comp, &b.id))
+        .filter_map(|b| b.inactive.as_ref())
+        .flat_map(|side| side.images.values())
+        .map(|img| img.sha256.to_ascii_lowercase())
+        .collect()
+}
+
+/// `uri → lowercase hex image_digest` for every manifest component that states both.
+fn manifest_part_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, String> {
+    (0..manifest.component_count())
+        .filter_map(|i| {
+            let uri = manifest.uri(i)?;
+            let (digest,) = manifest.image_digest(i)?;
+            let hex = digest.bytes.iter().map(|b| format!("{b:02x}")).collect();
+            Some((uri.to_string(), hex))
+        })
+        .collect()
 }
 
 /// `GET /vehicle/v1/data/x-update-state` — a NODE-level vendor resource at
@@ -283,10 +336,40 @@ pub async fn flash_ecu_to_staging(
                 message: format!("manifest upload: {e}"),
             })?;
 
-        if !opaque_firmware {
+        if let (false, Some(manifest)) = (opaque_firmware, manifest.as_ref()) {
+            // Resume per part: skip the payloads whose digest the component's
+            // staging bank already holds (from an interrupted earlier attempt).
+            // The server would accept a re-send without writing; skipping only
+            // saves the transfer. Unreadable state ⇒ upload everything.
+            let present = if job.payloads.is_empty() {
+                HashSet::new()
+            } else {
+                match read_node_update_state(server_url, token, insecure, ca_cert_pem).await {
+                    Ok(state) => staged_part_digests(&state, comp),
+                    Err(e) => {
+                        debug!(component = %comp, "x-update-state unreadable ({e}) — uploading every part");
+                        HashSet::new()
+                    }
+                }
+            };
+            let digests = manifest_part_digests(manifest);
+            let pending: Vec<_> = job
+                .payloads
+                .iter()
+                .filter(|p| digests.get(&p.uri).is_none_or(|d| !present.contains(d)))
+                .collect();
+            if !job.payloads.is_empty() {
+                info!(
+                    component = %comp,
+                    "{} of {} parts already staged, uploading {}",
+                    job.payloads.len() - pending.len(),
+                    job.payloads.len(),
+                    pending.len()
+                );
+            }
             // SUIT-backed: upload detached payloads in component order, streaming
             // files so a multi-hundred-MB image never lands in RAM.
-            for payload in &job.payloads {
+            for payload in pending {
                 // Size up front so the per-payload log reports it *before* a big
                 // (hundreds-of-MB) upload starts, then throughput after it finishes.
                 let size: u64 = match &payload.source {
@@ -1411,6 +1494,47 @@ pub(crate) fn build_flash_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- staged_part_digests: the per-part resume present set -----------------
+
+    #[test]
+    fn staged_part_digests_reads_this_components_inactive_images() {
+        let state: NodeUpdateStateProbe = serde_json::from_value(serde_json::json!({
+            "phase": "Staging",
+            "banks": [
+                { "id": "other", "active": null,
+                  "inactive": { "images": { "a": { "size": 1, "sha256": "11" } }, "sealed": true } },
+                { "id": "vm1", "active": null,
+                  "inactive": { "images": {
+                      "a": { "size": 1, "sha256": "AA" },
+                      "b": { "size": 2, "sha256": "bb" } }, "sealed": false } },
+                { "id": "idle", "active": null, "inactive": null },
+            ],
+        }))
+        .unwrap();
+        let vm1 = staged_part_digests(&state, "vm1");
+        assert_eq!(
+            vm1,
+            HashSet::from(["aa".to_string(), "bb".to_string()]),
+            "unsealed parts count, digests lowercased, other components ignored"
+        );
+        assert!(
+            staged_part_digests(&state, "idle").is_empty(),
+            "inactive: null"
+        );
+        assert!(
+            staged_part_digests(&state, "absent").is_empty(),
+            "no bank entry"
+        );
+    }
+
+    #[test]
+    fn staged_part_digests_is_empty_without_banks() {
+        // A server predating `banks[]` still parses; nothing counts as staged.
+        let state: NodeUpdateStateProbe =
+            serde_json::from_value(serde_json::json!({ "phase": "Idle" })).unwrap();
+        assert!(staged_part_digests(&state, "vm1").is_empty());
+    }
 
     // --- witness_decision: the pure, fail-closed reboot-witness verdict -------
 
