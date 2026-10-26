@@ -984,6 +984,12 @@ impl NodeVerdict {
 
     /// The operation tried when `op_id` answers 404: `x-update-commit` /
     /// `x-update-rollback` → `x-update-verdict` → the legacy x-ota op → none.
+    ///
+    /// A 401/403 also walks to the next op when one exists: servers predating the
+    /// per-verdict ops map their path to the generic `operations:execute` scope,
+    /// which the delegate certificate may not grant, so they refuse before any 404.
+    /// The real fix is the key issuer granting that scope; on the last op a 401/403
+    /// still surfaces as an error.
     fn fallback_op_id(self, op_id: &str) -> Option<&'static str> {
         if op_id == self.op_id() {
             Some(NODE_VERDICT_OP)
@@ -1208,7 +1214,9 @@ fn check_verdict(
 /// `POST /vehicle/v1/operations/x-update-commit/executions` (or `x-update-rollback`)
 /// with body `{"nonce": …}` (ISO 17978-3 §7.14, at the entity root). A 404 falls back
 /// to `x-update-verdict` with `{"verdict": "commit"|"rollback", "nonce": …}`, then to
-/// the legacy x-ota trials op.
+/// the legacy x-ota trials op. A 401/403 falls back the same way while a next op
+/// exists — older servers scope the new path as `operations:execute`, which the
+/// delegate certificate may not grant (see [`NodeVerdict::fallback_op_id`]).
 ///
 /// A 2xx is necessary but NOT sufficient: the §7.14 execution record in the body is
 /// parsed and [`check_verdict`]-checked — clock-free response CORRELATION (the device
@@ -1258,18 +1266,31 @@ async fn node_verdict(
                 .body(payload.to_string())
         };
         let (mut status, mut body) = send_node_request(post(op_id), token, op_id).await?;
-        // Transitional: older hosts answer 404 on the newer ops (see
-        // `fallback_op_id`); remove with the x-ota retirement. Every op answers the
-        // same record shape.
-        while status == reqwest::StatusCode::NOT_FOUND {
+        // Transitional: older hosts answer 404 — or 401/403, scoping the new path as
+        // `operations:execute` — on the newer ops (see `fallback_op_id`); remove with
+        // the x-ota retirement. Every op answers the same record shape.
+        loop {
+            let refused = status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN;
+            if status != reqwest::StatusCode::NOT_FOUND && !refused {
+                break;
+            }
             let Some(next) = verdict.fallback_op_id(op_id) else {
                 break;
             };
-            info!(
-                from = op_id,
-                op = next,
-                "node verdict op not served (404) — falling back"
-            );
+            if refused {
+                warn!(
+                    from = op_id,
+                    op = next,
+                    "node verdict op refused ({status}) — falling back"
+                );
+            } else {
+                info!(
+                    from = op_id,
+                    op = next,
+                    "node verdict op not served (404) — falling back"
+                );
+            }
             op_id = next;
             (status, body) = send_node_request(post(op_id), token, op_id).await?;
         }

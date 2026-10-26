@@ -30,7 +30,10 @@ Verdicts use the x-update verbs (`x-update-commit`, `x-update-rollback`)
 and the node update state `x-update-state`; this needs sumo v0.1.19+ on the
 node and SOVDd v0.1.2+. Until the x-ota retirement, a 404 on an x-update
 route falls back to the older route (a node verdict tries `x-update-verdict`,
-then the x-ota op), so older hosts keep working.
+then the x-ota op), so older hosts keep working. A node verdict refused
+with 401/403 falls back the same way while an older op remains, since
+older servers scope the new verdict path as `operations:execute`, which
+the delegate certificate may not grant.
 
 Staging resumes per part: after the manifest, the engine reads the
 component's staging bank from `x-update-state` (`banks[].inactive.images`)

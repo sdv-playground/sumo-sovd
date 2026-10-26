@@ -1515,15 +1515,30 @@ async fn serve_node_verdict_chain(
     chain: &'static [&'static str],
     acted_key: &'static str,
 ) -> (String, Arc<RwLock<Vec<NodeVerdictPost>>>) {
+    let (served, unserved) = chain.split_last().unwrap();
+    let refused = unserved
+        .iter()
+        .map(|&op_id| (op_id, axum::http::StatusCode::NOT_FOUND))
+        .collect();
+    serve_node_verdict_hops(refused, Some(served), acted_key).await
+}
+
+/// Serve the real sovd-api plus node-verdict op stubs: each `refused` op answers its
+/// status, then `served` (if any) serves the verdict as in
+/// [`serve_node_verdict_chain`]. Returns the base URL + every POST in arrival order.
+async fn serve_node_verdict_hops(
+    refused: Vec<(&'static str, axum::http::StatusCode)>,
+    served: Option<&'static str>,
+    acted_key: &'static str,
+) -> (String, Arc<RwLock<Vec<NodeVerdictPost>>>) {
     use axum::response::IntoResponse;
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
     let posts = Arc::new(RwLock::new(Vec::<NodeVerdictPost>::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (served, unserved) = chain.split_last().unwrap();
     let mut node_op = axum::Router::new();
-    for &op_id in unserved {
+    for (op_id, status) in refused {
         let posts_route = posts.clone();
         node_op = node_op.route(
             &format!("/vehicle/v1/operations/{op_id}/executions"),
@@ -1531,12 +1546,17 @@ async fn serve_node_verdict_chain(
                 let posts = posts_route.clone();
                 async move {
                     posts.write().push((op_id.to_string(), body));
-                    (axum::http::StatusCode::NOT_FOUND, "no such operation").into_response()
+                    (status, format!("{op_id} refused")).into_response()
                 }
             }),
         );
     }
-    let op_id = *served;
+    let Some(op_id) = served else {
+        let app = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op);
+        let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        return (format!("http://127.0.0.1:{port}"), posts);
+    };
     let posts_route = posts.clone();
     let node_op = node_op.route(
         &format!("/vehicle/v1/operations/{op_id}/executions"),
@@ -1663,6 +1683,80 @@ async fn node_verdict_falls_back_to_x_ota_rollback_trials_on_404() {
         "exactly one legacy rollback-trials POST, after both x-update ops"
     );
     assert_eq!(ecus[0].state, EcuState::RolledBack);
+}
+
+#[tokio::test]
+async fn node_verdict_falls_back_to_x_update_verdict_on_401() {
+    // A server predating `x-update-commit` scopes its path as `operations:execute`,
+    // which the delegate certificate does not grant: 401 before any 404. The commit
+    // falls back to `x-update-verdict` and succeeds.
+    let (url, posts) = serve_node_verdict_hops(
+        vec![("x-update-commit", axum::http::StatusCode::UNAUTHORIZED)],
+        Some("x-update-verdict"),
+        "committed",
+    )
+    .await;
+
+    let eng = force_reset_engine(url);
+    let mut ecus = activated_vm1();
+    eng.commit_all(&mut ecus).await.unwrap();
+
+    assert_eq!(post_ops(&posts), ["x-update-commit", "x-update-verdict"]);
+    assert_eq!(posts.read()[1].1["verdict"], "commit");
+    assert_eq!(ecus[0].state, EcuState::Committed);
+}
+
+#[tokio::test]
+async fn node_verdict_rollback_falls_back_to_x_update_verdict_on_403() {
+    // The 403 flavour of the same refusal on `x-update-rollback`.
+    let (url, posts) = serve_node_verdict_hops(
+        vec![("x-update-rollback", axum::http::StatusCode::FORBIDDEN)],
+        Some("x-update-verdict"),
+        "rolled_back",
+    )
+    .await;
+
+    let eng = force_reset_engine(url);
+    let mut ecus = activated_vm1();
+    eng.rollback_all(&mut ecus).await.unwrap();
+
+    assert_eq!(post_ops(&posts), ["x-update-rollback", "x-update-verdict"]);
+    assert_eq!(posts.read()[1].1["verdict"], "rollback");
+    assert_eq!(ecus[0].state, EcuState::RolledBack);
+}
+
+#[tokio::test]
+async fn node_verdict_fails_when_every_op_is_refused() {
+    // A genuine auth failure: every op answers 401. The walk ends at the last op and
+    // the call fails with its error — no endless walk, no silent success.
+    let (url, posts) = serve_node_verdict_hops(
+        vec![
+            ("x-update-commit", axum::http::StatusCode::UNAUTHORIZED),
+            ("x-update-verdict", axum::http::StatusCode::UNAUTHORIZED),
+            ("x-ota-commit-trials", axum::http::StatusCode::UNAUTHORIZED),
+        ],
+        None,
+        "committed",
+    )
+    .await;
+
+    let eng = force_reset_engine(url);
+    let mut ecus = activated_vm1();
+    let err = eng.commit_all(&mut ecus).await.unwrap_err();
+
+    let EngineError::FlashFailed { message, .. } = &err else {
+        panic!("got {err:?}");
+    };
+    assert!(
+        message.contains("x-ota-commit-trials") && message.contains("401"),
+        "error names the last op and its status: {message}"
+    );
+    assert_eq!(
+        post_ops(&posts),
+        ["x-update-commit", "x-update-verdict", "x-ota-commit-trials"],
+        "each op tried exactly once"
+    );
+    assert_ne!(ecus[0].state, EcuState::Committed);
 }
 
 /// Build a node-verdict mock whose commit handler echoes a nonce chosen by
