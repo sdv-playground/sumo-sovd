@@ -22,7 +22,7 @@ use sovd_core::{
 
 use sumo_sovd_flash_engine::{
     CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
-    FlashPlan, HealthCheck, NoAuth, UpdateType,
+    FlashPlan, HealthCheck, NoAuth, Payload, PayloadSource, UpdateType,
 };
 
 // Off-board toolkit — builds + signs a real SUIT disable envelope so the
@@ -844,6 +844,176 @@ async fn open_refused_in_trial_but_state_probe_fails_does_not_roll_back() {
         msg.contains("probe") && msg.contains("not auto-rolling back"),
         "error must note the failed state probe: {msg}"
     );
+}
+
+// =============================================================================
+// Per-part resume — upload only the parts the component's staging bank lacks
+// =============================================================================
+
+/// Digest the resume tests' manifest states for part `n` (any 32 bytes do — the
+/// test backend never checks payload content).
+fn part_digest(n: u8) -> Vec<u8> {
+    vec![n; 32]
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A signed three-part (`#a`, `#b`, `#c`) firmware job for `vm1`, plus the trust
+/// anchor that validates it (so the SUIT path, not the opaque fallback, runs).
+fn three_part_job() -> (FlashJob, Vec<u8>) {
+    use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
+    let signing_key = keygen::generate_signing_key(keygen::ES256).unwrap();
+    let mut builder = MultiComponentBuilder::new()
+        .sequence_number(1)
+        .signing_time(1_700_000_000);
+    for (n, name) in [(1, "a"), (2, "b"), (3, "c")] {
+        builder = builder.add_component(ComponentSpec {
+            id: vec![name.to_string()],
+            digest: part_digest(n),
+            size: 4,
+            uri: format!("#{name}"),
+            encryption_info: None,
+        });
+    }
+    let envelope = builder.build(&signing_key).unwrap();
+    let payloads = ["#a", "#b", "#c"]
+        .iter()
+        .map(|uri| Payload {
+            uri: uri.to_string(),
+            source: PayloadSource::Bytes(vec![0xAB; 4]),
+        })
+        .collect();
+    let job = FlashJob {
+        component_id: "vm1".to_string(),
+        gateway_id: None,
+        envelope,
+        payloads,
+    };
+    (job, signing_key.public_key_bytes())
+}
+
+/// Serve the real sovd-api for `vm1` with the NODE-level `x-update-state`
+/// answering `state_reply` (`Some(json)` ⇒ 200, `None` ⇒ 404, as is the legacy
+/// alias) and every non-manifest part PUT logged by its decoded part id.
+async fn serve_part_resume(
+    state_reply: Option<serde_json::Value>,
+) -> (
+    String,
+    Arc<RwLock<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::response::IntoResponse;
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
+
+    let puts = Arc::new(RwLock::new(Vec::new()));
+    let state_reply = Arc::new(state_reply);
+    let (puts_l, state_l) = (puts.clone(), state_reply.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).layer(
+        axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let (puts, state) = (puts_l.clone(), state_l.clone());
+                async move {
+                    let method = req.method().clone();
+                    let path = req.uri().path().to_string();
+                    if method == axum::http::Method::GET
+                        && path.starts_with("/vehicle/v1/data/")
+                        && path.ends_with("update-state")
+                    {
+                        return match &*state {
+                            Some(v) if path == "/vehicle/v1/data/x-update-state" => {
+                                axum::Json(v.clone()).into_response()
+                            }
+                            _ => (axum::http::StatusCode::NOT_FOUND, "no such resource")
+                                .into_response(),
+                        };
+                    }
+                    if method == axum::http::Method::PUT {
+                        if let Some((_, part)) = path.split_once("/bulk-data/") {
+                            let part = part.replace("%23", "#");
+                            if part != "manifest" {
+                                puts.write().push(part);
+                            }
+                        }
+                    }
+                    next.run(req).await
+                }
+            },
+        ),
+    );
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), puts, handle)
+}
+
+/// Stage the three-part job against `state_reply`; return the payload PUT log.
+async fn staged_parts(state_reply: Option<serde_json::Value>) -> Vec<String> {
+    let (job, trust_anchor) = three_part_job();
+    let (url, puts, _h) = serve_part_resume(state_reply).await;
+    let eng = FlashEngine::new(
+        url,
+        Arc::new(NoAuth),
+        trust_anchor,
+        EngineTimeouts::default(),
+        false,
+        None,
+    );
+    let ecus = eng.stage_all(&FlashPlan { jobs: vec![job] }).await.unwrap();
+    assert_ne!(ecus[0].state, EcuState::Failed, "staging failed: {ecus:?}");
+    let log = puts.read().clone();
+    log
+}
+
+/// An x-update-state whose `vm1` inactive bank holds `images`.
+fn state_with_inactive(inactive: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "phase": "Staging",
+        "components": [],
+        "banks": [ { "id": "vm1", "active": null, "inactive": inactive,
+                     "in_trial": false, "pending_reset": false } ],
+    })
+}
+
+#[tokio::test]
+async fn part_resume_skips_a_part_the_bank_already_holds() {
+    // `#b` survived an interrupted attempt (unsealed bank) ⇒ only `#a` and `#c` go.
+    let parts = staged_parts(Some(state_with_inactive(serde_json::json!({
+        "bank": "B",
+        "images": { "b": { "size": 4, "sha256": hex(&part_digest(2)) } },
+        "sealed": false,
+    }))))
+    .await;
+    assert_eq!(parts, vec!["#a".to_string(), "#c".to_string()]);
+}
+
+#[tokio::test]
+async fn part_resume_uploads_every_part_when_state_is_not_served() {
+    let parts = staged_parts(None).await;
+    assert_eq!(parts, vec!["#a", "#b", "#c"]);
+}
+
+#[tokio::test]
+async fn part_resume_uploads_every_part_when_nothing_is_staged() {
+    let parts = staged_parts(Some(state_with_inactive(serde_json::Value::Null))).await;
+    assert_eq!(parts, vec!["#a", "#b", "#c"]);
+}
+
+#[tokio::test]
+async fn part_resume_uploads_a_present_part_whose_digest_differs() {
+    // A `b` from some other release is staged — matched by digest, not name, so
+    // the campaign's `#b` is still sent.
+    let parts = staged_parts(Some(state_with_inactive(serde_json::json!({
+        "bank": "B",
+        "images": { "b": { "size": 4, "sha256": hex(&part_digest(9)) } },
+        "sealed": false,
+    }))))
+    .await;
+    assert_eq!(parts, vec!["#a", "#b", "#c"]);
 }
 
 #[tokio::test]

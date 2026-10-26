@@ -32,6 +32,11 @@ node and SOVDd v0.1.2+. Until the x-ota retirement, a 404 on an x-update
 route falls back to the older route (a node verdict tries `x-update-verdict`,
 then the x-ota op), so older hosts keep working.
 
+Staging resumes per part: after the manifest, the engine reads the
+component's staging bank from `x-update-state` (`banks[].inactive.images`)
+and uploads only the payloads whose digest is not already there, so an
+interrupted rollout does not re-send what the node already holds.
+
 ## Key Concepts
 
 - **Campaign manifest (L1)**: Declares which ECUs get which firmware, in what order. The manifest's SUIT command sequences (`install`, `validate`, `invoke`) program the update flow.
