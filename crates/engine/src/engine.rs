@@ -837,7 +837,7 @@ impl FlashEngine {
 
     // --- internals ---------------------------------------------------------
 
-    /// Commit one component — pure SOVD (attach + spec_verdict("commit")). The driver
+    /// Commit one component — pure SOVD (attach + x-update-commit). The driver
     /// re-unlocks (UDS) before calling, if its security model needs it.
     async fn commit_one(
         &self,
@@ -861,17 +861,17 @@ impl FlashEngine {
                 component: component_id.to_string(),
                 message: format!("attach: {e}"),
             })?;
-        let body = match flash_client.spec_verdict("commit").await {
-            // Transitional: hosts before the x-update aliases (sumo-machine-manager <
-            // v0.1.13 / SOVDd v0.1.0) answer 404 here; remove with the x-ota retirement.
+        let body = match flash_client.spec_x_update_commit().await {
+            // Transitional: hosts before the x-update verbs (SOVDd < v0.1.2) answer
+            // 404 here; remove with the x-ota retirement.
             Err(FlashError::Server { status: 404, .. }) => flash_client.spec_commit().await,
             other => other,
         }
         .map_err(|e| EngineError::FlashFailed {
             component: component_id.to_string(),
-            message: format!("spec_verdict(commit): {e}"),
+            message: format!("x-update-commit: {e}"),
         })?;
-        // spec_verdict polls until the execute phase is *terminal* — but "terminal"
+        // The verdict polls until the execute phase is *terminal* — but "terminal"
         // includes `failed`, which the poll returns as Ok(body). A bare terminal
         // is not success: require the verdict to have actually completed. (The
         // §7.14 execution-record correlation + `result` fields validated on the node
@@ -881,7 +881,7 @@ impl FlashEngine {
             return Err(EngineError::FlashFailed {
                 component: component_id.to_string(),
                 message: format!(
-                    "spec_verdict(commit) ended at {}/{}{}",
+                    "x-update-commit ended at {}/{}{}",
                     body.phase,
                     body.status,
                     body.error
@@ -893,7 +893,7 @@ impl FlashEngine {
         Ok(())
     }
 
-    /// Rollback one component — pure SOVD (attach + spec_verdict("rollback")).
+    /// Rollback one component — pure SOVD (attach + x-update-rollback).
     async fn rollback_one(
         &self,
         component_id: &str,
@@ -916,16 +916,16 @@ impl FlashEngine {
                 component: component_id.to_string(),
                 message: format!("attach: {e}"),
             })?;
-        match flash_client.spec_verdict("rollback").await {
-            // Transitional: hosts before the x-update aliases (sumo-machine-manager <
-            // v0.1.13 / SOVDd v0.1.0) answer 404 here; remove with the x-ota retirement.
+        match flash_client.spec_x_update_rollback().await {
+            // Transitional: hosts before the x-update verbs (SOVDd < v0.1.2) answer
+            // 404 here; remove with the x-ota retirement.
             Err(FlashError::Server { status: 404, .. }) => flash_client.spec_rollback().await,
             other => other,
         }
         .map(|_| ())
         .map_err(|e| EngineError::FlashFailed {
             component: component_id.to_string(),
-            message: format!("spec_verdict(rollback): {e}"),
+            message: format!("x-update-rollback: {e}"),
         })
     }
 
