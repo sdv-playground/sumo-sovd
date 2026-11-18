@@ -5,7 +5,7 @@
 //! for `reset_kind` / `update_mode` (read off the wire here, never in the plan).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sovd_client::{FlashError, SovdClient};
 use tracing::{error, info, warn};
@@ -53,6 +53,11 @@ pub struct FlashEngine {
     /// onboard orchestrator never reboots a moving vehicle; activation waits for
     /// the next power cycle.
     force_ecu_reset: bool,
+    /// The server's node topology (where `x-update-state`, the node verdict ops and
+    /// the node restart live), discovered once off `GET /components` and shared by
+    /// every clone of this engine (they all talk to the same `server_url`). Unset
+    /// until a discovery succeeds — a failed one is retried on the next use.
+    node_topology: Arc<OnceLock<ecu::NodeTopology>>,
 }
 
 impl FlashEngine {
@@ -72,6 +77,7 @@ impl FlashEngine {
             insecure,
             ca_cert_pem,
             force_ecu_reset: false,
+            node_topology: Arc::new(OnceLock::new()),
         }
     }
 
@@ -156,7 +162,9 @@ impl FlashEngine {
             statuses[i].state = EcuState::Flashing;
 
             let token = self.token.token(comp).await?;
+            let topology = self.node_topology().await;
             match ecu::flash_ecu_to_staging(
+                &topology,
                 job,
                 &self.server_url,
                 &self.trust_anchor,
@@ -396,9 +404,11 @@ impl FlashEngine {
                 "issuing ECU-level restart (coalesced for RequiresEcuReset)"
             );
             let restart_key = gateway_id.as_deref().unwrap_or("");
+            let topology = self.node_topology().await;
+            let restart_at = gateway_id.as_deref().or(topology.restart_target());
             let restart = match self.sovd_client(restart_key).await {
                 Ok(client) => client
-                    .system_restart(gateway_id.as_deref(), "hard")
+                    .system_restart(restart_at, "hard")
                     .await
                     .map_err(|e| EngineError::FlashFailed {
                         component: comps.first().map(|(c, _)| c.clone()).unwrap_or_default(),
@@ -558,8 +568,10 @@ impl FlashEngine {
                 self.ca_cert_pem.as_deref(),
             )
             .await;
+            let topology = self.node_topology().await;
+            let restart_at = gateway_id.as_deref().or(topology.restart_target());
             let restart = match self.sovd_client(restart_key).await {
-                Ok(client) => match client.system_restart(gateway_id.as_deref(), "hard").await {
+                Ok(client) => match client.system_restart(restart_at, "hard").await {
                     Ok(()) => Ok(()),
                     // The device reboots kernel-direct, so when the reboot wins the
                     // race the connection dies before the response flushes. That is
@@ -641,7 +653,9 @@ impl FlashEngine {
     /// uncorrelated old-device response has nothing to exact-match, so it is refused.
     async fn commit_node_trials_for(&self, expected: &[String]) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
+        let topology = self.node_topology().await;
         ecu::commit_node_trials(
+            &topology,
             &self.server_url,
             expected,
             &token,
@@ -661,7 +675,9 @@ impl FlashEngine {
     /// caller expects in the record's `rolled_back` set.
     async fn rollback_node_trials_for(&self, expected: &[String]) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
+        let topology = self.node_topology().await;
         ecu::rollback_node_trials(
+            &topology,
             &self.server_url,
             expected,
             &token,
@@ -1063,6 +1079,33 @@ impl FlashEngine {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
+        }
+    }
+
+    /// The server's [`ecu::NodeTopology`], discovered once (`GET /components`) and
+    /// cached. A failed discovery is not cached: this call uses the root paths
+    /// (today's behaviour) and the next call retries.
+    async fn node_topology(&self) -> ecu::NodeTopology {
+        if let Some(t) = self.node_topology.get() {
+            return t.clone();
+        }
+        let token = match self.token.token("").await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "node discovery: no token — using the root paths for now");
+                return ecu::NodeTopology::Root;
+            }
+        };
+        match ecu::discover_node_topology(
+            &self.server_url,
+            &token,
+            self.insecure,
+            self.ca_cert_pem.as_deref(),
+        )
+        .await
+        {
+            Some(t) => self.node_topology.get_or_init(|| t).clone(),
+            None => ecu::NodeTopology::Root,
         }
     }
 

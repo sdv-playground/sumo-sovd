@@ -27,6 +27,7 @@ use crate::types::{FlashJob, PayloadSource, UpdateType};
 /// fails device-side (`NotInTrial`) and masks the true cause. Returns the new
 /// update_id.
 async fn open_update_or_rollback_pending(
+    topology: &NodeTopology,
     flash_client: &FlashClient,
     comp: &str,
     name: &str,
@@ -39,6 +40,7 @@ async fn open_update_or_rollback_pending(
             // update-state off the wire (connection recovered from the flash client).
             let cfg = flash_client.config();
             let state = read_node_update_state(
+                topology,
                 &cfg.connection.base_url,
                 cfg.connection.bearer.as_deref().unwrap_or(""),
                 cfg.insecure,
@@ -160,12 +162,113 @@ fn manifest_part_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, S
         .collect()
 }
 
-/// `GET /vehicle/v1/data/x-update-state` — a NODE-level vendor resource at
-/// the vehicle root, so it is read with a direct GET (not the per-component
-/// `SovdClient::read_data`). `Err` when the resource is unreachable/absent (an
-/// older device predating the field) or the body will not parse — the caller
-/// treats any failure as unconfirmed and refuses the destructive rollback.
+/// Where a server serves its node-level vendor resources (`x-update-state`, the
+/// node verdict operations, the node restart).
+///
+/// A node-topology server (supernova with `sovd_node`) lists exactly ONE component
+/// at `/vehicle/v1/components` — the node — and serves those resources on it
+/// (`/vehicle/v1/components/{node}/...`). Every other server (several components,
+/// or none: mmgr-cvc, older supernova builds on sumo-machine-manager ≤ v0.1.21)
+/// serves them at the entity root (`/vehicle/v1/...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NodeTopology {
+    /// The node resources live at the entity root.
+    Root,
+    /// The node resources live on the node component with this id.
+    Node(String),
+}
+
+impl NodeTopology {
+    /// Classify a `GET /vehicle/v1/components` body: exactly one `items` entry with
+    /// an `id` is the node; anything else (several, none, unparseable) is `Root`.
+    pub(crate) fn from_components_body(body: &serde_json::Value) -> Self {
+        match body
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+        {
+            Some([only]) => match only.get("id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => NodeTopology::Node(id.to_string()),
+                _ => NodeTopology::Root,
+            },
+            _ => NodeTopology::Root,
+        }
+    }
+
+    /// The URL prefix the node resources hang off: `{server}/vehicle/v1` (root) or
+    /// `{server}/vehicle/v1/components/{node}` (node form).
+    pub(crate) fn prefix(&self, server_url: &str) -> String {
+        let base = server_url.trim_end_matches('/');
+        match self {
+            NodeTopology::Root => format!("{base}/vehicle/v1"),
+            NodeTopology::Node(node) => format!("{base}/vehicle/v1/components/{node}"),
+        }
+    }
+
+    /// The gateway to address an entity-root restart at: the node in node form
+    /// (`PUT components/{node}/status/restart`), `None` (the root) otherwise.
+    pub(crate) fn restart_target(&self) -> Option<&str> {
+        match self {
+            NodeTopology::Root => None,
+            NodeTopology::Node(node) => Some(node),
+        }
+    }
+}
+
+/// Discover the server's [`NodeTopology`] off `GET /vehicle/v1/components`.
+/// `None` when the listing could not be read (transport failure, non-2xx, or an
+/// unparseable body) — the caller then uses the root paths for this call and
+/// retries discovery next time instead of caching a guess.
+pub(crate) async fn discover_node_topology(
+    server_url: &str,
+    token: &str,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Option<NodeTopology> {
+    let client = build_verdict_client(insecure, ca_cert_pem, "components").ok()?;
+    let base = server_url.trim_end_matches('/');
+    let (status, body) = match send_node_request(
+        client.get(format!("{base}/vehicle/v1/components")),
+        token,
+        "components",
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("node discovery failed ({e}) — using the root paths for now");
+            return None;
+        }
+    };
+    if !status.is_success() {
+        warn!(
+            "node discovery: GET /components answered HTTP {status} — using the root paths for now"
+        );
+        return None;
+    }
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => {
+            let topology = NodeTopology::from_components_body(&v);
+            info!(topology = ?topology, "discovered the SOVD node topology");
+            Some(topology)
+        }
+        Err(e) => {
+            warn!(
+                "node discovery: unparseable /components body ({e}) — using the root paths for now"
+            );
+            None
+        }
+    }
+}
+
+/// `GET {node}/data/x-update-state` — a NODE-level vendor resource (at the entity
+/// root, or on the node component in node form; see [`NodeTopology`]), so it is
+/// read with a direct GET (not the per-component `SovdClient::read_data`). `Err`
+/// when the resource is unreachable/absent (an older device predating the field)
+/// or the body will not parse — the caller treats any failure as unconfirmed and
+/// refuses the destructive rollback.
 async fn read_node_update_state(
+    topology: &NodeTopology,
     server_url: &str,
     token: &str,
     insecure: bool,
@@ -173,10 +276,10 @@ async fn read_node_update_state(
 ) -> Result<NodeUpdateStateProbe, EngineError> {
     // Same one-off CA-trust seam as the node-verdict POST.
     let client = build_verdict_client(insecure, ca_cert_pem, "x-update-state")?;
-    let base = server_url.trim_end_matches('/');
+    let prefix = topology.prefix(server_url);
     let mut resource = "x-update-state";
     let (mut status, mut body) = send_node_request(
-        client.get(format!("{base}/vehicle/v1/data/{resource}")),
+        client.get(format!("{prefix}/data/{resource}")),
         token,
         resource,
     )
@@ -187,7 +290,7 @@ async fn read_node_update_state(
         resource = "x-ota-update-state";
         info!("x-update-state not served (404) — falling back to legacy {resource}");
         (status, body) = send_node_request(
-            client.get(format!("{base}/vehicle/v1/data/{resource}")),
+            client.get(format!("{prefix}/data/{resource}")),
             token,
             resource,
         )
@@ -277,7 +380,8 @@ fn is_container_image_manifest(manifest: &sumo_onboard::Manifest) -> bool {
 /// Flash one job to staging — ends at AwaitingReboot for firmware updates.
 /// Does NOT reset the ECU (a campaign-level decision). **Precondition:** the
 /// driver has already unlocked the ECU (programming session + security).
-pub async fn flash_ecu_to_staging(
+pub(crate) async fn flash_ecu_to_staging(
+    topology: &NodeTopology,
     job: &FlashJob,
     server_url: &str,
     trust_anchor: &[u8],
@@ -317,7 +421,8 @@ pub async fn flash_ecu_to_staging(
     let flash_client = build_flash_client(server_url, comp, gw, token, insecure, ca_cert_pem)?;
 
     let update_id =
-        open_update_or_rollback_pending(&flash_client, comp, &pkg_name, &pkg_version).await?;
+        open_update_or_rollback_pending(topology, &flash_client, comp, &pkg_name, &pkg_version)
+            .await?;
     let e_update_id = update_id.clone();
     info!(component = %comp, update_id = %update_id, "opened /updates session");
 
@@ -344,7 +449,9 @@ pub async fn flash_ecu_to_staging(
             let present = if job.payloads.is_empty() {
                 HashSet::new()
             } else {
-                match read_node_update_state(server_url, token, insecure, ca_cert_pem).await {
+                match read_node_update_state(topology, server_url, token, insecure, ca_cert_pem)
+                    .await
+                {
                     Ok(state) => staged_part_digests(&state, comp),
                     Err(e) => {
                         debug!(component = %comp, "x-update-state unreadable ({e}) — uploading every part");
@@ -1212,7 +1319,8 @@ fn check_verdict(
 /// re-attaches per component — it issues ONE verdict and the node fans it out
 /// from NV (the update *session* is the commit unit). Wire:
 /// `POST /vehicle/v1/operations/x-update-commit/executions` (or `x-update-rollback`)
-/// with body `{"nonce": …}` (ISO 17978-3 §7.14, at the entity root). A 404 falls back
+/// with body `{"nonce": …}` (ISO 17978-3 §7.14, at the entity root — or on the node,
+/// `/vehicle/v1/components/{node}/operations/…`, in node form; see [`NodeTopology`]). A 404 falls back
 /// to `x-update-verdict` with `{"verdict": "commit"|"rollback", "nonce": …}`, then to
 /// the legacy x-ota trials op. A 401/403 falls back the same way while a next op
 /// exists — older servers scope the new path as `operations:execute`, which the
@@ -1230,6 +1338,7 @@ fn check_verdict(
 /// fan-out returns 5xx with the per-component errors; an unparseable body is an error,
 /// never a silent log.
 async fn node_verdict(
+    topology: &NodeTopology,
     server_url: &str,
     verdict: NodeVerdict,
     expected: &[String],
@@ -1237,8 +1346,8 @@ async fn node_verdict(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let base = server_url.trim_end_matches('/');
-    let url_for = |op_id: &str| format!("{base}/vehicle/v1/operations/{op_id}/executions");
+    let prefix = topology.prefix(server_url);
+    let url_for = |op_id: &str| format!("{prefix}/operations/{op_id}/executions");
     let mut op_id = verdict.op_id();
     // Two attempts max: the field bug was a transport-level replay (a pooled
     // connection answering with a PRIOR execution's record). A VIRGIN connection
@@ -1378,7 +1487,8 @@ fn build_verdict_client(
 /// Commit every in-trial component on the node in one verdict. `expected` are the
 /// component ids that must appear in the record's `committed` set (empty ⇒ the manual
 /// verb, correlation + completed status still enforced, no per-component content).
-pub async fn commit_node_trials(
+pub(crate) async fn commit_node_trials(
+    topology: &NodeTopology,
     server_url: &str,
     expected: &[String],
     token: &str,
@@ -1386,6 +1496,7 @@ pub async fn commit_node_trials(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
     node_verdict(
+        topology,
         server_url,
         NodeVerdict::Commit,
         expected,
@@ -1398,7 +1509,8 @@ pub async fn commit_node_trials(
 
 /// Roll back every in-trial component on the node in one verdict. `expected` are
 /// the component ids that must appear in the record's `rolled_back` set.
-pub async fn rollback_node_trials(
+pub(crate) async fn rollback_node_trials(
+    topology: &NodeTopology,
     server_url: &str,
     expected: &[String],
     token: &str,
@@ -1406,6 +1518,7 @@ pub async fn rollback_node_trials(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
     node_verdict(
+        topology,
         server_url,
         NodeVerdict::Rollback,
         expected,
@@ -1515,6 +1628,51 @@ pub(crate) fn build_flash_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- NodeTopology: discovery classification + node-resource paths ---------
+
+    #[test]
+    fn one_component_is_the_node() {
+        let body = serde_json::json!({ "items": [{ "id": "cvc", "name": "CVC" }] });
+        assert_eq!(
+            NodeTopology::from_components_body(&body),
+            NodeTopology::Node("cvc".into())
+        );
+    }
+
+    #[test]
+    fn several_or_no_components_are_the_root_form() {
+        for body in [
+            serde_json::json!({ "items": [{ "id": "host" }, { "id": "hsm" }] }),
+            serde_json::json!({ "items": [] }),
+            serde_json::json!({}),
+            serde_json::json!({ "items": [{ "name": "no id" }] }),
+            serde_json::json!({ "items": [{ "id": "" }] }),
+        ] {
+            assert_eq!(
+                NodeTopology::from_components_body(&body),
+                NodeTopology::Root,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_resource_prefix_per_topology() {
+        assert_eq!(
+            NodeTopology::Root.prefix("https://cvc:8443/"),
+            "https://cvc:8443/vehicle/v1"
+        );
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).prefix("https://cvc:8443"),
+            "https://cvc:8443/vehicle/v1/components/cvc"
+        );
+        assert_eq!(NodeTopology::Root.restart_target(), None);
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).restart_target(),
+            Some("cvc")
+        );
+    }
 
     // --- staged_part_digests: the per-part resume present set -----------------
 
