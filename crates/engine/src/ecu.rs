@@ -323,13 +323,28 @@ pub(crate) async fn discover_node_topology(
     };
     // One component: a node only when it says so (a flat single-component server
     // lists one item too). The document's `subcomponents` link decides; a document
-    // without it (or unreadable) falls to probing the collection itself.
-    if let Ok((status, body)) = get(format!("/{candidate}")).await {
-        let doc = serde_json::from_str::<serde_json::Value>(&body).ok();
-        if status.is_success() && doc.as_ref().is_some_and(NodeTopology::is_node_document) {
-            let topology = NodeTopology::Node(candidate);
-            info!(topology = ?topology, "discovered the SOVD node topology");
-            return Some(topology);
+    // without it, or a 404, falls to probing the collection itself. A failed read
+    // decides nothing: the collection's 404 must not then cache a node as flat.
+    match get(format!("/{candidate}")).await {
+        Ok((status, body)) if status.is_success() => {
+            let doc = serde_json::from_str::<serde_json::Value>(&body).ok();
+            if doc.as_ref().is_some_and(NodeTopology::is_node_document) {
+                let topology = NodeTopology::Node(candidate);
+                info!(topology = ?topology, "discovered the SOVD node topology");
+                return Some(topology);
+            }
+        }
+        Ok((status, _)) if status == reqwest::StatusCode::NOT_FOUND => {}
+        Ok((status, _)) => {
+            warn!(
+                "node discovery: GET /components/{candidate} answered HTTP {status} — using \
+                 the root paths for now"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("node discovery failed ({e}) — using the root paths for now");
+            return None;
         }
     }
     let topology = match get(format!("/{candidate}/subcomponents")).await {
@@ -2407,5 +2422,52 @@ mod tests {
         let body_no =
             r#"{"execution_id":"e","operation_id":"o","status":"completed","started_at":"t"}"#;
         assert_eq!(echoed_nonce(body_no), None);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+
+    /// A server listing one component, `cvc`, whose document answers `doc` and whose
+    /// subcomponents collection answers 404.
+    async fn serve(doc: StatusCode) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/vehicle/v1/components",
+                get(|| async { axum::Json(serde_json::json!({"items": [{"id": "cvc"}]})) }),
+            )
+            .route(
+                "/vehicle/v1/components/cvc",
+                get(move || async move { (doc, "{\"id\":\"cvc\"}") }),
+            )
+            .route(
+                "/vehicle/v1/components/cvc/subcomponents",
+                get(|| async { StatusCode::NOT_FOUND }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_document_read_decides_nothing() {
+        let url = serve(StatusCode::INTERNAL_SERVER_ERROR).await;
+        assert_eq!(discover_node_topology(&url, "", true, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_lone_component_without_subcomponents_is_flat() {
+        for doc in [StatusCode::OK, StatusCode::NOT_FOUND] {
+            let url = serve(doc).await;
+            assert_eq!(
+                discover_node_topology(&url, "", true, None).await,
+                Some(NodeTopology::Root),
+                "document {doc}"
+            );
+        }
     }
 }
