@@ -175,6 +175,48 @@ pub struct CampaignReport {
     pub ecus: Vec<EcuStatus>,
 }
 
+/// Which SOVD topology the device is addressed in.
+///
+/// - [`Auto`](Self::Auto) (the default) detects it: a node when `GET /components`
+///   lists exactly one component and that component has subcomponents, the flat
+///   form otherwise.
+/// - [`Node`](Self::Node) takes the one component `GET /components` lists as the
+///   node without asking it; the components are its subcomponents.
+/// - [`Flat`](Self::Flat) never asks: the components are top-level and the node
+///   resources live at the entity root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TopologyChoice {
+    #[default]
+    Auto,
+    Node,
+    Flat,
+}
+
+impl std::fmt::Display for TopologyChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TopologyChoice::Auto => "auto",
+            TopologyChoice::Node => "node",
+            TopologyChoice::Flat => "flat",
+        })
+    }
+}
+
+impl std::str::FromStr for TopologyChoice {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(TopologyChoice::Auto),
+            "node" => Ok(TopologyChoice::Node),
+            "flat" => Ok(TopologyChoice::Flat),
+            other => Err(format!(
+                "unknown SOVD topology {other:?} (auto, node or flat)"
+            )),
+        }
+    }
+}
+
 /// Per-phase wall-clock budgets.
 #[derive(Clone)]
 pub struct EngineTimeouts {
