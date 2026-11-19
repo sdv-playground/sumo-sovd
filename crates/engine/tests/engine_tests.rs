@@ -344,6 +344,146 @@ fn dummy_trust_anchor() -> Vec<u8> {
     key
 }
 
+/// Add an idle second top-level component, so `/components` lists several — the
+/// plainest root-form server (sumo-machine-manager ≤ v0.1.21, mmgr-cvc), whose
+/// node resources are `/vehicle/v1/data/…`, `/vehicle/v1/operations/…`,
+/// `/vehicle/v1/status/restart`. (A lone component is a node only when its
+/// document links `subcomponents`; see
+/// `single_component_flat_server_stays_on_the_root_form`.)
+fn add_root_peer(backends: &mut HashMap<String, Arc<dyn DiagnosticBackend>>) {
+    backends.insert("peer".into(), Arc::new(TestBackend::new("peer")));
+}
+
+/// Re-serve a ROOT-form mock as a node-topology server (supernova with `sovd_node`):
+/// `GET /vehicle/v1/components` lists the one node `node` (whose document links its
+/// `subcomponents`), its node resources
+/// (`components/{node}/data/…`, `…/operations/…`, `…/status/restart`) are routed to
+/// the mock's root handlers, the mock's components are the node's subcomponents
+/// (`components/{node}/subcomponents[/{id}/…]` routed to `components[/{id}/…]`),
+/// and the old root paths and flat `components/{id}/…` paths answer 404 — so a
+/// client still on the root or flat form fails the test. The rewrite runs BEFORE
+/// the inner router routes.
+fn node_form(app: axum::Router, node: &'static str) -> axum::Router {
+    use axum::response::IntoResponse;
+    axum::Router::new()
+        .fallback_service(app)
+        .layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let path = req.uri().path().to_string();
+                if req.method() == axum::http::Method::GET && path == "/vehicle/v1/components" {
+                    return axum::Json(serde_json::json!({
+                        "items": [{
+                            "id": node,
+                            "name": node,
+                            "href": format!("/vehicle/v1/components/{node}"),
+                        }]
+                    }))
+                    .into_response();
+                }
+                if req.method() == axum::http::Method::GET
+                    && path == format!("/vehicle/v1/components/{node}")
+                {
+                    return axum::Json(serde_json::json!({
+                        "id": node,
+                        "name": node,
+                        "subcomponents": format!("/vehicle/v1/components/{node}/subcomponents"),
+                    }))
+                    .into_response();
+                }
+                let is_node_resource = |rest: &str| {
+                    rest.starts_with("data/")
+                        || rest.starts_with("operations/")
+                        || rest == "status/restart"
+                        || rest.starts_with("status/restart/")
+                };
+                if path
+                    .strip_prefix("/vehicle/v1/")
+                    .is_some_and(is_node_resource)
+                {
+                    return (axum::http::StatusCode::NOT_FOUND, "root path removed")
+                        .into_response();
+                }
+                let node_prefix = format!("/vehicle/v1/components/{node}");
+                let rewritten = match path.strip_prefix(&node_prefix) {
+                    Some("/subcomponents") => Some("/vehicle/v1/components".to_string()),
+                    Some(rest) => match rest.strip_prefix("/subcomponents/") {
+                        Some(sub) => Some(format!("/vehicle/v1/components/{sub}")),
+                        None => rest
+                            .strip_prefix('/')
+                            .filter(|rest| is_node_resource(rest))
+                            .map(|rest| format!("/vehicle/v1/{rest}")),
+                    },
+                    // A flat per-component path: gone on a node.
+                    None if path.starts_with("/vehicle/v1/components/") => {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            "flat component path removed",
+                        )
+                            .into_response();
+                    }
+                    None => None,
+                };
+                if let Some(target) = rewritten {
+                    let query = req
+                        .uri()
+                        .query()
+                        .map(|q| format!("?{q}"))
+                        .unwrap_or_default();
+                    *req.uri_mut() = format!("{target}{query}").parse().unwrap();
+                }
+                next.run(req).await
+            },
+        ))
+}
+
+/// `app` as is (`node: None`, a root-form server) or behind [`node_form`].
+fn topology(app: axum::Router, node: Option<&'static str>) -> axum::Router {
+    match node {
+        Some(node) => node_form(app, node),
+        None => app,
+    }
+}
+
+/// Record every request `app` receives — `"{METHOD} {path}"`, as the client sent it
+/// (outside any [`node_form`] rewrite).
+fn record_requests(app: axum::Router) -> (axum::Router, Arc<RwLock<Vec<String>>>) {
+    let log = Arc::new(RwLock::new(Vec::<String>::new()));
+    let log_l = log.clone();
+    let app = app.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let log = log_l.clone();
+            async move {
+                log.write()
+                    .push(format!("{} {}", req.method(), req.uri().path()));
+                next.run(req).await
+            }
+        },
+    ));
+    (app, log)
+}
+
+/// The real sovd-api over `backends` as a node-topology server with node `node`
+/// (see [`node_form`]), recording every request (see [`record_requests`]).
+async fn serve_node(
+    node: &'static str,
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+) -> (
+    String,
+    Arc<RwLock<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = node_form(
+        sovd_api::create_router(sovd_api::AppState::new(backends)),
+        node,
+    );
+    let (app, log) = record_requests(app);
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), log, handle)
+}
+
 async fn serve(
     backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
 ) -> (String, tokio::task::JoinHandle<()>) {
@@ -662,10 +802,26 @@ async fn serve_trial_recovery_at(
     Arc<AtomicU32>,
     tokio::task::JoinHandle<()>,
 ) {
+    serve_trial_recovery_in(None, state_path, state_reply).await
+}
+
+/// `serve_trial_recovery_at` on a root-form server (`node: None`) or a
+/// node-topology one (see [`node_form`]).
+async fn serve_trial_recovery_in(
+    node: Option<&'static str>,
+    state_path: &'static str,
+    state_reply: Option<serde_json::Value>,
+) -> (
+    String,
+    Arc<AtomicU32>,
+    Arc<AtomicU32>,
+    tokio::task::JoinHandle<()>,
+) {
     use axum::response::IntoResponse;
     let backend = Arc::new(TestBackend::new("vm1"));
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), backend);
+    add_root_peer(&mut backends);
 
     let rollbacks = Arc::new(AtomicU32::new(0));
     let opens = Arc::new(AtomicU32::new(0));
@@ -717,6 +873,7 @@ async fn serve_trial_recovery_at(
             },
         ),
     );
+    let app = topology(app, node);
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     (format!("http://127.0.0.1:{port}"), rollbacks, opens, handle)
@@ -907,6 +1064,7 @@ async fn serve_part_resume(
     use axum::response::IntoResponse;
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
+    add_root_peer(&mut backends);
 
     let puts = Arc::new(RwLock::new(Vec::new()));
     let state_reply = Arc::new(state_reply);
@@ -1078,6 +1236,21 @@ async fn serve_node_restart(
     Arc<RwLock<Vec<String>>>,
     tokio::task::JoinHandle<()>,
 ) {
+    serve_node_restart_in(None, backends, node_boot, restart).await
+}
+
+/// `serve_node_restart` on a root-form server (`node: None`) or a node-topology
+/// one, whose restart is `PUT /vehicle/v1/components/{node}/status/restart`.
+async fn serve_node_restart_in(
+    node: Option<&'static str>,
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+    node_boot: Arc<AtomicU32>,
+    restart: Restart,
+) -> (
+    String,
+    Arc<RwLock<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
     use axum::response::IntoResponse;
     let polls = Arc::new(RwLock::new(Vec::<String>::new()));
     let (boot_l, polls_l) = (node_boot.clone(), polls.clone());
@@ -1120,6 +1293,7 @@ async fn serve_node_restart(
             },
         ),
     );
+    let app = topology(app, node);
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     (format!("http://127.0.0.1:{port}"), polls, handle)
@@ -1173,6 +1347,7 @@ async fn removal_node_reset_is_witnessed_by_the_reboot_not_by_readiness() {
     rt.set_update_mode(false, "requires_ecu_reset");
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("rt".into(), rt);
+    add_root_peer(&mut backends);
     let (url, _polls, _h) = serve_node_restart(backends, node_boot, Restart::RotatesNonce).await;
     let eng = engine_with_reset_budget(&url, 10);
 
@@ -1199,6 +1374,7 @@ async fn node_reset_tolerates_the_restart_call_dying_mid_request() {
     rt.set_update_mode(false, "requires_ecu_reset");
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("rt".into(), rt);
+    add_root_peer(&mut backends);
     let (url, _polls, _h) = serve_node_restart(backends, node_boot, Restart::DropsConnection).await;
     let eng = engine_with_reset_budget(&url, 10);
 
@@ -1262,6 +1438,7 @@ async fn removal_node_reset_fails_closed_when_the_node_never_reboots() {
     rt.set_update_mode(false, "requires_ecu_reset");
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("rt".into(), rt);
+    add_root_peer(&mut backends);
     let (url, _polls, _h) = serve_node_restart(backends, node_boot, Restart::NeverReboots).await;
     let eng = engine_with_reset_budget(&url, 3);
 
@@ -1382,6 +1559,7 @@ async fn node_reboot_step_commits_via_node_verdict_not_per_component() {
     let backend = Arc::new(TestBackend::new("vm1"));
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), backend.clone());
+    add_root_peer(&mut backends);
 
     // Mock = the real sovd-api router + a stub for the node verdict op (the
     // real fan-out lives in vm-mgr; here we only assert the engine targets it).
@@ -1464,6 +1642,7 @@ async fn node_reboot_step_rolls_back_via_node_verdict() {
     let backend = Arc::new(TestBackend::new("vm1"));
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), backend.clone());
+    add_root_peer(&mut backends);
 
     let hits = Arc::new(AtomicU32::new(0));
     let hits_route = hits.clone();
@@ -1531,9 +1710,21 @@ async fn serve_node_verdict_hops(
     served: Option<&'static str>,
     acted_key: &'static str,
 ) -> (String, Arc<RwLock<Vec<NodeVerdictPost>>>) {
+    serve_node_verdict_hops_in(None, refused, served, acted_key).await
+}
+
+/// `serve_node_verdict_hops` on a root-form server (`node: None`) or a
+/// node-topology one, whose ops are `components/{node}/operations/{op}/executions`.
+async fn serve_node_verdict_hops_in(
+    node: Option<&'static str>,
+    refused: Vec<(&'static str, axum::http::StatusCode)>,
+    served: Option<&'static str>,
+    acted_key: &'static str,
+) -> (String, Arc<RwLock<Vec<NodeVerdictPost>>>) {
     use axum::response::IntoResponse;
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
+    add_root_peer(&mut backends);
     let posts = Arc::new(RwLock::new(Vec::<NodeVerdictPost>::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1552,7 +1743,10 @@ async fn serve_node_verdict_hops(
         );
     }
     let Some(op_id) = served else {
-        let app = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op);
+        let app = topology(
+            sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op),
+            node,
+        );
         let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         return (format!("http://127.0.0.1:{port}"), posts);
@@ -1579,7 +1773,10 @@ async fn serve_node_verdict_hops(
             }
         }),
     );
-    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op);
+    let app = topology(
+        sovd_api::create_router(sovd_api::AppState::new(backends)).merge(node_op),
+        node,
+    );
     let _h = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     (format!("http://127.0.0.1:{port}"), posts)
@@ -1836,6 +2033,7 @@ async fn node_verdict_retries_once_on_nonce_mismatch_then_succeeds() {
     // Attempt 0 echoes a WRONG nonce → retry; attempt 1 echoes the sent nonce → ok.
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
+    add_root_peer(&mut backends);
     let (url, hits) = serve_nonce_echo_verdict(backends, |n, sent| {
         if n == 0 {
             "stale-prior-nonce".to_string()
@@ -1863,6 +2061,7 @@ async fn node_verdict_fails_after_one_retry_on_persistent_replay() {
     // single retry — the engine never commits on an unverifiable verdict.
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("vm1".into(), Arc::new(TestBackend::new("vm1")));
+    add_root_peer(&mut backends);
     let (url, hits) =
         serve_nonce_echo_verdict(backends, |_n, _sent| "always-wrong".to_string()).await;
 
@@ -1905,6 +2104,7 @@ async fn commit_trials_does_not_clear_owed_reboot_gate_reflash_refused_cleanly()
     backend.set_update_mode(true, "requires_ecu_reset");
     let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
     backends.insert("host".into(), backend.clone());
+    add_root_peer(&mut backends);
 
     // Node-verdict stub for x-update-commit — same uncorrelated-but-exact-
     // content-match shape as `node_reboot_step_commits_via_node_verdict_not_per_component`.
@@ -2204,4 +2404,286 @@ async fn run_campaign_unhealthy_step_rolls_back_and_aborts() {
     );
     // The step's trial was rolled back — never left committed on a bad baseline.
     assert_eq!(*b1.flash_state.read(), FlashState::RolledBack);
+}
+
+// =============================================================================
+// Node topology: one node at /components, the node resources on it
+// =============================================================================
+
+#[tokio::test]
+async fn node_form_trial_recovery_reads_x_update_state_off_the_node() {
+    // A node-topology server (one component, `cvc`, at /components) serves the
+    // update state at `components/cvc/data/x-update-state` only — the root path is
+    // gone. The probe discovers the node, reads the state there, and the confirmed
+    // trial is rolled back exactly as on a root-form server.
+    let (url, rollbacks, opens, _h) = serve_trial_recovery_in(
+        Some("cvc"),
+        "/vehicle/v1/data/x-update-state",
+        Some(serde_json::json!({ "phase": "Trial", "components": ["vm1"] })),
+    )
+    .await;
+    let eng = engine(&url);
+
+    let statuses = eng
+        .stage_all(&plan(&[("vm1", &[0xDE, 0xAD])]))
+        .await
+        .expect("node-form confirmed in-trial ⇒ rollback + reopen succeeds");
+
+    assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+    assert!(opens.load(Ordering::SeqCst) >= 2);
+    assert_ne!(statuses[0].state, EcuState::Failed, "got {statuses:?}");
+}
+
+#[tokio::test]
+async fn node_form_trial_recovery_falls_back_to_x_ota_update_state_on_the_node() {
+    // The x-update-state → x-ota-update-state fallback holds in the node form too.
+    let (url, rollbacks, _opens, _h) = serve_trial_recovery_in(
+        Some("cvc"),
+        "/vehicle/v1/data/x-ota-update-state",
+        Some(serde_json::json!({ "phase": "Trial", "components": ["vm1"] })),
+    )
+    .await;
+    let eng = engine(&url);
+
+    eng.stage_all(&plan(&[("vm1", &[0xDE, 0xAD])]))
+        .await
+        .expect("node-form legacy-confirmed in-trial ⇒ rollback + reopen succeeds");
+    assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn node_form_commit_posts_x_update_commit_on_the_node() {
+    // The node-reboot commit POSTs `components/cvc/operations/x-update-commit/…`;
+    // the root op answers 404 on this server, so a root-form POST fails the commit.
+    let (url, posts) =
+        serve_node_verdict_hops_in(Some("cvc"), vec![], Some("x-update-commit"), "committed").await;
+
+    let eng = force_reset_engine(url);
+    let mut ecus = activated_vm1();
+    eng.commit_all(&mut ecus).await.unwrap();
+
+    assert_eq!(post_ops(&posts), ["x-update-commit"]);
+    assert_eq!(ecus[0].state, EcuState::Committed);
+}
+
+#[tokio::test]
+async fn node_form_verdict_fallback_chain_stays_on_the_node() {
+    // The 404 fallback chain (x-update-rollback → x-update-verdict → legacy x-ota op)
+    // walks the node's operations, never the root.
+    let (url, posts) = serve_node_verdict_hops_in(
+        Some("cvc"),
+        vec![
+            ("x-update-rollback", axum::http::StatusCode::NOT_FOUND),
+            ("x-update-verdict", axum::http::StatusCode::NOT_FOUND),
+        ],
+        Some("x-ota-rollback-trials"),
+        "rolled_back",
+    )
+    .await;
+
+    let eng = force_reset_engine(url);
+    let mut ecus = activated_vm1();
+    eng.rollback_all(&mut ecus).await.unwrap();
+
+    assert_eq!(
+        post_ops(&posts),
+        [
+            "x-update-rollback",
+            "x-update-verdict",
+            "x-ota-rollback-trials"
+        ]
+    );
+    assert_eq!(ecus[0].state, EcuState::RolledBack);
+}
+
+#[tokio::test]
+async fn node_form_node_reset_puts_restart_on_the_node() {
+    // The coalesced node reset is `PUT components/cvc/status/restart` on a
+    // node-topology server; the root `status/restart` is gone (404 ⇒ a real refusal,
+    // the step would fail), so passing proves the node form was used.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(TestBackend::new("rt").with_node_boot(node_boot.clone()));
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    let (url, _polls, _h) =
+        serve_node_restart_in(Some("cvc"), backends, node_boot, Restart::RotatesNonce).await;
+    let eng = engine_with_reset_budget(&url, 10);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("the node-form restart rotates the node boot id");
+    assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+}
+
+#[tokio::test]
+async fn root_form_node_reset_never_addresses_a_node() {
+    // Two components at /components ⇒ root form: the reset stays the root
+    // `PUT /vehicle/v1/status/restart` (the root mock answers 404 on any other).
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(TestBackend::new("rt").with_node_boot(node_boot.clone()));
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    add_root_peer(&mut backends);
+    let (url, _polls, _h) =
+        serve_node_restart(backends, node_boot.clone(), Restart::RotatesNonce).await;
+    let eng = engine_with_reset_budget(&url, 10);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus).await.unwrap();
+    assert_eq!(
+        node_boot.load(Ordering::SeqCst),
+        2,
+        "the root restart fired"
+    );
+}
+
+#[tokio::test]
+async fn single_component_flat_server_stays_on_the_root_form() {
+    // A flat server with ONE component (`rt`, no `subcomponents` link, its
+    // subcomponents collection 404) is NOT a node: the reset stays the root
+    // `PUT /vehicle/v1/status/restart` — never `components/rt/status/restart`.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(TestBackend::new("rt").with_node_boot(node_boot.clone()));
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    let (url, _polls, _h) =
+        serve_node_restart(backends, node_boot.clone(), Restart::RotatesNonce).await;
+    let eng = engine_with_reset_budget(&url, 10);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("a lone flat component keeps the root restart");
+    assert_eq!(
+        node_boot.load(Ordering::SeqCst),
+        2,
+        "the root restart fired"
+    );
+}
+
+/// The recorded requests addressing a flat `components/{id}/…` path other than the
+/// node's own — none may reach a node-topology server.
+fn flat_component_requests(log: &RwLock<Vec<String>>, node: &str) -> Vec<String> {
+    log.read()
+        .iter()
+        .filter(|r| {
+            r.split_once(' ')
+                .and_then(|(_, path)| path.strip_prefix("/vehicle/v1/components/"))
+                .is_some_and(|rest| rest != node && !rest.starts_with(&format!("{node}/")))
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn node_form_flashes_a_subcomponent_end_to_end() {
+    // A node-topology server serves vm1 only as `components/cvc/subcomponents/vm1`
+    // (the flat `components/vm1/…` answers 404). Register, upload, prepare, execute,
+    // the per-component restart + status witness, and the commit all land on the
+    // subcomponent.
+    let backend = Arc::new(TestBackend::new("vm1"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), backend.clone());
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let mut ecus = stage_and_reset(&eng, &plan(&[("vm1", &[0xDE, 0xAD])])).await;
+    assert_eq!(ecus[0].state, EcuState::Activated);
+    assert!(backend.reset_count() >= 1, "the local restart reached vm1");
+    eng.commit_all(&mut ecus).await.unwrap();
+    assert_eq!(*backend.flash_state.read(), FlashState::Committed);
+    assert_eq!(ecus[0].state, EcuState::Committed);
+
+    let sub = "/vehicle/v1/components/cvc/subcomponents/vm1";
+    let log_v = log.read().clone();
+    let hit = |method: &str, suffix: &str| {
+        log_v
+            .iter()
+            .any(|r| r.starts_with(&format!("{method} {sub}/")) && r.ends_with(suffix))
+    };
+    assert!(hit("POST", "/updates"), "register: {log_v:?}");
+    assert!(hit("PUT", "/prepare"), "prepare: {log_v:?}");
+    assert!(hit("PUT", "/execute"), "execute: {log_v:?}");
+    assert!(hit("PUT", "/status/restart"), "restart: {log_v:?}");
+    assert!(hit("GET", "/status"), "status witness: {log_v:?}");
+    assert!(hit("PUT", "/x-update-commit"), "commit: {log_v:?}");
+    assert!(hit("PUT", "/bulk-data/manifest"), "upload: {log_v:?}");
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn node_form_stage_failure_rolls_back_on_the_subcomponents() {
+    // A failed second component (refused at open): the first's staged trial is
+    // rolled back on its subcomponent, never on a flat path.
+    let b1 = Arc::new(TestBackend::new("vm1"));
+    let b2 = Arc::new(TestBackend::new("vm2"));
+    *b2.fail_flash.write() = Some("simulated flash failure".into());
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), b1.clone());
+    backends.insert("vm2".into(), b2.clone());
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let err = eng
+        .stage_all(&plan(&[("vm1", &[0x01]), ("vm2", &[0x02])]))
+        .await;
+    assert!(err.is_err(), "stage_all should fail when vm2 fails");
+    assert_eq!(*b1.flash_state.read(), FlashState::RolledBack);
+    assert!(
+        log.read().iter().any(|r| r
+            .starts_with("PUT /vehicle/v1/components/cvc/subcomponents/vm1/updates/")
+            && r.ends_with("/x-update-rollback")),
+        "rollback on the subcomponent: {:?}",
+        log.read()
+    );
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn node_form_guard_reads_update_mode_off_the_subcomponents() {
+    // The no-mix guard reads each component's x-ota-update-mode on the node's
+    // subcomponent; the flat read would 404 and the guard would (gracefully) let
+    // the mixed plan through.
+    let banked = Arc::new(TestBackend::new("vm1"));
+    banked.set_update_mode(true, "requires_ecu_reset");
+    let singleshot = Arc::new(TestBackend::new("rt"));
+    singleshot.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), banked);
+    backends.insert("rt".into(), singleshot);
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let err = eng.guard(&plan(&[("vm1", &[0x01]), ("rt", &[0x02])])).await;
+    assert!(
+        matches!(err, Err(EngineError::MixedUpdateModes { .. })),
+        "got {err:?}"
+    );
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn node_form_restarts_a_committed_local_singleshot_on_its_subcomponent() {
+    // A committed singleshot declaring reset_kind=local: its reset_kind probe, its
+    // `status/restart` and the `/status` witness are the subcomponent's.
+    let backend = Arc::new(TestBackend::new("rt"));
+    backend.set_update_mode(false, "local");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), backend.clone());
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus).await.unwrap();
+    assert!(backend.reset_count() >= 1, "the subcomponent restarted");
+    assert_eq!(ecus[0].state, EcuState::Committed);
+    assert!(log
+        .read()
+        .iter()
+        .any(|r| r == "PUT /vehicle/v1/components/cvc/subcomponents/rt/status/restart"));
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
 }

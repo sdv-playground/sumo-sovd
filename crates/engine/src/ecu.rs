@@ -27,6 +27,7 @@ use crate::types::{FlashJob, PayloadSource, UpdateType};
 /// fails device-side (`NotInTrial`) and masks the true cause. Returns the new
 /// update_id.
 async fn open_update_or_rollback_pending(
+    topology: &NodeTopology,
     flash_client: &FlashClient,
     comp: &str,
     name: &str,
@@ -39,6 +40,7 @@ async fn open_update_or_rollback_pending(
             // update-state off the wire (connection recovered from the flash client).
             let cfg = flash_client.config();
             let state = read_node_update_state(
+                topology,
                 &cfg.connection.base_url,
                 cfg.connection.bearer.as_deref().unwrap_or(""),
                 cfg.insecure,
@@ -160,12 +162,223 @@ fn manifest_part_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, S
         .collect()
 }
 
-/// `GET /vehicle/v1/data/x-update-state` — a NODE-level vendor resource at
-/// the vehicle root, so it is read with a direct GET (not the per-component
-/// `SovdClient::read_data`). `Err` when the resource is unreachable/absent (an
-/// older device predating the field) or the body will not parse — the caller
-/// treats any failure as unconfirmed and refuses the destructive rollback.
+/// Where a server serves its node-level vendor resources (`x-update-state`, the
+/// node verdict operations, the node restart) and its components.
+///
+/// A node-topology server (supernova with `sovd_node`) lists exactly ONE component
+/// at `/vehicle/v1/components` — the node — whose document links its
+/// `subcomponents`, and serves those resources on it
+/// (`/vehicle/v1/components/{node}/...`). Every other server (several components,
+/// none, or a single component that is not a node: mmgr-cvc, older supernova
+/// builds on sumo-machine-manager ≤ v0.1.21) serves them at the entity root
+/// (`/vehicle/v1/...`).
+///
+/// A node serves every component as its subcomponent
+/// (`/vehicle/v1/components/{node}/subcomponents/{component}/...`; the flat
+/// `/vehicle/v1/components/{component}/...` answers 404), so every per-component
+/// call addresses the component by [`component_path`](Self::component_path).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NodeTopology {
+    /// The node resources live at the entity root.
+    Root,
+    /// The node resources live on the node component with this id.
+    Node(String),
+}
+
+impl NodeTopology {
+    /// The node candidate of a `GET /vehicle/v1/components` body: the id of its ONE
+    /// `items` entry. Several, none, an id-less entry or an unparseable body ⇒
+    /// `None` (the root form). A candidate is only the node once its document
+    /// confirms it ([`is_node_document`](Self::is_node_document)): a flat server
+    /// with a single component lists one item too.
+    pub(crate) fn node_candidate(body: &serde_json::Value) -> Option<String> {
+        match body
+            .get("items")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+        {
+            Some([only]) => match only.get("id").and_then(|v| v.as_str()) {
+                Some(id) if !id.is_empty() => Some(id.to_string()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Does a `GET /vehicle/v1/components/{id}` document describe a node — i.e.
+    /// link a `subcomponents` collection (sovd-api's node document carries
+    /// `"subcomponents": "{base}/components/{node}/subcomponents"`)?
+    pub(crate) fn is_node_document(doc: &serde_json::Value) -> bool {
+        doc.get("subcomponents").is_some_and(|v| !v.is_null())
+    }
+
+    /// The URL prefix the node resources hang off: `{server}/vehicle/v1` (root) or
+    /// `{server}/vehicle/v1/components/{node}` (node form).
+    pub(crate) fn prefix(&self, server_url: &str) -> String {
+        let base = server_url.trim_end_matches('/');
+        match self {
+            NodeTopology::Root => format!("{base}/vehicle/v1"),
+            NodeTopology::Node(node) => format!("{base}/vehicle/v1/components/{node}"),
+        }
+    }
+
+    /// A component's path below `/vehicle/v1/components/`: `{component}` (root
+    /// form) or `{node}/subcomponents/{component}` (node form). sovd-client
+    /// splices the component id it is given into its URLs verbatim
+    /// (`FlashConfig::base_prefix`, `SovdClient::read_status`/`read_data`/
+    /// `system_restart`), so this path is what the engine hands it as the
+    /// component (or gateway) id.
+    pub(crate) fn component_path(&self, component: &str) -> String {
+        match self {
+            NodeTopology::Root => component.to_string(),
+            NodeTopology::Node(node) => format!("{node}/subcomponents/{component}"),
+        }
+    }
+
+    /// The `(component_id, gateway_id)` pair a `FlashConfig` (and the hand-built
+    /// session abort) addresses `component` (behind `gateway`) by: without a
+    /// gateway the component's [`component_path`](Self::component_path); with one,
+    /// the app id as is under the gateway's path (`…/components/{gateway
+    /// path}/apps/{app}`).
+    pub(crate) fn entity_ids(
+        &self,
+        component: &str,
+        gateway: Option<&str>,
+    ) -> (String, Option<String>) {
+        match gateway {
+            Some(gw) => (component.to_string(), Some(self.component_path(gw))),
+            None => (self.component_path(component), None),
+        }
+    }
+
+    /// Where a `RequiresEcuReset` group's coalesced restart is addressed
+    /// (`SovdClient::system_restart`): the group's gateway (by its
+    /// [`component_path`](Self::component_path)) when it has one, else the
+    /// [`restart_target`](Self::restart_target).
+    pub(crate) fn group_restart_target(&self, gateway: Option<&str>) -> Option<String> {
+        match gateway {
+            Some(gw) => Some(self.component_path(gw)),
+            None => self.restart_target().map(str::to_string),
+        }
+    }
+
+    /// The gateway to address an entity-root restart at: the node in node form
+    /// (`PUT components/{node}/status/restart`), `None` (the root) otherwise.
+    pub(crate) fn restart_target(&self) -> Option<&str> {
+        match self {
+            NodeTopology::Root => None,
+            NodeTopology::Node(node) => Some(node),
+        }
+    }
+}
+
+/// Discover the server's [`NodeTopology`]: `GET /vehicle/v1/components`, and when
+/// that lists exactly one component, confirm it is a node — its document
+/// (`GET /vehicle/v1/components/{id}`) links `subcomponents`, or
+/// `GET /vehicle/v1/components/{id}/subcomponents` answers 2xx. A lone component
+/// without either (its subcomponents answer 404) is a flat server: the root form.
+/// `None` when a read could not decide (transport failure, an unexpected HTTP
+/// status, or an unparseable listing) — the caller then uses the root paths for
+/// this call and retries discovery next time instead of caching a guess.
+pub(crate) async fn discover_node_topology(
+    server_url: &str,
+    token: &str,
+    insecure: bool,
+    ca_cert_pem: Option<&[u8]>,
+) -> Option<NodeTopology> {
+    let client = build_verdict_client(insecure, ca_cert_pem, "components").ok()?;
+    let base = server_url.trim_end_matches('/');
+    let get = |path: String| {
+        send_node_request(
+            client.get(format!("{base}/vehicle/v1/components{path}")),
+            token,
+            "components",
+        )
+    };
+    let (status, body) = match get(String::new()).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("node discovery failed ({e}) — using the root paths for now");
+            return None;
+        }
+    };
+    if !status.is_success() {
+        warn!(
+            "node discovery: GET /components answered HTTP {status} — using the root paths for now"
+        );
+        return None;
+    }
+    let listing = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "node discovery: unparseable /components body ({e}) — using the root paths for now"
+            );
+            return None;
+        }
+    };
+    let Some(candidate) = NodeTopology::node_candidate(&listing) else {
+        info!(topology = ?NodeTopology::Root, "discovered the SOVD node topology");
+        return Some(NodeTopology::Root);
+    };
+    // One component: a node only when it says so (a flat single-component server
+    // lists one item too). The document's `subcomponents` link decides; a document
+    // without it, or a 404, falls to probing the collection itself. A failed read
+    // decides nothing: the collection's 404 must not then cache a node as flat.
+    match get(format!("/{candidate}")).await {
+        Ok((status, body)) if status.is_success() => {
+            let doc = serde_json::from_str::<serde_json::Value>(&body).ok();
+            if doc.as_ref().is_some_and(NodeTopology::is_node_document) {
+                let topology = NodeTopology::Node(candidate);
+                info!(topology = ?topology, "discovered the SOVD node topology");
+                return Some(topology);
+            }
+        }
+        Ok((status, _)) if status == reqwest::StatusCode::NOT_FOUND => {}
+        Ok((status, _)) => {
+            warn!(
+                "node discovery: GET /components/{candidate} answered HTTP {status} — using \
+                 the root paths for now"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("node discovery failed ({e}) — using the root paths for now");
+            return None;
+        }
+    }
+    let topology = match get(format!("/{candidate}/subcomponents")).await {
+        Ok((status, _)) if status.is_success() => NodeTopology::Node(candidate),
+        Ok((status, _))
+            if status == reqwest::StatusCode::NOT_FOUND
+                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+        {
+            NodeTopology::Root
+        }
+        Ok((status, _)) => {
+            warn!(
+                "node discovery: GET /components/{candidate}/subcomponents answered HTTP \
+                 {status} — using the root paths for now"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("node discovery failed ({e}) — using the root paths for now");
+            return None;
+        }
+    };
+    info!(topology = ?topology, "discovered the SOVD node topology");
+    Some(topology)
+}
+
+/// `GET {node}/data/x-update-state` — a NODE-level vendor resource (at the entity
+/// root, or on the node component in node form; see [`NodeTopology`]), so it is
+/// read with a direct GET (not the per-component `SovdClient::read_data`). `Err`
+/// when the resource is unreachable/absent (an older device predating the field)
+/// or the body will not parse — the caller treats any failure as unconfirmed and
+/// refuses the destructive rollback.
 async fn read_node_update_state(
+    topology: &NodeTopology,
     server_url: &str,
     token: &str,
     insecure: bool,
@@ -173,10 +386,10 @@ async fn read_node_update_state(
 ) -> Result<NodeUpdateStateProbe, EngineError> {
     // Same one-off CA-trust seam as the node-verdict POST.
     let client = build_verdict_client(insecure, ca_cert_pem, "x-update-state")?;
-    let base = server_url.trim_end_matches('/');
+    let prefix = topology.prefix(server_url);
     let mut resource = "x-update-state";
     let (mut status, mut body) = send_node_request(
-        client.get(format!("{base}/vehicle/v1/data/{resource}")),
+        client.get(format!("{prefix}/data/{resource}")),
         token,
         resource,
     )
@@ -187,7 +400,7 @@ async fn read_node_update_state(
         resource = "x-ota-update-state";
         info!("x-update-state not served (404) — falling back to legacy {resource}");
         (status, body) = send_node_request(
-            client.get(format!("{base}/vehicle/v1/data/{resource}")),
+            client.get(format!("{prefix}/data/{resource}")),
             token,
             resource,
         )
@@ -277,7 +490,8 @@ fn is_container_image_manifest(manifest: &sumo_onboard::Manifest) -> bool {
 /// Flash one job to staging — ends at AwaitingReboot for firmware updates.
 /// Does NOT reset the ECU (a campaign-level decision). **Precondition:** the
 /// driver has already unlocked the ECU (programming session + security).
-pub async fn flash_ecu_to_staging(
+pub(crate) async fn flash_ecu_to_staging(
+    topology: &NodeTopology,
     job: &FlashJob,
     server_url: &str,
     trust_anchor: &[u8],
@@ -314,10 +528,12 @@ pub async fn flash_ecu_to_staging(
         .to_string();
     info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU flash (assumes already unlocked)");
 
-    let flash_client = build_flash_client(server_url, comp, gw, token, insecure, ca_cert_pem)?;
+    let flash_client =
+        build_flash_client(topology, server_url, comp, gw, token, insecure, ca_cert_pem)?;
 
     let update_id =
-        open_update_or_rollback_pending(&flash_client, comp, &pkg_name, &pkg_version).await?;
+        open_update_or_rollback_pending(topology, &flash_client, comp, &pkg_name, &pkg_version)
+            .await?;
     let e_update_id = update_id.clone();
     info!(component = %comp, update_id = %update_id, "opened /updates session");
 
@@ -344,7 +560,9 @@ pub async fn flash_ecu_to_staging(
             let present = if job.payloads.is_empty() {
                 HashSet::new()
             } else {
-                match read_node_update_state(server_url, token, insecure, ca_cert_pem).await {
+                match read_node_update_state(topology, server_url, token, insecure, ca_cert_pem)
+                    .await
+                {
                     Ok(state) => staged_part_digests(&state, comp),
                     Err(e) => {
                         debug!(component = %comp, "x-update-state unreadable ({e}) — uploading every part");
@@ -431,6 +649,7 @@ pub async fn flash_ecu_to_staging(
         Ok(result) => Ok(result),
         Err(e) => {
             if let Err(de) = abort_update_session(
+                topology,
                 server_url,
                 comp,
                 gw,
@@ -459,7 +678,9 @@ pub async fn flash_ecu_to_staging(
 /// `FlashClient` method, so it doesn't wait on an upstream SOVDd
 /// release/tag/bump wave for one verb. Best-effort: 404 (session already
 /// gone) is success.
+#[allow(clippy::too_many_arguments)]
 async fn abort_update_session(
+    topology: &NodeTopology,
     server_url: &str,
     comp: &str,
     gateway_id: Option<&str>,
@@ -468,11 +689,13 @@ async fn abort_update_session(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    // Same base-prefix shape as FlashConfig::base_prefix — sub-entity
-    // components live under /components/{gateway}/apps/{app}.
-    let comp_path = match gateway_id {
-        Some(gw) => format!("{gw}/apps/{}", comp.replace('/', "%2F")),
-        None => comp.to_string(),
+    // Same base-prefix shape as FlashConfig::base_prefix over the same ids as
+    // `build_flash_client` — sub-entity components live under
+    // /components/{gateway}/apps/{app}, a node's under
+    // /components/{node}/subcomponents/{component}.
+    let comp_path = match topology.entity_ids(comp, gateway_id) {
+        (app, Some(gw)) => format!("{gw}/apps/{}", app.replace('/', "%2F")),
+        (path, None) => path,
     };
     let url = format!(
         "{}/vehicle/v1/components/{comp_path}/updates/{update_id}",
@@ -633,6 +856,7 @@ fn status_client(
 /// component like host-os) or `/status` is unreachable — callers treat absence
 /// as "no boot_id witness" and fall back to the observed server down→up.
 pub async fn read_boot_id(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     token: &str,
@@ -643,7 +867,10 @@ pub async fn read_boot_id(
     // (ii) `/status` unreadable → no heartbeat baseline. Stay quiet: the
     // connect-level down→up witness in `wait_activated` (which classifies its own
     // read errors) covers the reboot signal; here it is simply "no baseline".
-    let body = match client.read_status(component_id).await {
+    let body = match client
+        .read_status(&topology.component_path(component_id))
+        .await
+    {
         Ok(b) => b,
         Err(_) => return None,
     };
@@ -674,6 +901,7 @@ pub async fn read_boot_id(
 /// field (callers then fall back to the down→up witness). See the machine-manager
 /// `read_entity_status` (component-mgr backend) which emits it.
 pub async fn read_node_boot_id(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     token: &str,
@@ -683,7 +911,10 @@ pub async fn read_node_boot_id(
     let client = status_client(server_url, token, insecure, ca_cert_pem).ok()?;
     // (ii) `/status` unreadable → no node baseline; the down→up witness covers the
     // reboot. Quiet (the connect-level signal is `wait_activated`'s job).
-    let body = match client.read_status(component_id).await {
+    let body = match client
+        .read_status(&topology.component_path(component_id))
+        .await
+    {
         Ok(b) => b,
         Err(_) => return None,
     };
@@ -846,6 +1077,7 @@ fn witness_timeout_reason(had_boot_baseline: bool, saw_down: bool, kind: Witness
 /// real reboot does.
 #[allow(clippy::too_many_arguments)]
 pub async fn wait_activated(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     baseline: Option<u32>,
@@ -864,9 +1096,10 @@ pub async fn wait_activated(
     // and set ONLY by a connect-level failure (an HTTP status response proves the
     // server is up and must not count).
     let mut saw_down = false;
+    let status_path = topology.component_path(component_id);
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match client.read_status(component_id).await {
+        match client.read_status(&status_path).await {
             Ok(body) => {
                 let ready = matches!(body.status, EntityStatus::Ready);
                 let runtime = body.extensions.get("x-runtime");
@@ -924,7 +1157,9 @@ pub async fn wait_activated(
 /// fresh, ready lifetime — the per-component analogue of the node path, same
 /// `/status` boot_id witness, just a per-component `status/restart` instead of a
 /// coalesced node reboot.
+#[allow(clippy::too_many_arguments)]
 pub async fn restart_and_verify(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -933,8 +1168,17 @@ pub async fn restart_and_verify(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let baseline = read_boot_id(server_url, component_id, token, insecure, ca_cert_pem).await;
+    let baseline = read_boot_id(
+        topology,
+        server_url,
+        component_id,
+        token,
+        insecure,
+        ca_cert_pem,
+    )
+    .await;
     trigger_local_restart(
+        topology,
         server_url,
         component_id,
         gateway_id,
@@ -944,6 +1188,7 @@ pub async fn restart_and_verify(
     )
     .await?;
     wait_activated(
+        topology,
         server_url,
         component_id,
         baseline,
@@ -1212,7 +1457,8 @@ fn check_verdict(
 /// re-attaches per component — it issues ONE verdict and the node fans it out
 /// from NV (the update *session* is the commit unit). Wire:
 /// `POST /vehicle/v1/operations/x-update-commit/executions` (or `x-update-rollback`)
-/// with body `{"nonce": …}` (ISO 17978-3 §7.14, at the entity root). A 404 falls back
+/// with body `{"nonce": …}` (ISO 17978-3 §7.14, at the entity root — or on the node,
+/// `/vehicle/v1/components/{node}/operations/…`, in node form; see [`NodeTopology`]). A 404 falls back
 /// to `x-update-verdict` with `{"verdict": "commit"|"rollback", "nonce": …}`, then to
 /// the legacy x-ota trials op. A 401/403 falls back the same way while a next op
 /// exists — older servers scope the new path as `operations:execute`, which the
@@ -1230,6 +1476,7 @@ fn check_verdict(
 /// fan-out returns 5xx with the per-component errors; an unparseable body is an error,
 /// never a silent log.
 async fn node_verdict(
+    topology: &NodeTopology,
     server_url: &str,
     verdict: NodeVerdict,
     expected: &[String],
@@ -1237,8 +1484,8 @@ async fn node_verdict(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let base = server_url.trim_end_matches('/');
-    let url_for = |op_id: &str| format!("{base}/vehicle/v1/operations/{op_id}/executions");
+    let prefix = topology.prefix(server_url);
+    let url_for = |op_id: &str| format!("{prefix}/operations/{op_id}/executions");
     let mut op_id = verdict.op_id();
     // Two attempts max: the field bug was a transport-level replay (a pooled
     // connection answering with a PRIOR execution's record). A VIRGIN connection
@@ -1378,7 +1625,8 @@ fn build_verdict_client(
 /// Commit every in-trial component on the node in one verdict. `expected` are the
 /// component ids that must appear in the record's `committed` set (empty ⇒ the manual
 /// verb, correlation + completed status still enforced, no per-component content).
-pub async fn commit_node_trials(
+pub(crate) async fn commit_node_trials(
+    topology: &NodeTopology,
     server_url: &str,
     expected: &[String],
     token: &str,
@@ -1386,6 +1634,7 @@ pub async fn commit_node_trials(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
     node_verdict(
+        topology,
         server_url,
         NodeVerdict::Commit,
         expected,
@@ -1398,7 +1647,8 @@ pub async fn commit_node_trials(
 
 /// Roll back every in-trial component on the node in one verdict. `expected` are
 /// the component ids that must appear in the record's `rolled_back` set.
-pub async fn rollback_node_trials(
+pub(crate) async fn rollback_node_trials(
+    topology: &NodeTopology,
     server_url: &str,
     expected: &[String],
     token: &str,
@@ -1406,6 +1656,7 @@ pub async fn rollback_node_trials(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
     node_verdict(
+        topology,
         server_url,
         NodeVerdict::Rollback,
         expected,
@@ -1417,8 +1668,10 @@ pub async fn rollback_node_trials(
 }
 
 /// Trigger a per-component restart via `PUT components/{id}/status/restart`
-/// (used for `ResetKind::Local`). Does NOT wait for activation.
+/// (`components/{node}/subcomponents/{id}/status/restart` in node form; used for
+/// `ResetKind::Local`). Does NOT wait for activation.
 pub async fn trigger_local_restart(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -1427,6 +1680,7 @@ pub async fn trigger_local_restart(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
     let flash_client = build_flash_client(
+        topology,
         server_url,
         component_id,
         gateway_id,
@@ -1448,7 +1702,9 @@ pub async fn trigger_local_restart(
 /// Read a component's declared `reset_kind` off the `/updates` wire (the
 /// `x-ota-reset-kind` vendor field SOVDd captures at register time). Servers
 /// that omit it deserialise to `Local`.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_reset_kind(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -1458,6 +1714,7 @@ pub async fn fetch_reset_kind(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<sovd_core::ResetKind, EngineError> {
     let flash_client = build_flash_client(
+        topology,
         server_url,
         component_id,
         gateway_id,
@@ -1488,7 +1745,14 @@ pub async fn fetch_reset_kind(
 /// constructors (full verification). `ca_cert_pem`, when `Some`, instead pins
 /// that PEM CA root for the device leaf (the verifying counterpart to
 /// `insecure`); `None` keeps the `insecure` behaviour.
+///
+/// `component_id` / `gateway_id` are the logical ids; the client addresses them
+/// in `topology`'s form ([`NodeTopology::entity_ids`]) — in node form the
+/// component id handed to `FlashConfig` is its path below `/components/`
+/// (`{node}/subcomponents/{component}`), which `FlashConfig::base_prefix`
+/// splices in unencoded, so every `/updates` call lands on the subcomponent.
 pub(crate) fn build_flash_client(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -1496,11 +1760,12 @@ pub(crate) fn build_flash_client(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<FlashClient, EngineError> {
+    let (wire_id, wire_gateway) = topology.entity_ids(component_id, gateway_id);
     let mut builder = FlashConfig::builder(server_url)
-        .component_id(component_id)
+        .component_id(wire_id)
         .insecure(insecure)
         .ca_cert_pem(ca_cert_pem.map(|c| c.to_vec()));
-    if let Some(gw) = gateway_id {
+    if let Some(gw) = wire_gateway {
         builder = builder.gateway_id(gw);
     }
     if !token.is_empty() {
@@ -1515,6 +1780,117 @@ pub(crate) fn build_flash_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- NodeTopology: discovery classification + node-resource paths ---------
+
+    #[test]
+    fn one_component_is_the_node_candidate() {
+        let body = serde_json::json!({ "items": [{ "id": "cvc", "name": "CVC" }] });
+        assert_eq!(NodeTopology::node_candidate(&body), Some("cvc".into()));
+    }
+
+    #[test]
+    fn several_or_no_components_have_no_node_candidate() {
+        for body in [
+            serde_json::json!({ "items": [{ "id": "host" }, { "id": "hsm" }] }),
+            serde_json::json!({ "items": [] }),
+            serde_json::json!({}),
+            serde_json::json!({ "items": [{ "name": "no id" }] }),
+            serde_json::json!({ "items": [{ "id": "" }] }),
+        ] {
+            assert_eq!(NodeTopology::node_candidate(&body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn only_a_document_linking_subcomponents_is_a_node() {
+        assert!(NodeTopology::is_node_document(&serde_json::json!({
+            "id": "cvc",
+            "subcomponents": "/vehicle/v1/components/cvc/subcomponents",
+        })));
+        for doc in [
+            // A flat server's lone component: a plain component document.
+            serde_json::json!({ "id": "vm1", "data": "/vehicle/v1/components/vm1/data" }),
+            serde_json::json!({ "id": "vm1", "subcomponents": null }),
+        ] {
+            assert!(!NodeTopology::is_node_document(&doc), "{doc}");
+        }
+    }
+
+    #[test]
+    fn node_resource_prefix_per_topology() {
+        assert_eq!(
+            NodeTopology::Root.prefix("https://cvc:8443/"),
+            "https://cvc:8443/vehicle/v1"
+        );
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).prefix("https://cvc:8443"),
+            "https://cvc:8443/vehicle/v1/components/cvc"
+        );
+        assert_eq!(NodeTopology::Root.restart_target(), None);
+        assert_eq!(NodeTopology::Root.group_restart_target(None), None);
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).group_restart_target(None),
+            Some("cvc".into())
+        );
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).group_restart_target(Some("gw")),
+            Some("cvc/subcomponents/gw".into())
+        );
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).restart_target(),
+            Some("cvc")
+        );
+    }
+
+    #[test]
+    fn component_paths_per_topology() {
+        let root = NodeTopology::Root;
+        let node = NodeTopology::Node("cvc".into());
+        assert_eq!(root.component_path("vm1"), "vm1");
+        assert_eq!(node.component_path("vm1"), "cvc/subcomponents/vm1");
+        assert_eq!(root.entity_ids("vm1", None), ("vm1".into(), None));
+        assert_eq!(
+            node.entity_ids("vm1", None),
+            ("cvc/subcomponents/vm1".into(), None)
+        );
+        assert_eq!(
+            node.entity_ids("app", Some("gw")),
+            ("app".into(), Some("cvc/subcomponents/gw".into()))
+        );
+    }
+
+    #[test]
+    fn node_form_flash_client_addresses_the_subcomponent() {
+        // FlashConfig::base_prefix splices the id in verbatim — the node path
+        // must come out as the subcomponent's /updates collection.
+        let node = NodeTopology::Node("cvc".into());
+        let client = build_flash_client(&node, "http://dev", "vm1", None, "", false, None).unwrap();
+        assert_eq!(
+            client.config().updates_collection_path(),
+            "/vehicle/v1/components/cvc/subcomponents/vm1/updates"
+        );
+        let client =
+            build_flash_client(&node, "http://dev", "app", Some("gw"), "", false, None).unwrap();
+        assert_eq!(
+            client.config().updates_collection_path(),
+            "/vehicle/v1/components/cvc/subcomponents/gw/apps/app/updates"
+        );
+        let client = build_flash_client(
+            &NodeTopology::Root,
+            "http://dev",
+            "vm1",
+            None,
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            client.config().updates_collection_path(),
+            "/vehicle/v1/components/vm1/updates"
+        );
+    }
 
     // --- staged_part_digests: the per-part resume present set -----------------
 
@@ -2046,5 +2422,52 @@ mod tests {
         let body_no =
             r#"{"execution_id":"e","operation_id":"o","status":"completed","started_at":"t"}"#;
         assert_eq!(echoed_nonce(body_no), None);
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+
+    /// A server listing one component, `cvc`, whose document answers `doc` and whose
+    /// subcomponents collection answers 404.
+    async fn serve(doc: StatusCode) -> String {
+        let app = axum::Router::new()
+            .route(
+                "/vehicle/v1/components",
+                get(|| async { axum::Json(serde_json::json!({"items": [{"id": "cvc"}]})) }),
+            )
+            .route(
+                "/vehicle/v1/components/cvc",
+                get(move || async move { (doc, "{\"id\":\"cvc\"}") }),
+            )
+            .route(
+                "/vehicle/v1/components/cvc/subcomponents",
+                get(|| async { StatusCode::NOT_FOUND }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_failed_node_document_read_decides_nothing() {
+        let url = serve(StatusCode::INTERNAL_SERVER_ERROR).await;
+        assert_eq!(discover_node_topology(&url, "", true, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_lone_component_without_subcomponents_is_flat() {
+        for doc in [StatusCode::OK, StatusCode::NOT_FOUND] {
+            let url = serve(doc).await;
+            assert_eq!(
+                discover_node_topology(&url, "", true, None).await,
+                Some(NodeTopology::Root),
+                "document {doc}"
+            );
+        }
     }
 }
