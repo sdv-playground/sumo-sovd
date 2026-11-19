@@ -344,17 +344,19 @@ fn dummy_trust_anchor() -> Vec<u8> {
     key
 }
 
-/// Add an idle second top-level component. A server whose `/components` lists ONE
-/// component is a node-topology server (the engine serves the node resources off
-/// `components/{node}/…`); the tests of the ROOT-form wire (`/vehicle/v1/data/…`,
-/// `/vehicle/v1/operations/…`, `/vehicle/v1/status/restart` — sumo-machine-manager
-/// ≤ v0.1.21, mmgr-cvc) therefore serve two.
+/// Add an idle second top-level component, so `/components` lists several — the
+/// plainest root-form server (sumo-machine-manager ≤ v0.1.21, mmgr-cvc), whose
+/// node resources are `/vehicle/v1/data/…`, `/vehicle/v1/operations/…`,
+/// `/vehicle/v1/status/restart`. (A lone component is a node only when its
+/// document links `subcomponents`; see
+/// `single_component_flat_server_stays_on_the_root_form`.)
 fn add_root_peer(backends: &mut HashMap<String, Arc<dyn DiagnosticBackend>>) {
     backends.insert("peer".into(), Arc::new(TestBackend::new("peer")));
 }
 
 /// Re-serve a ROOT-form mock as a node-topology server (supernova with `sovd_node`):
-/// `GET /vehicle/v1/components` lists the one node `node`, its node resources
+/// `GET /vehicle/v1/components` lists the one node `node` (whose document links its
+/// `subcomponents`), its node resources
 /// (`components/{node}/data/…`, `…/operations/…`, `…/status/restart`) are routed to
 /// the mock's root handlers, and the old root paths answer 404 — so a client still
 /// on the root form fails the test. The rewrite runs BEFORE the inner router routes.
@@ -372,6 +374,16 @@ fn node_form(app: axum::Router, node: &'static str) -> axum::Router {
                             "name": node,
                             "href": format!("/vehicle/v1/components/{node}"),
                         }]
+                    }))
+                    .into_response();
+                }
+                if req.method() == axum::http::Method::GET
+                    && path == format!("/vehicle/v1/components/{node}")
+                {
+                    return axum::Json(serde_json::json!({
+                        "id": node,
+                        "name": node,
+                        "subcomponents": format!("/vehicle/v1/components/{node}/subcomponents"),
                     }))
                     .into_response();
                 }
@@ -2461,6 +2473,31 @@ async fn root_form_node_reset_never_addresses_a_node() {
 
     let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
     eng.reset_all(&mut ecus).await.unwrap();
+    assert_eq!(
+        node_boot.load(Ordering::SeqCst),
+        2,
+        "the root restart fired"
+    );
+}
+
+#[tokio::test]
+async fn single_component_flat_server_stays_on_the_root_form() {
+    // A flat server with ONE component (`rt`, no `subcomponents` link, its
+    // subcomponents collection 404) is NOT a node: the reset stays the root
+    // `PUT /vehicle/v1/status/restart` — never `components/rt/status/restart`.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(TestBackend::new("rt").with_node_boot(node_boot.clone()));
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    let (url, _polls, _h) =
+        serve_node_restart(backends, node_boot.clone(), Restart::RotatesNonce).await;
+    let eng = engine_with_reset_budget(&url, 10);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("a lone flat component keeps the root restart");
     assert_eq!(
         node_boot.load(Ordering::SeqCst),
         2,

@@ -166,10 +166,12 @@ fn manifest_part_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, S
 /// node verdict operations, the node restart).
 ///
 /// A node-topology server (supernova with `sovd_node`) lists exactly ONE component
-/// at `/vehicle/v1/components` — the node — and serves those resources on it
+/// at `/vehicle/v1/components` — the node — whose document links its
+/// `subcomponents`, and serves those resources on it
 /// (`/vehicle/v1/components/{node}/...`). Every other server (several components,
-/// or none: mmgr-cvc, older supernova builds on sumo-machine-manager ≤ v0.1.21)
-/// serves them at the entity root (`/vehicle/v1/...`).
+/// none, or a single component that is not a node: mmgr-cvc, older supernova
+/// builds on sumo-machine-manager ≤ v0.1.21) serves them at the entity root
+/// (`/vehicle/v1/...`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NodeTopology {
     /// The node resources live at the entity root.
@@ -179,20 +181,30 @@ pub(crate) enum NodeTopology {
 }
 
 impl NodeTopology {
-    /// Classify a `GET /vehicle/v1/components` body: exactly one `items` entry with
-    /// an `id` is the node; anything else (several, none, unparseable) is `Root`.
-    pub(crate) fn from_components_body(body: &serde_json::Value) -> Self {
+    /// The node candidate of a `GET /vehicle/v1/components` body: the id of its ONE
+    /// `items` entry. Several, none, an id-less entry or an unparseable body ⇒
+    /// `None` (the root form). A candidate is only the node once its document
+    /// confirms it ([`is_node_document`](Self::is_node_document)): a flat server
+    /// with a single component lists one item too.
+    pub(crate) fn node_candidate(body: &serde_json::Value) -> Option<String> {
         match body
             .get("items")
             .and_then(|v| v.as_array())
             .map(Vec::as_slice)
         {
             Some([only]) => match only.get("id").and_then(|v| v.as_str()) {
-                Some(id) if !id.is_empty() => NodeTopology::Node(id.to_string()),
-                _ => NodeTopology::Root,
+                Some(id) if !id.is_empty() => Some(id.to_string()),
+                _ => None,
             },
-            _ => NodeTopology::Root,
+            _ => None,
         }
+    }
+
+    /// Does a `GET /vehicle/v1/components/{id}` document describe a node — i.e.
+    /// link a `subcomponents` collection (sovd-api's node document carries
+    /// `"subcomponents": "{base}/components/{node}/subcomponents"`)?
+    pub(crate) fn is_node_document(doc: &serde_json::Value) -> bool {
+        doc.get("subcomponents").is_some_and(|v| !v.is_null())
     }
 
     /// The URL prefix the node resources hang off: `{server}/vehicle/v1` (root) or
@@ -215,10 +227,14 @@ impl NodeTopology {
     }
 }
 
-/// Discover the server's [`NodeTopology`] off `GET /vehicle/v1/components`.
-/// `None` when the listing could not be read (transport failure, non-2xx, or an
-/// unparseable body) — the caller then uses the root paths for this call and
-/// retries discovery next time instead of caching a guess.
+/// Discover the server's [`NodeTopology`]: `GET /vehicle/v1/components`, and when
+/// that lists exactly one component, confirm it is a node — its document
+/// (`GET /vehicle/v1/components/{id}`) links `subcomponents`, or
+/// `GET /vehicle/v1/components/{id}/subcomponents` answers 2xx. A lone component
+/// without either (its subcomponents answer 404) is a flat server: the root form.
+/// `None` when a read could not decide (transport failure, an unexpected HTTP
+/// status, or an unparseable listing) — the caller then uses the root paths for
+/// this call and retries discovery next time instead of caching a guess.
 pub(crate) async fn discover_node_topology(
     server_url: &str,
     token: &str,
@@ -227,13 +243,14 @@ pub(crate) async fn discover_node_topology(
 ) -> Option<NodeTopology> {
     let client = build_verdict_client(insecure, ca_cert_pem, "components").ok()?;
     let base = server_url.trim_end_matches('/');
-    let (status, body) = match send_node_request(
-        client.get(format!("{base}/vehicle/v1/components")),
-        token,
-        "components",
-    )
-    .await
-    {
+    let get = |path: String| {
+        send_node_request(
+            client.get(format!("{base}/vehicle/v1/components{path}")),
+            token,
+            "components",
+        )
+    };
+    let (status, body) = match get(String::new()).await {
         Ok(r) => r,
         Err(e) => {
             warn!("node discovery failed ({e}) — using the root paths for now");
@@ -246,19 +263,52 @@ pub(crate) async fn discover_node_topology(
         );
         return None;
     }
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(v) => {
-            let topology = NodeTopology::from_components_body(&v);
-            info!(topology = ?topology, "discovered the SOVD node topology");
-            Some(topology)
-        }
+    let listing = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => v,
         Err(e) => {
             warn!(
                 "node discovery: unparseable /components body ({e}) — using the root paths for now"
             );
-            None
+            return None;
+        }
+    };
+    let Some(candidate) = NodeTopology::node_candidate(&listing) else {
+        info!(topology = ?NodeTopology::Root, "discovered the SOVD node topology");
+        return Some(NodeTopology::Root);
+    };
+    // One component: a node only when it says so (a flat single-component server
+    // lists one item too). The document's `subcomponents` link decides; a document
+    // without it (or unreadable) falls to probing the collection itself.
+    if let Ok((status, body)) = get(format!("/{candidate}")).await {
+        let doc = serde_json::from_str::<serde_json::Value>(&body).ok();
+        if status.is_success() && doc.as_ref().is_some_and(NodeTopology::is_node_document) {
+            let topology = NodeTopology::Node(candidate);
+            info!(topology = ?topology, "discovered the SOVD node topology");
+            return Some(topology);
         }
     }
+    let topology = match get(format!("/{candidate}/subcomponents")).await {
+        Ok((status, _)) if status.is_success() => NodeTopology::Node(candidate),
+        Ok((status, _))
+            if status == reqwest::StatusCode::NOT_FOUND
+                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED =>
+        {
+            NodeTopology::Root
+        }
+        Ok((status, _)) => {
+            warn!(
+                "node discovery: GET /components/{candidate}/subcomponents answered HTTP \
+                 {status} — using the root paths for now"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!("node discovery failed ({e}) — using the root paths for now");
+            return None;
+        }
+    };
+    info!(topology = ?topology, "discovered the SOVD node topology");
+    Some(topology)
 }
 
 /// `GET {node}/data/x-update-state` — a NODE-level vendor resource (at the entity
@@ -1632,16 +1682,13 @@ mod tests {
     // --- NodeTopology: discovery classification + node-resource paths ---------
 
     #[test]
-    fn one_component_is_the_node() {
+    fn one_component_is_the_node_candidate() {
         let body = serde_json::json!({ "items": [{ "id": "cvc", "name": "CVC" }] });
-        assert_eq!(
-            NodeTopology::from_components_body(&body),
-            NodeTopology::Node("cvc".into())
-        );
+        assert_eq!(NodeTopology::node_candidate(&body), Some("cvc".into()));
     }
 
     #[test]
-    fn several_or_no_components_are_the_root_form() {
+    fn several_or_no_components_have_no_node_candidate() {
         for body in [
             serde_json::json!({ "items": [{ "id": "host" }, { "id": "hsm" }] }),
             serde_json::json!({ "items": [] }),
@@ -1649,11 +1696,22 @@ mod tests {
             serde_json::json!({ "items": [{ "name": "no id" }] }),
             serde_json::json!({ "items": [{ "id": "" }] }),
         ] {
-            assert_eq!(
-                NodeTopology::from_components_body(&body),
-                NodeTopology::Root,
-                "{body}"
-            );
+            assert_eq!(NodeTopology::node_candidate(&body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn only_a_document_linking_subcomponents_is_a_node() {
+        assert!(NodeTopology::is_node_document(&serde_json::json!({
+            "id": "cvc",
+            "subcomponents": "/vehicle/v1/components/cvc/subcomponents",
+        })));
+        for doc in [
+            // A flat server's lone component: a plain component document.
+            serde_json::json!({ "id": "vm1", "data": "/vehicle/v1/components/vm1/data" }),
+            serde_json::json!({ "id": "vm1", "subcomponents": null }),
+        ] {
+            assert!(!NodeTopology::is_node_document(&doc), "{doc}");
         }
     }
 
