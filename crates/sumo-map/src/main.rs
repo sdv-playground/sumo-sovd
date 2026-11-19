@@ -166,7 +166,9 @@ async fn discover_node(client: &SovdClient) -> Result<Option<String>> {
     Ok(subs.map(|_| id.clone()))
 }
 
-/// `GET {server}{path}` as JSON: `Some` on a 2xx, `None` on any other status.
+/// `GET {server}{path}` as JSON: `Some` on a 2xx, `None` when the server does not
+/// serve it (404 or 405, what a flat server answers for a node's paths), an error
+/// on any other status: a failing server must not read as a flat one.
 async fn get_json(client: &SovdClient, path: &str) -> Result<Option<serde_json::Value>> {
     let url = client.base_url().join(path).context("build URL")?;
     let resp = client
@@ -175,8 +177,12 @@ async fn get_json(client: &SovdClient, path: &str) -> Result<Option<serde_json::
         .send()
         .await
         .with_context(|| format!("GET {path}"))?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if matches!(status.as_u16(), 404 | 405) {
         return Ok(None);
+    }
+    if !status.is_success() {
+        anyhow::bail!("GET {path}: HTTP {status}");
     }
     let text = resp.text().await.with_context(|| format!("GET {path}"))?;
     Ok(Some(
