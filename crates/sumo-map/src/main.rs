@@ -6,6 +6,10 @@
 //! installed set against a release to show the "what to flash" view.
 //!
 //! Contract: `sumo-machine-manager/specs/sovd-vm-app-installation.md` §17.
+//!
+//! A server in SOVD node topology (supernova with `sovd_node`) lists only its node
+//! at `/vehicle/v1/components` and serves the VMs as the node's subcomponents
+//! (`/vehicle/v1/components/{node}/subcomponents/{vm}/…`); see [`discover_node`].
 
 mod manifest;
 
@@ -24,7 +28,8 @@ const INSTALLED_MANIFEST_PARAM_ID: &str = "x-ota-installed-manifest";
     name = "sumo-map",
     about = "Inventory installed software per VM via the x-ota-installed-manifest SOVD read",
     long_about = "Reads the signed IVD manifest each VM serves at \
-        GET /vehicle/v1/components/{vm}/data/x-ota-installed-manifest, verifies it \
+        GET /vehicle/v1/components/{vm}/data/x-ota-installed-manifest (on a SOVD \
+        node: components/{node}/subcomponents/{vm}/data/…), verifies it \
         against the device's ivd-signing public key, prints the per-file inventory, \
         and (with --release) diffs the installed set against a release to show what \
         would need flashing. Contract: sovd-vm-app-installation.md §17."
@@ -98,10 +103,22 @@ async fn main() -> Result<()> {
         None => None,
     };
 
-    // Resolve the component list (1 — narrowed, or all).
-    let components: Vec<String> = match &cli.component {
-        Some(c) => vec![c.clone()],
-        None => client
+    // Resolve the component list (1 — narrowed, or all) — the node's
+    // subcomponents on a node-topology server.
+    let node = discover_node(&client).await?;
+    let components: Vec<String> = match (&cli.component, &node) {
+        (Some(c), _) => vec![c.clone()],
+        (None, Some(node)) => {
+            let body = get_json(
+                &client,
+                &format!("/vehicle/v1/components/{node}/subcomponents"),
+            )
+            .await
+            .with_context(|| format!("list the subcomponents of node {node}"))?
+            .with_context(|| format!("list the subcomponents of node {node}: not served"))?;
+            item_ids(&body)
+        }
+        (None, None) => client
             .list_components()
             .await
             .context("list components")?
@@ -112,7 +129,10 @@ async fn main() -> Result<()> {
 
     let mut reports = Vec::with_capacity(components.len());
     for component in &components {
-        reports.push(build_report(&client, component, pubkey.as_ref(), release.as_ref()).await?);
+        let path = component_path(node.as_deref(), component);
+        reports.push(
+            build_report(&client, component, &path, pubkey.as_ref(), release.as_ref()).await?,
+        );
     }
 
     if cli.json {
@@ -124,17 +144,81 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Read + (optionally) verify + diff one VM's installed manifest.
+/// The SOVD node a node-topology server serves its components under: its
+/// `/components` lists exactly one item AND that item is a node — its document
+/// links `subcomponents`, or its `subcomponents` collection answers 2xx. `None`
+/// (the flat form) otherwise, including a flat server with a single component.
+async fn discover_node(client: &SovdClient) -> Result<Option<String>> {
+    let components = client.list_components().await.context("list components")?;
+    let [only] = components.as_slice() else {
+        return Ok(None);
+    };
+    let id = &only.id;
+    let doc = get_json(client, &format!("/vehicle/v1/components/{id}")).await?;
+    if doc.as_ref().is_some_and(is_node_document) {
+        return Ok(Some(id.clone()));
+    }
+    let subs = get_json(
+        client,
+        &format!("/vehicle/v1/components/{id}/subcomponents"),
+    )
+    .await?;
+    Ok(subs.map(|_| id.clone()))
+}
+
+/// `GET {server}{path}` as JSON: `Some` on a 2xx, `None` on any other status.
+async fn get_json(client: &SovdClient, path: &str) -> Result<Option<serde_json::Value>> {
+    let url = client.base_url().join(path).context("build URL")?;
+    let resp = client
+        .http_client()
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {path}"))?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let text = resp.text().await.with_context(|| format!("GET {path}"))?;
+    Ok(Some(
+        serde_json::from_str(&text).with_context(|| format!("parse GET {path}"))?,
+    ))
+}
+
+/// Does a component document describe a node (link a `subcomponents` collection)?
+fn is_node_document(doc: &serde_json::Value) -> bool {
+    doc.get("subcomponents").is_some_and(|v| !v.is_null())
+}
+
+/// The `items[].id`s of a SOVD collection body.
+fn item_ids(body: &serde_json::Value) -> Vec<String> {
+    body.get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|i| i.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect()
+}
+
+/// A component's path below `/vehicle/v1/components/`: `{component}` (flat) or
+/// `{node}/subcomponents/{component}` (node topology). `SovdClient::read_data`
+/// splices it in verbatim.
+fn component_path(node: Option<&str>, component: &str) -> String {
+    match node {
+        Some(node) => format!("{node}/subcomponents/{component}"),
+        None => component.to_string(),
+    }
+}
+
+/// Read + (optionally) verify + diff one VM's installed manifest. `path` is the
+/// component's path below `/components` ([`component_path`]).
 async fn build_report(
     client: &SovdClient,
     component: &str,
+    path: &str,
     pubkey: Option<&p256::ecdsa::VerifyingKey>,
     release: Option<&Release>,
 ) -> Result<VmReport> {
-    let value = match client
-        .read_data(component, INSTALLED_MANIFEST_PARAM_ID)
-        .await
-    {
+    let value = match client.read_data(path, INSTALLED_MANIFEST_PARAM_ID).await {
         Ok(resp) => resp.value,
         // No committed manifest (never flashed / no-HSM smoke path) — not an error.
         Err(e) if is_not_found(&e) => {
@@ -305,5 +389,35 @@ fn none_if_empty(s: &str) -> &str {
         "<unnamed>"
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_document_linking_subcomponents_is_a_node() {
+        assert!(is_node_document(&serde_json::json!({
+            "id": "cvc",
+            "subcomponents": "/vehicle/v1/components/cvc/subcomponents",
+        })));
+        assert!(!is_node_document(&serde_json::json!({ "id": "vm1" })));
+        assert!(!is_node_document(
+            &serde_json::json!({ "id": "vm1", "subcomponents": null })
+        ));
+    }
+
+    #[test]
+    fn component_paths_per_topology() {
+        assert_eq!(component_path(None, "vm1"), "vm1");
+        assert_eq!(component_path(Some("cvc"), "vm1"), "cvc/subcomponents/vm1");
+    }
+
+    #[test]
+    fn item_ids_reads_a_collection() {
+        let body = serde_json::json!({ "items": [{ "id": "host" }, { "id": "vm1" }, {}] });
+        assert_eq!(item_ids(&body), ["host", "vm1"]);
+        assert!(item_ids(&serde_json::json!({})).is_empty());
     }
 }
