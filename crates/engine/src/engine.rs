@@ -58,6 +58,8 @@ pub struct FlashEngine {
     /// every clone of this engine (they all talk to the same `server_url`). Unset
     /// until a discovery succeeds — a failed one is retried on the next use.
     node_topology: Arc<OnceLock<ecu::NodeTopology>>,
+    /// How the topology is found: detected (the default), or chosen by the operator.
+    topology_choice: crate::types::TopologyChoice,
 }
 
 impl FlashEngine {
@@ -78,7 +80,16 @@ impl FlashEngine {
             ca_cert_pem,
             force_ecu_reset: false,
             node_topology: Arc::new(OnceLock::new()),
+            topology_choice: Default::default(),
         }
+    }
+
+    /// Address the device in the chosen SOVD topology instead of detecting it — see
+    /// [`TopologyChoice`](crate::types::TopologyChoice).
+    pub fn with_topology(mut self, choice: crate::types::TopologyChoice) -> Self {
+        self.topology_choice = choice;
+        self.node_topology = Arc::new(OnceLock::new());
+        self
     }
 
     /// Activate every staged component via one coalesced node reboot rather than
@@ -1123,6 +1134,7 @@ impl FlashEngine {
             &token,
             self.insecure,
             self.ca_cert_pem.as_deref(),
+            self.topology_choice,
         )
         .await
         {

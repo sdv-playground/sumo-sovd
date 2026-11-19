@@ -280,12 +280,21 @@ impl NodeTopology {
 /// `None` when a read could not decide (transport failure, an unexpected HTTP
 /// status, or an unparseable listing) — the caller then uses the root paths for
 /// this call and retries discovery next time instead of caching a guess.
+///
+/// `choice` overrides the detection: [`TopologyChoice::Flat`] is the root form
+/// without a request, [`TopologyChoice::Node`] takes the one listed component as
+/// the node without asking it (several or none listed is undecided).
 pub(crate) async fn discover_node_topology(
     server_url: &str,
     token: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    choice: crate::types::TopologyChoice,
 ) -> Option<NodeTopology> {
+    use crate::types::TopologyChoice;
+    if choice == TopologyChoice::Flat {
+        return Some(NodeTopology::Root);
+    }
     let client = build_verdict_client(insecure, ca_cert_pem, "components").ok()?;
     let base = server_url.trim_end_matches('/');
     let get = |path: String| {
@@ -318,9 +327,21 @@ pub(crate) async fn discover_node_topology(
         }
     };
     let Some(candidate) = NodeTopology::node_candidate(&listing) else {
+        if choice == TopologyChoice::Node {
+            warn!(
+                "node topology chosen, but GET /components does not list exactly one component \
+                 — using the root paths for now"
+            );
+            return None;
+        }
         info!(topology = ?NodeTopology::Root, "discovered the SOVD node topology");
         return Some(NodeTopology::Root);
     };
+    if choice == TopologyChoice::Node {
+        let topology = NodeTopology::Node(candidate);
+        info!(topology = ?topology, "the SOVD node topology, as chosen");
+        return Some(topology);
+    }
     // One component: a node only when it says so (a flat single-component server
     // lists one item too). The document's `subcomponents` link decides; a document
     // without it, or a 404, falls to probing the collection itself. A failed read
@@ -2428,6 +2449,7 @@ mod tests {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+    use crate::types::TopologyChoice;
     use axum::http::StatusCode;
     use axum::routing::get;
 
@@ -2456,7 +2478,46 @@ mod discovery_tests {
     #[tokio::test]
     async fn a_failed_node_document_read_decides_nothing() {
         let url = serve(StatusCode::INTERNAL_SERVER_ERROR).await;
-        assert_eq!(discover_node_topology(&url, "", true, None).await, None);
+        assert_eq!(
+            discover_node_topology(&url, "", true, None, Default::default()).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chosen_node_is_the_lone_component_without_asking_it() {
+        // The lone component has no subcomponents (its document lacks the link,
+        // its collection answers 404): detection says flat, the choice says node.
+        let url = serve(StatusCode::OK).await;
+        assert_eq!(
+            discover_node_topology(&url, "", true, None, TopologyChoice::Node).await,
+            Some(NodeTopology::Node("cvc".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chosen_node_needs_exactly_one_listed_component() {
+        let app = axum::Router::new().route(
+            "/vehicle/v1/components",
+            get(|| async { axum::Json(serde_json::json!({"items": [{"id": "a"}, {"id": "b"}]})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert_eq!(
+            discover_node_topology(&url, "", true, None, TopologyChoice::Node).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chosen_flat_form_asks_nothing() {
+        // Nothing listens here: the flat choice decides without a request.
+        assert_eq!(
+            discover_node_topology("http://127.0.0.1:9", "", true, None, TopologyChoice::Flat)
+                .await,
+            Some(NodeTopology::Root)
+        );
     }
 
     #[tokio::test]
@@ -2464,7 +2525,7 @@ mod discovery_tests {
         for doc in [StatusCode::OK, StatusCode::NOT_FOUND] {
             let url = serve(doc).await;
             assert_eq!(
-                discover_node_topology(&url, "", true, None).await,
+                discover_node_topology(&url, "", true, None, Default::default()).await,
                 Some(NodeTopology::Root),
                 "document {doc}"
             );
