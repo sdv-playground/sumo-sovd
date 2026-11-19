@@ -358,8 +358,11 @@ fn add_root_peer(backends: &mut HashMap<String, Arc<dyn DiagnosticBackend>>) {
 /// `GET /vehicle/v1/components` lists the one node `node` (whose document links its
 /// `subcomponents`), its node resources
 /// (`components/{node}/data/…`, `…/operations/…`, `…/status/restart`) are routed to
-/// the mock's root handlers, and the old root paths answer 404 — so a client still
-/// on the root form fails the test. The rewrite runs BEFORE the inner router routes.
+/// the mock's root handlers, the mock's components are the node's subcomponents
+/// (`components/{node}/subcomponents[/{id}/…]` routed to `components[/{id}/…]`),
+/// and the old root paths and flat `components/{id}/…` paths answer 404 — so a
+/// client still on the root or flat form fails the test. The rewrite runs BEFORE
+/// the inner router routes.
 fn node_form(app: axum::Router, node: &'static str) -> axum::Router {
     use axum::response::IntoResponse;
     axum::Router::new()
@@ -400,16 +403,33 @@ fn node_form(app: axum::Router, node: &'static str) -> axum::Router {
                     return (axum::http::StatusCode::NOT_FOUND, "root path removed")
                         .into_response();
                 }
-                if let Some(rest) = path
-                    .strip_prefix(&format!("/vehicle/v1/components/{node}/"))
-                    .filter(|rest| is_node_resource(rest))
-                {
+                let node_prefix = format!("/vehicle/v1/components/{node}");
+                let rewritten = match path.strip_prefix(&node_prefix) {
+                    Some("/subcomponents") => Some("/vehicle/v1/components".to_string()),
+                    Some(rest) => match rest.strip_prefix("/subcomponents/") {
+                        Some(sub) => Some(format!("/vehicle/v1/components/{sub}")),
+                        None => rest
+                            .strip_prefix('/')
+                            .filter(|rest| is_node_resource(rest))
+                            .map(|rest| format!("/vehicle/v1/{rest}")),
+                    },
+                    // A flat per-component path: gone on a node.
+                    None if path.starts_with("/vehicle/v1/components/") => {
+                        return (
+                            axum::http::StatusCode::NOT_FOUND,
+                            "flat component path removed",
+                        )
+                            .into_response();
+                    }
+                    None => None,
+                };
+                if let Some(target) = rewritten {
                     let query = req
                         .uri()
                         .query()
                         .map(|q| format!("?{q}"))
                         .unwrap_or_default();
-                    *req.uri_mut() = format!("/vehicle/v1/{rest}{query}").parse().unwrap();
+                    *req.uri_mut() = format!("{target}{query}").parse().unwrap();
                 }
                 next.run(req).await
             },
@@ -422,6 +442,46 @@ fn topology(app: axum::Router, node: Option<&'static str>) -> axum::Router {
         Some(node) => node_form(app, node),
         None => app,
     }
+}
+
+/// Record every request `app` receives — `"{METHOD} {path}"`, as the client sent it
+/// (outside any [`node_form`] rewrite).
+fn record_requests(app: axum::Router) -> (axum::Router, Arc<RwLock<Vec<String>>>) {
+    let log = Arc::new(RwLock::new(Vec::<String>::new()));
+    let log_l = log.clone();
+    let app = app.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let log = log_l.clone();
+            async move {
+                log.write()
+                    .push(format!("{} {}", req.method(), req.uri().path()));
+                next.run(req).await
+            }
+        },
+    ));
+    (app, log)
+}
+
+/// The real sovd-api over `backends` as a node-topology server with node `node`
+/// (see [`node_form`]), recording every request (see [`record_requests`]).
+async fn serve_node(
+    node: &'static str,
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+) -> (
+    String,
+    Arc<RwLock<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = node_form(
+        sovd_api::create_router(sovd_api::AppState::new(backends)),
+        node,
+    );
+    let (app, log) = record_requests(app);
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), log, handle)
 }
 
 async fn serve(
@@ -2503,4 +2563,127 @@ async fn single_component_flat_server_stays_on_the_root_form() {
         2,
         "the root restart fired"
     );
+}
+
+/// The recorded requests addressing a flat `components/{id}/…` path other than the
+/// node's own — none may reach a node-topology server.
+fn flat_component_requests(log: &RwLock<Vec<String>>, node: &str) -> Vec<String> {
+    log.read()
+        .iter()
+        .filter(|r| {
+            r.split_once(' ')
+                .and_then(|(_, path)| path.strip_prefix("/vehicle/v1/components/"))
+                .is_some_and(|rest| rest != node && !rest.starts_with(&format!("{node}/")))
+        })
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn node_form_flashes_a_subcomponent_end_to_end() {
+    // A node-topology server serves vm1 only as `components/cvc/subcomponents/vm1`
+    // (the flat `components/vm1/…` answers 404). Register, upload, prepare, execute,
+    // the per-component restart + status witness, and the commit all land on the
+    // subcomponent.
+    let backend = Arc::new(TestBackend::new("vm1"));
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), backend.clone());
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let mut ecus = stage_and_reset(&eng, &plan(&[("vm1", &[0xDE, 0xAD])])).await;
+    assert_eq!(ecus[0].state, EcuState::Activated);
+    assert!(backend.reset_count() >= 1, "the local restart reached vm1");
+    eng.commit_all(&mut ecus).await.unwrap();
+    assert_eq!(*backend.flash_state.read(), FlashState::Committed);
+    assert_eq!(ecus[0].state, EcuState::Committed);
+
+    let sub = "/vehicle/v1/components/cvc/subcomponents/vm1";
+    let log_v = log.read().clone();
+    let hit = |method: &str, suffix: &str| {
+        log_v
+            .iter()
+            .any(|r| r.starts_with(&format!("{method} {sub}/")) && r.ends_with(suffix))
+    };
+    assert!(hit("POST", "/updates"), "register: {log_v:?}");
+    assert!(hit("PUT", "/prepare"), "prepare: {log_v:?}");
+    assert!(hit("PUT", "/execute"), "execute: {log_v:?}");
+    assert!(hit("PUT", "/status/restart"), "restart: {log_v:?}");
+    assert!(hit("GET", "/status"), "status witness: {log_v:?}");
+    assert!(hit("PUT", "/x-update-commit"), "commit: {log_v:?}");
+    assert!(hit("PUT", "/bulk-data/manifest"), "upload: {log_v:?}");
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn node_form_stage_failure_rolls_back_on_the_subcomponents() {
+    // A failed second component (refused at open): the first's staged trial is
+    // rolled back on its subcomponent, never on a flat path.
+    let b1 = Arc::new(TestBackend::new("vm1"));
+    let b2 = Arc::new(TestBackend::new("vm2"));
+    *b2.fail_flash.write() = Some("simulated flash failure".into());
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), b1.clone());
+    backends.insert("vm2".into(), b2.clone());
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let err = eng
+        .stage_all(&plan(&[("vm1", &[0x01]), ("vm2", &[0x02])]))
+        .await;
+    assert!(err.is_err(), "stage_all should fail when vm2 fails");
+    assert_eq!(*b1.flash_state.read(), FlashState::RolledBack);
+    assert!(
+        log.read().iter().any(|r| r
+            .starts_with("PUT /vehicle/v1/components/cvc/subcomponents/vm1/updates/")
+            && r.ends_with("/x-update-rollback")),
+        "rollback on the subcomponent: {:?}",
+        log.read()
+    );
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn node_form_guard_reads_update_mode_off_the_subcomponents() {
+    // The no-mix guard reads each component's x-ota-update-mode on the node's
+    // subcomponent; the flat read would 404 and the guard would (gracefully) let
+    // the mixed plan through.
+    let banked = Arc::new(TestBackend::new("vm1"));
+    banked.set_update_mode(true, "requires_ecu_reset");
+    let singleshot = Arc::new(TestBackend::new("rt"));
+    singleshot.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("vm1".into(), banked);
+    backends.insert("rt".into(), singleshot);
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let err = eng.guard(&plan(&[("vm1", &[0x01]), ("rt", &[0x02])])).await;
+    assert!(
+        matches!(err, Err(EngineError::MixedUpdateModes { .. })),
+        "got {err:?}"
+    );
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn node_form_restarts_a_committed_local_singleshot_on_its_subcomponent() {
+    // A committed singleshot declaring reset_kind=local: its reset_kind probe, its
+    // `status/restart` and the `/status` witness are the subcomponent's.
+    let backend = Arc::new(TestBackend::new("rt"));
+    backend.set_update_mode(false, "local");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), backend.clone());
+    let (url, log, _h) = serve_node("cvc", backends).await;
+    let eng = engine(&url);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus).await.unwrap();
+    assert!(backend.reset_count() >= 1, "the subcomponent restarted");
+    assert_eq!(ecus[0].state, EcuState::Committed);
+    assert!(log
+        .read()
+        .iter()
+        .any(|r| r == "PUT /vehicle/v1/components/cvc/subcomponents/rt/status/restart"));
+    assert_eq!(flat_component_requests(&log, "cvc"), Vec::<String>::new());
 }

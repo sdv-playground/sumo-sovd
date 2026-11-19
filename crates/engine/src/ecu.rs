@@ -163,7 +163,7 @@ fn manifest_part_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, S
 }
 
 /// Where a server serves its node-level vendor resources (`x-update-state`, the
-/// node verdict operations, the node restart).
+/// node verdict operations, the node restart) and its components.
 ///
 /// A node-topology server (supernova with `sovd_node`) lists exactly ONE component
 /// at `/vehicle/v1/components` — the node — whose document links its
@@ -172,6 +172,11 @@ fn manifest_part_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, S
 /// none, or a single component that is not a node: mmgr-cvc, older supernova
 /// builds on sumo-machine-manager ≤ v0.1.21) serves them at the entity root
 /// (`/vehicle/v1/...`).
+///
+/// A node serves every component as its subcomponent
+/// (`/vehicle/v1/components/{node}/subcomponents/{component}/...`; the flat
+/// `/vehicle/v1/components/{component}/...` answers 404), so every per-component
+/// call addresses the component by [`component_path`](Self::component_path).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NodeTopology {
     /// The node resources live at the entity root.
@@ -214,6 +219,46 @@ impl NodeTopology {
         match self {
             NodeTopology::Root => format!("{base}/vehicle/v1"),
             NodeTopology::Node(node) => format!("{base}/vehicle/v1/components/{node}"),
+        }
+    }
+
+    /// A component's path below `/vehicle/v1/components/`: `{component}` (root
+    /// form) or `{node}/subcomponents/{component}` (node form). sovd-client
+    /// splices the component id it is given into its URLs verbatim
+    /// (`FlashConfig::base_prefix`, `SovdClient::read_status`/`read_data`/
+    /// `system_restart`), so this path is what the engine hands it as the
+    /// component (or gateway) id.
+    pub(crate) fn component_path(&self, component: &str) -> String {
+        match self {
+            NodeTopology::Root => component.to_string(),
+            NodeTopology::Node(node) => format!("{node}/subcomponents/{component}"),
+        }
+    }
+
+    /// The `(component_id, gateway_id)` pair a `FlashConfig` (and the hand-built
+    /// session abort) addresses `component` (behind `gateway`) by: without a
+    /// gateway the component's [`component_path`](Self::component_path); with one,
+    /// the app id as is under the gateway's path (`…/components/{gateway
+    /// path}/apps/{app}`).
+    pub(crate) fn entity_ids(
+        &self,
+        component: &str,
+        gateway: Option<&str>,
+    ) -> (String, Option<String>) {
+        match gateway {
+            Some(gw) => (component.to_string(), Some(self.component_path(gw))),
+            None => (self.component_path(component), None),
+        }
+    }
+
+    /// Where a `RequiresEcuReset` group's coalesced restart is addressed
+    /// (`SovdClient::system_restart`): the group's gateway (by its
+    /// [`component_path`](Self::component_path)) when it has one, else the
+    /// [`restart_target`](Self::restart_target).
+    pub(crate) fn group_restart_target(&self, gateway: Option<&str>) -> Option<String> {
+        match gateway {
+            Some(gw) => Some(self.component_path(gw)),
+            None => self.restart_target().map(str::to_string),
         }
     }
 
@@ -468,7 +513,8 @@ pub(crate) async fn flash_ecu_to_staging(
         .to_string();
     info!(component = %comp, gateway = ?gw, update_type = ?update_type, "starting ECU flash (assumes already unlocked)");
 
-    let flash_client = build_flash_client(server_url, comp, gw, token, insecure, ca_cert_pem)?;
+    let flash_client =
+        build_flash_client(topology, server_url, comp, gw, token, insecure, ca_cert_pem)?;
 
     let update_id =
         open_update_or_rollback_pending(topology, &flash_client, comp, &pkg_name, &pkg_version)
@@ -588,6 +634,7 @@ pub(crate) async fn flash_ecu_to_staging(
         Ok(result) => Ok(result),
         Err(e) => {
             if let Err(de) = abort_update_session(
+                topology,
                 server_url,
                 comp,
                 gw,
@@ -616,7 +663,9 @@ pub(crate) async fn flash_ecu_to_staging(
 /// `FlashClient` method, so it doesn't wait on an upstream SOVDd
 /// release/tag/bump wave for one verb. Best-effort: 404 (session already
 /// gone) is success.
+#[allow(clippy::too_many_arguments)]
 async fn abort_update_session(
+    topology: &NodeTopology,
     server_url: &str,
     comp: &str,
     gateway_id: Option<&str>,
@@ -625,11 +674,13 @@ async fn abort_update_session(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    // Same base-prefix shape as FlashConfig::base_prefix — sub-entity
-    // components live under /components/{gateway}/apps/{app}.
-    let comp_path = match gateway_id {
-        Some(gw) => format!("{gw}/apps/{}", comp.replace('/', "%2F")),
-        None => comp.to_string(),
+    // Same base-prefix shape as FlashConfig::base_prefix over the same ids as
+    // `build_flash_client` — sub-entity components live under
+    // /components/{gateway}/apps/{app}, a node's under
+    // /components/{node}/subcomponents/{component}.
+    let comp_path = match topology.entity_ids(comp, gateway_id) {
+        (app, Some(gw)) => format!("{gw}/apps/{}", app.replace('/', "%2F")),
+        (path, None) => path,
     };
     let url = format!(
         "{}/vehicle/v1/components/{comp_path}/updates/{update_id}",
@@ -790,6 +841,7 @@ fn status_client(
 /// component like host-os) or `/status` is unreachable — callers treat absence
 /// as "no boot_id witness" and fall back to the observed server down→up.
 pub async fn read_boot_id(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     token: &str,
@@ -800,7 +852,10 @@ pub async fn read_boot_id(
     // (ii) `/status` unreadable → no heartbeat baseline. Stay quiet: the
     // connect-level down→up witness in `wait_activated` (which classifies its own
     // read errors) covers the reboot signal; here it is simply "no baseline".
-    let body = match client.read_status(component_id).await {
+    let body = match client
+        .read_status(&topology.component_path(component_id))
+        .await
+    {
         Ok(b) => b,
         Err(_) => return None,
     };
@@ -831,6 +886,7 @@ pub async fn read_boot_id(
 /// field (callers then fall back to the down→up witness). See the machine-manager
 /// `read_entity_status` (component-mgr backend) which emits it.
 pub async fn read_node_boot_id(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     token: &str,
@@ -840,7 +896,10 @@ pub async fn read_node_boot_id(
     let client = status_client(server_url, token, insecure, ca_cert_pem).ok()?;
     // (ii) `/status` unreadable → no node baseline; the down→up witness covers the
     // reboot. Quiet (the connect-level signal is `wait_activated`'s job).
-    let body = match client.read_status(component_id).await {
+    let body = match client
+        .read_status(&topology.component_path(component_id))
+        .await
+    {
         Ok(b) => b,
         Err(_) => return None,
     };
@@ -1003,6 +1062,7 @@ fn witness_timeout_reason(had_boot_baseline: bool, saw_down: bool, kind: Witness
 /// real reboot does.
 #[allow(clippy::too_many_arguments)]
 pub async fn wait_activated(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     baseline: Option<u32>,
@@ -1021,9 +1081,10 @@ pub async fn wait_activated(
     // and set ONLY by a connect-level failure (an HTTP status response proves the
     // server is up and must not count).
     let mut saw_down = false;
+    let status_path = topology.component_path(component_id);
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        match client.read_status(component_id).await {
+        match client.read_status(&status_path).await {
             Ok(body) => {
                 let ready = matches!(body.status, EntityStatus::Ready);
                 let runtime = body.extensions.get("x-runtime");
@@ -1081,7 +1142,9 @@ pub async fn wait_activated(
 /// fresh, ready lifetime — the per-component analogue of the node path, same
 /// `/status` boot_id witness, just a per-component `status/restart` instead of a
 /// coalesced node reboot.
+#[allow(clippy::too_many_arguments)]
 pub async fn restart_and_verify(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -1090,8 +1153,17 @@ pub async fn restart_and_verify(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
-    let baseline = read_boot_id(server_url, component_id, token, insecure, ca_cert_pem).await;
+    let baseline = read_boot_id(
+        topology,
+        server_url,
+        component_id,
+        token,
+        insecure,
+        ca_cert_pem,
+    )
+    .await;
     trigger_local_restart(
+        topology,
         server_url,
         component_id,
         gateway_id,
@@ -1101,6 +1173,7 @@ pub async fn restart_and_verify(
     )
     .await?;
     wait_activated(
+        topology,
         server_url,
         component_id,
         baseline,
@@ -1580,8 +1653,10 @@ pub(crate) async fn rollback_node_trials(
 }
 
 /// Trigger a per-component restart via `PUT components/{id}/status/restart`
-/// (used for `ResetKind::Local`). Does NOT wait for activation.
+/// (`components/{node}/subcomponents/{id}/status/restart` in node form; used for
+/// `ResetKind::Local`). Does NOT wait for activation.
 pub async fn trigger_local_restart(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -1590,6 +1665,7 @@ pub async fn trigger_local_restart(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<(), EngineError> {
     let flash_client = build_flash_client(
+        topology,
         server_url,
         component_id,
         gateway_id,
@@ -1611,7 +1687,9 @@ pub async fn trigger_local_restart(
 /// Read a component's declared `reset_kind` off the `/updates` wire (the
 /// `x-ota-reset-kind` vendor field SOVDd captures at register time). Servers
 /// that omit it deserialise to `Local`.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_reset_kind(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -1621,6 +1699,7 @@ pub async fn fetch_reset_kind(
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<sovd_core::ResetKind, EngineError> {
     let flash_client = build_flash_client(
+        topology,
         server_url,
         component_id,
         gateway_id,
@@ -1651,7 +1730,14 @@ pub async fn fetch_reset_kind(
 /// constructors (full verification). `ca_cert_pem`, when `Some`, instead pins
 /// that PEM CA root for the device leaf (the verifying counterpart to
 /// `insecure`); `None` keeps the `insecure` behaviour.
+///
+/// `component_id` / `gateway_id` are the logical ids; the client addresses them
+/// in `topology`'s form ([`NodeTopology::entity_ids`]) — in node form the
+/// component id handed to `FlashConfig` is its path below `/components/`
+/// (`{node}/subcomponents/{component}`), which `FlashConfig::base_prefix`
+/// splices in unencoded, so every `/updates` call lands on the subcomponent.
 pub(crate) fn build_flash_client(
+    topology: &NodeTopology,
     server_url: &str,
     component_id: &str,
     gateway_id: Option<&str>,
@@ -1659,11 +1745,12 @@ pub(crate) fn build_flash_client(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
 ) -> Result<FlashClient, EngineError> {
+    let (wire_id, wire_gateway) = topology.entity_ids(component_id, gateway_id);
     let mut builder = FlashConfig::builder(server_url)
-        .component_id(component_id)
+        .component_id(wire_id)
         .insecure(insecure)
         .ca_cert_pem(ca_cert_pem.map(|c| c.to_vec()));
-    if let Some(gw) = gateway_id {
+    if let Some(gw) = wire_gateway {
         builder = builder.gateway_id(gw);
     }
     if !token.is_empty() {
@@ -1726,9 +1813,67 @@ mod tests {
             "https://cvc:8443/vehicle/v1/components/cvc"
         );
         assert_eq!(NodeTopology::Root.restart_target(), None);
+        assert_eq!(NodeTopology::Root.group_restart_target(None), None);
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).group_restart_target(None),
+            Some("cvc".into())
+        );
+        assert_eq!(
+            NodeTopology::Node("cvc".into()).group_restart_target(Some("gw")),
+            Some("cvc/subcomponents/gw".into())
+        );
         assert_eq!(
             NodeTopology::Node("cvc".into()).restart_target(),
             Some("cvc")
+        );
+    }
+
+    #[test]
+    fn component_paths_per_topology() {
+        let root = NodeTopology::Root;
+        let node = NodeTopology::Node("cvc".into());
+        assert_eq!(root.component_path("vm1"), "vm1");
+        assert_eq!(node.component_path("vm1"), "cvc/subcomponents/vm1");
+        assert_eq!(root.entity_ids("vm1", None), ("vm1".into(), None));
+        assert_eq!(
+            node.entity_ids("vm1", None),
+            ("cvc/subcomponents/vm1".into(), None)
+        );
+        assert_eq!(
+            node.entity_ids("app", Some("gw")),
+            ("app".into(), Some("cvc/subcomponents/gw".into()))
+        );
+    }
+
+    #[test]
+    fn node_form_flash_client_addresses_the_subcomponent() {
+        // FlashConfig::base_prefix splices the id in verbatim — the node path
+        // must come out as the subcomponent's /updates collection.
+        let node = NodeTopology::Node("cvc".into());
+        let client = build_flash_client(&node, "http://dev", "vm1", None, "", false, None).unwrap();
+        assert_eq!(
+            client.config().updates_collection_path(),
+            "/vehicle/v1/components/cvc/subcomponents/vm1/updates"
+        );
+        let client =
+            build_flash_client(&node, "http://dev", "app", Some("gw"), "", false, None).unwrap();
+        assert_eq!(
+            client.config().updates_collection_path(),
+            "/vehicle/v1/components/cvc/subcomponents/gw/apps/app/updates"
+        );
+        let client = build_flash_client(
+            &NodeTopology::Root,
+            "http://dev",
+            "vm1",
+            None,
+            "",
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            client.config().updates_collection_path(),
+            "/vehicle/v1/components/vm1/updates"
         );
     }
 

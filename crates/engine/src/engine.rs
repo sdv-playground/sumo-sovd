@@ -92,15 +92,21 @@ impl FlashEngine {
     /// plan that mixes rollbackable (banked) + irreversible (singleshot, e.g.
     /// the HSM keystore) components — a rollback would leave the device
     /// undefined. Components the device doesn't report are skipped (graceful on
-    /// older firmware). Reads at the top-level component id (`read_data` has no
-    /// sub-entity form) — correct for campaign + rig's top-level components.
+    /// older firmware). Reads at the component (`read_data` has no sub-entity
+    /// form; a node's subcomponent by its path, see
+    /// [`ecu::NodeTopology::component_path`]) — correct for campaign + rig's
+    /// top-level components.
     pub async fn guard(&self, plan: &FlashPlan) -> Result<(), EngineError> {
         let mut rollbackable = Vec::new();
         let mut irreversible = Vec::new();
+        let topology = self.node_topology().await;
         for job in &plan.jobs {
             let client = self.sovd_client(&job.component_id).await?;
             if let Ok(resp) = client
-                .read_data(&job.component_id, "x-ota-update-mode")
+                .read_data(
+                    &topology.component_path(&job.component_id),
+                    "x-ota-update-mode",
+                )
                 .await
             {
                 if let Ok(mode) = serde_json::from_value::<UpdateModeProbe>(resp.value) {
@@ -232,10 +238,12 @@ impl FlashEngine {
 
     /// Reset all staged ECUs and wait for activation (trial mode), partitioning
     /// by `(parent ECU, reset_kind)` per ISO 17978-3 §7.19:
-    /// - `Local` → `PUT components/{id}/status/restart` per component, parallel.
+    /// - `Local` → `PUT components/{id}/status/restart` per component (a node's
+    ///   `components/{node}/subcomponents/{id}/status/restart`), parallel.
     /// - `RequiresEcuReset` → ONE entity/gateway restart per parent ECU, then
     ///   poll that group in parallel. Coalesces RT + host-OS into one reboot.
     pub async fn reset_all(&self, ecus: &mut [EcuStatus]) -> Result<(), EngineError> {
+        let topology = self.node_topology().await;
         // 1. Staged firmware components carry the update_id captured at staging.
         let mut staged: Vec<(String, Option<String>, String)> = Vec::new();
         for e in ecus.iter().filter(|e| e.state == EcuState::Staged) {
@@ -297,6 +305,7 @@ impl FlashEngine {
             } else {
                 let token = self.token.token(comp).await?;
                 ecu::fetch_reset_kind(
+                    &topology,
                     &self.server_url,
                     comp,
                     gw.as_deref(),
@@ -338,8 +347,10 @@ impl FlashEngine {
                 let secs = self.timeouts.local_reset_secs;
                 let insecure = self.insecure;
                 let ca_cert_pem = self.ca_cert_pem.clone();
+                let topology = topology.clone();
                 set.spawn(async move {
                     let result = ecu::restart_and_verify(
+                        &topology,
                         &url,
                         &comp,
                         gw.as_deref(),
@@ -373,6 +384,7 @@ impl FlashEngine {
                 baselines.insert(
                     comp_id.clone(),
                     ecu::read_boot_id(
+                        &topology,
                         &self.server_url,
                         comp_id,
                         &token,
@@ -384,6 +396,7 @@ impl FlashEngine {
                 node_baselines.insert(
                     comp_id.clone(),
                     ecu::read_node_boot_id(
+                        &topology,
                         &self.server_url,
                         comp_id,
                         &token,
@@ -404,11 +417,10 @@ impl FlashEngine {
                 "issuing ECU-level restart (coalesced for RequiresEcuReset)"
             );
             let restart_key = gateway_id.as_deref().unwrap_or("");
-            let topology = self.node_topology().await;
-            let restart_at = gateway_id.as_deref().or(topology.restart_target());
+            let restart_at = topology.group_restart_target(gateway_id.as_deref());
             let restart = match self.sovd_client(restart_key).await {
                 Ok(client) => client
-                    .system_restart(restart_at, "hard")
+                    .system_restart(restart_at.as_deref(), "hard")
                     .await
                     .map_err(|e| EngineError::FlashFailed {
                         component: comps.first().map(|(c, _)| c.clone()).unwrap_or_default(),
@@ -454,8 +466,10 @@ impl FlashEngine {
                 let node_baseline = node_baselines.get(&comp_id).cloned().flatten();
                 let insecure = self.insecure;
                 let ca_cert_pem = self.ca_cert_pem.clone();
+                let topology = topology.clone();
                 set.spawn(async move {
                     let result = ecu::wait_activated(
+                        &topology,
                         &url,
                         &comp_id,
                         baseline,
@@ -494,6 +508,7 @@ impl FlashEngine {
             // the node path above). restart_and_verify waits for the reboot to be
             // WITNESSED before we proceed.
             let outcome = ecu::restart_and_verify(
+                &topology,
                 &self.server_url,
                 &comp,
                 gw.as_deref(),
@@ -553,6 +568,7 @@ impl FlashEngine {
             // reboot unwitnessed unless node_boot_id/down→up fired — so pass the
             // heartbeat baseline too and require a REAL witness.
             let hb_baseline = ecu::read_boot_id(
+                &topology,
                 &self.server_url,
                 &witness,
                 &witness_token,
@@ -561,6 +577,7 @@ impl FlashEngine {
             )
             .await;
             let node_baseline = ecu::read_node_boot_id(
+                &topology,
                 &self.server_url,
                 &witness,
                 &witness_token,
@@ -568,10 +585,9 @@ impl FlashEngine {
                 self.ca_cert_pem.as_deref(),
             )
             .await;
-            let topology = self.node_topology().await;
-            let restart_at = gateway_id.as_deref().or(topology.restart_target());
+            let restart_at = topology.group_restart_target(gateway_id.as_deref());
             let restart = match self.sovd_client(restart_key).await {
-                Ok(client) => match client.system_restart(restart_at, "hard").await {
+                Ok(client) => match client.system_restart(restart_at.as_deref(), "hard").await {
                     Ok(()) => Ok(()),
                     // The device reboots kernel-direct, so when the reboot wins the
                     // race the connection dies before the response flushes. That is
@@ -598,6 +614,7 @@ impl FlashEngine {
             let outcome = match restart {
                 Ok(()) => {
                     ecu::wait_activated(
+                        &topology,
                         &self.server_url,
                         &witness,
                         hb_baseline,
@@ -862,7 +879,9 @@ impl FlashEngine {
         update_id: &str,
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
+        let topology = self.node_topology().await;
         let flash_client = ecu::build_flash_client(
+            &topology,
             &self.server_url,
             component_id,
             gateway_id,
@@ -917,7 +936,9 @@ impl FlashEngine {
         update_id: &str,
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
+        let topology = self.node_topology().await;
         let flash_client = ecu::build_flash_client(
+            &topology,
             &self.server_url,
             component_id,
             gateway_id,
@@ -1026,7 +1047,8 @@ impl FlashEngine {
                 return None;
             }
         };
-        let resp = match client.read_data(comp, "x-ota-update-mode").await {
+        let path = self.node_topology().await.component_path(comp);
+        let resp = match client.read_data(&path, "x-ota-update-mode").await {
             Ok(r) => r,
             Err(e) => {
                 warn!(component = %comp, error = %e, "update-mode probe: read failed");
@@ -1111,7 +1133,8 @@ impl FlashEngine {
 
     /// Build a base-URL `SovdClient` for `key` (a component or gateway id),
     /// bearing that key's token when non-empty. Used for entity-root restart
-    /// and the update-mode guard.
+    /// and the update-mode guard. `key` stays the logical id (it selects the
+    /// token); the caller addresses the component by its topology path.
     async fn sovd_client(&self, key: &str) -> Result<SovdClient, EngineError> {
         let token = self.token.token(key).await?;
         let ca = self.ca_cert_pem.as_deref();
