@@ -148,16 +148,34 @@ fn staged_part_digests(state: &NodeUpdateStateProbe, comp: &str) -> HashSet<Stri
         .collect()
 }
 
-/// `uri → lowercase hex image_digest` for every manifest component that states both.
+/// `part name → lowercase hex image_digest` for every manifest component that
+/// states a digest. The part name is the last segment of the component id —
+/// what the device names the staged image after and what a `#<part>` payload
+/// uri strips to. (The component's own uri is no key: a content-addressed
+/// envelope gives `sha256:<outer>` there, never the payload's `#<part>`.)
 fn manifest_part_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, String> {
     (0..manifest.component_count())
         .filter_map(|i| {
-            let uri = manifest.uri(i)?;
-            let (digest,) = manifest.image_digest(i)?;
-            let hex = digest.bytes.iter().map(|b| format!("{b:02x}")).collect();
-            Some((uri.to_string(), hex))
+            let name = manifest.component_id(i)?.last()?;
+            Some((
+                String::from_utf8_lossy(name).into_owned(),
+                digest_hex(manifest, i)?,
+            ))
         })
         .collect()
+}
+
+/// `uri → lowercase hex image_digest` for every manifest component that states
+/// both — the fallback for a payload addressed by a real uri, not `#<part>`.
+fn manifest_uri_digests(manifest: &sumo_onboard::Manifest) -> HashMap<String, String> {
+    (0..manifest.component_count())
+        .filter_map(|i| Some((manifest.uri(i)?.to_string(), digest_hex(manifest, i)?)))
+        .collect()
+}
+
+fn digest_hex(manifest: &sumo_onboard::Manifest, i: usize) -> Option<String> {
+    let (digest,) = manifest.image_digest(i)?;
+    Some(digest.bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `GET /vehicle/v1/data/x-update-state` — a NODE-level vendor resource at
@@ -352,20 +370,28 @@ pub async fn flash_ecu_to_staging(
                     }
                 }
             };
-            let digests = manifest_part_digests(manifest);
-            let pending: Vec<_> = job
-                .payloads
-                .iter()
-                .filter(|p| digests.get(&p.uri).is_none_or(|d| !present.contains(d)))
-                .collect();
+            let (by_name, by_uri) = (
+                manifest_part_digests(manifest),
+                manifest_uri_digests(manifest),
+            );
+            let (skipped, pending): (Vec<_>, Vec<_>) = job.payloads.iter().partition(|p| {
+                by_name
+                    .get(p.uri.trim_start_matches('#'))
+                    .or_else(|| by_uri.get(&p.uri))
+                    .is_some_and(|d| present.contains(d))
+            });
             if !job.payloads.is_empty() {
                 info!(
                     component = %comp,
                     "{} of {} parts already staged, uploading {}",
-                    job.payloads.len() - pending.len(),
+                    skipped.len(),
                     job.payloads.len(),
                     pending.len()
                 );
+                if !skipped.is_empty() {
+                    let names: Vec<_> = skipped.iter().map(|p| p.uri.as_str()).collect();
+                    debug!(component = %comp, "skipping staged parts {names:?}");
+                }
             }
             // SUIT-backed: upload detached payloads in component order, streaming
             // files so a multi-hundred-MB image never lands in RAM.
@@ -1555,6 +1581,54 @@ mod tests {
         let state: NodeUpdateStateProbe =
             serde_json::from_value(serde_json::json!({ "phase": "Idle" })).unwrap();
         assert!(staged_part_digests(&state, "vm1").is_empty());
+    }
+
+    // --- manifest_part_digests: the per-part resume lookup keys ---------------
+
+    /// A signed manifest with components `(id, uri, digest byte)`.
+    fn parts_manifest(parts: &[(&[&str], &str, u8)]) -> sumo_onboard::Manifest {
+        use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
+        use sumo_offboard::keygen;
+        let key = keygen::generate_signing_key(keygen::ES256).unwrap();
+        let mut builder = MultiComponentBuilder::new()
+            .sequence_number(1)
+            .signing_time(1_700_000_000);
+        for (id, uri, n) in parts {
+            builder = builder.add_component(ComponentSpec {
+                id: id.iter().map(|s| s.to_string()).collect(),
+                digest: vec![*n; 32],
+                size: 4,
+                uri: uri.to_string(),
+                encryption_info: None,
+            });
+        }
+        let envelope = builder.build(&key).unwrap();
+        classify_manifest(&envelope, &key.public_key_bytes())
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn manifest_part_digests_keys_by_last_component_id_segment() {
+        // Content-addressed component uris (as a tower-built envelope carries):
+        // the part name still comes from the component id, never the uri.
+        let outer_a = format!("sha256:{}", "01".repeat(32));
+        let outer_b = format!("sha256:{}", "02".repeat(32));
+        let m = parts_manifest(&[
+            (&["vm1", "kernel"], &outer_a, 0xaa),
+            (&["vm1", "rootfs.img"], &outer_b, 0xbb),
+        ]);
+        assert_eq!(
+            manifest_part_digests(&m),
+            HashMap::from([
+                ("kernel".to_string(), "aa".repeat(32)),
+                ("rootfs.img".to_string(), "bb".repeat(32)),
+            ])
+        );
+        assert_eq!(
+            manifest_uri_digests(&m),
+            HashMap::from([(outer_a, "aa".repeat(32)), (outer_b, "bb".repeat(32))])
+        );
     }
 
     // --- witness_decision: the pure, fail-closed reboot-witness verdict -------

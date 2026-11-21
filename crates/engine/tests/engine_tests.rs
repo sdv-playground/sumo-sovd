@@ -862,6 +862,8 @@ fn hex(bytes: &[u8]) -> String {
 
 /// A signed three-part (`#a`, `#b`, `#c`) firmware job for `vm1`, plus the trust
 /// anchor that validates it (so the SUIT path, not the opaque fallback, runs).
+/// The manifest's component uris are content addresses (`sha256:<outer>`), as a
+/// built envelope carries — only the payloads say `#<part>`.
 fn three_part_job() -> (FlashJob, Vec<u8>) {
     use sumo_offboard::image_builder::{ComponentSpec, MultiComponentBuilder};
     let signing_key = keygen::generate_signing_key(keygen::ES256).unwrap();
@@ -873,7 +875,7 @@ fn three_part_job() -> (FlashJob, Vec<u8>) {
             id: vec![name.to_string()],
             digest: part_digest(n),
             size: 4,
-            uri: format!("#{name}"),
+            uri: format!("sha256:{}", hex(&[0xC0 + n; 32])),
             encryption_info: None,
         });
     }

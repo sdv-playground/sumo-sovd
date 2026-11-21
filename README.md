@@ -38,7 +38,9 @@ the delegate certificate may not grant.
 Staging resumes per part: after the manifest, the engine reads the
 component's staging bank from `x-update-state` (`banks[].inactive.images`)
 and uploads only the payloads whose digest is not already there, so an
-interrupted rollout does not re-send what the node already holds.
+interrupted rollout does not re-send what the node already holds. A `#<part>`
+payload takes its digest from the manifest component whose id ends in
+`<part>` (the component's own uri may be a content address).
 
 ## Key Concepts
 
