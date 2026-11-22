@@ -5,7 +5,7 @@
 //! for `reset_kind` / `update_mode` (read off the wire here, never in the plan).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sovd_client::{FlashError, SovdClient};
 use tracing::{error, info, warn};
@@ -27,9 +27,25 @@ struct UpdateModeProbe {
     reset_kind: String,
 }
 
+/// Where the device answers SOVD right now. A device can move base across a
+/// node restart (e.g. plain http while unprovisioned, https after the restart
+/// that applies provisioning), so the engine asks the caller after observing
+/// the node down — see [`FlashEngine::with_base_resolver`].
+#[async_trait::async_trait]
+pub trait BaseResolver: Send + Sync {
+    /// The base URL the device answers on right now, or None if it answers nowhere yet.
+    async fn resolve(&self) -> Option<String>;
+}
+
 #[derive(Clone)]
 pub struct FlashEngine {
-    server_url: String,
+    /// The device base URL. Shared (not per-clone) so a base the witness wait
+    /// re-resolved after a restart is seen by every clone — `run_campaign`'s
+    /// per-step engines included. Read via [`server_url`](Self::server_url).
+    server_url: Arc<RwLock<String>>,
+    /// Asked for the device's current base after a node restart; `None` (the
+    /// default) keeps `server_url` fixed for the engine's lifetime.
+    base_resolver: Option<Arc<dyn BaseResolver>>,
     token: Arc<dyn TokenSource>,
     trust_anchor: Vec<u8>,
     timeouts: EngineTimeouts,
@@ -65,7 +81,8 @@ impl FlashEngine {
         ca_cert_pem: Option<Vec<u8>>,
     ) -> Self {
         Self {
-            server_url: server_url.into(),
+            server_url: Arc::new(RwLock::new(server_url.into())),
+            base_resolver: None,
             token,
             trust_anchor,
             timeouts,
@@ -80,6 +97,21 @@ impl FlashEngine {
     pub fn with_force_ecu_reset(mut self, force: bool) -> Self {
         self.force_ecu_reset = force;
         self
+    }
+
+    /// Re-resolve the device base after a node restart: once the witness wait
+    /// observes the node down, it asks `resolver` where the device is now and
+    /// follows a changed base — for the wait and for everything afterwards on
+    /// this engine (and its clones). Without one, the base is fixed.
+    pub fn with_base_resolver(mut self, resolver: Arc<dyn BaseResolver>) -> Self {
+        self.base_resolver = Some(resolver);
+        self
+    }
+
+    /// The device base URL the engine currently talks to — the constructor's,
+    /// or the one a [`BaseResolver`] moved it to after a restart.
+    pub fn server_url(&self) -> String {
+        self.server_url.read().unwrap().clone()
     }
 
     /// No-mix guard: read each component's `x-ota-update-mode` and reject a
@@ -158,7 +190,7 @@ impl FlashEngine {
             let token = self.token.token(comp).await?;
             match ecu::flash_ecu_to_staging(
                 job,
-                &self.server_url,
+                &self.server_url(),
                 &self.trust_anchor,
                 &token,
                 self.insecure,
@@ -289,7 +321,7 @@ impl FlashEngine {
             } else {
                 let token = self.token.token(comp).await?;
                 ecu::fetch_reset_kind(
-                    &self.server_url,
+                    &self.server_url(),
                     comp,
                     gw.as_deref(),
                     update_id,
@@ -325,7 +357,7 @@ impl FlashEngine {
         if !local.is_empty() {
             let mut set = tokio::task::JoinSet::new();
             for (comp, gw, _update_id) in local {
-                let url = self.server_url.clone();
+                let url = self.server_url();
                 let token = self.token.token(&comp).await?;
                 let secs = self.timeouts.local_reset_secs;
                 let insecure = self.insecure;
@@ -365,7 +397,7 @@ impl FlashEngine {
                 baselines.insert(
                     comp_id.clone(),
                     ecu::read_boot_id(
-                        &self.server_url,
+                        &self.server_url(),
                         comp_id,
                         &token,
                         self.insecure,
@@ -376,7 +408,7 @@ impl FlashEngine {
                 node_baselines.insert(
                     comp_id.clone(),
                     ecu::read_node_boot_id(
-                        &self.server_url,
+                        &self.server_url(),
                         comp_id,
                         &token,
                         self.insecure,
@@ -429,7 +461,6 @@ impl FlashEngine {
             // reboot wiped it).
             let mut set = tokio::task::JoinSet::new();
             for (comp_id, _update_id) in comps {
-                let url = self.server_url.clone();
                 let secs = self.timeouts.ecu_reset_activation_secs;
                 // Post-202 token: the device is mid-respawn, so a *minting*
                 // TokenSource (which reads the device boot_id to bind the token to
@@ -440,10 +471,13 @@ impl FlashEngine {
                 // campaign. The pre-restart baseline token can't be reused — it is
                 // boot-bound and invalid once the boot moves.)
                 let token = self.token_through_reboot(&comp_id, secs).await?;
+                let url = self.server_url();
                 let baseline = baselines.get(&comp_id).copied().flatten();
                 let node_baseline = node_baselines.get(&comp_id).cloned().flatten();
                 let insecure = self.insecure;
                 let ca_cert_pem = self.ca_cert_pem.clone();
+                let resolver = self.base_resolver.clone();
+                let url_slot = self.server_url.clone();
                 set.spawn(async move {
                     let result = ecu::wait_activated(
                         &url,
@@ -457,6 +491,7 @@ impl FlashEngine {
                         // Staged (banked, awaiting-verdict) components: the new
                         // firmware must come back READY before the verdict.
                         ecu::WitnessKind::RebootAndReady,
+                        resolver.as_deref().map(|r| (r, &*url_slot)),
                     )
                     .await;
                     (comp_id, result)
@@ -484,7 +519,7 @@ impl FlashEngine {
             // the node path above). restart_and_verify waits for the reboot to be
             // WITNESSED before we proceed.
             let outcome = ecu::restart_and_verify(
-                &self.server_url,
+                &self.server_url(),
                 &comp,
                 gw.as_deref(),
                 self.timeouts.local_reset_secs,
@@ -543,7 +578,7 @@ impl FlashEngine {
             // reboot unwitnessed unless node_boot_id/down→up fired — so pass the
             // heartbeat baseline too and require a REAL witness.
             let hb_baseline = ecu::read_boot_id(
-                &self.server_url,
+                &self.server_url(),
                 &witness,
                 &witness_token,
                 self.insecure,
@@ -551,7 +586,7 @@ impl FlashEngine {
             )
             .await;
             let node_baseline = ecu::read_node_boot_id(
-                &self.server_url,
+                &self.server_url(),
                 &witness,
                 &witness_token,
                 self.insecure,
@@ -586,7 +621,7 @@ impl FlashEngine {
             let outcome = match restart {
                 Ok(()) => {
                     ecu::wait_activated(
-                        &self.server_url,
+                        &self.server_url(),
                         &witness,
                         hb_baseline,
                         node_baseline,
@@ -595,6 +630,9 @@ impl FlashEngine {
                         self.insecure,
                         self.ca_cert_pem.as_deref(),
                         witness_kind,
+                        self.base_resolver
+                            .as_deref()
+                            .map(|r| (r, &*self.server_url)),
                     )
                     .await
                 }
@@ -642,7 +680,7 @@ impl FlashEngine {
     async fn commit_node_trials_for(&self, expected: &[String]) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
         ecu::commit_node_trials(
-            &self.server_url,
+            &self.server_url(),
             expected,
             &token,
             self.insecure,
@@ -662,7 +700,7 @@ impl FlashEngine {
     async fn rollback_node_trials_for(&self, expected: &[String]) -> Result<(), EngineError> {
         let token = self.token.token("").await?;
         ecu::rollback_node_trials(
-            &self.server_url,
+            &self.server_url(),
             expected,
             &token,
             self.insecure,
@@ -847,7 +885,7 @@ impl FlashEngine {
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
         let flash_client = ecu::build_flash_client(
-            &self.server_url,
+            &self.server_url(),
             component_id,
             gateway_id,
             &token,
@@ -902,7 +940,7 @@ impl FlashEngine {
     ) -> Result<(), EngineError> {
         let token = self.token.token(component_id).await?;
         let flash_client = ecu::build_flash_client(
-            &self.server_url,
+            &self.server_url(),
             component_id,
             gateway_id,
             &token,
@@ -1073,9 +1111,9 @@ impl FlashEngine {
         let token = self.token.token(key).await?;
         let ca = self.ca_cert_pem.as_deref();
         let client = if token.is_empty() {
-            SovdClient::new_verifying(&self.server_url, self.insecure, ca)
+            SovdClient::new_verifying(&self.server_url(), self.insecure, ca)
         } else {
-            SovdClient::with_bearer_token_verifying(&self.server_url, &token, self.insecure, ca)
+            SovdClient::with_bearer_token_verifying(&self.server_url(), &token, self.insecure, ca)
         };
         client.map_err(|e| EngineError::Sovd {
             component: key.to_string(),

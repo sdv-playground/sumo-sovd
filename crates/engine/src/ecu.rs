@@ -7,6 +7,7 @@
 //! or security state. The driver unlocks the ECU (UDS) before staging.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 use sovd_client::flash::{FlashClient, FlashConfig, FlashError};
 use sovd_client::{OperationExecution, OperationStatus, SovdClient, SovdClientError};
@@ -15,6 +16,7 @@ use sumo_crypto::RustCryptoBackend;
 use sumo_onboard::Validator;
 use tracing::{debug, info, warn};
 
+use crate::engine::BaseResolver;
 use crate::error::EngineError;
 use crate::types::{FlashJob, PayloadSource, UpdateType};
 
@@ -870,6 +872,11 @@ fn witness_timeout_reason(had_boot_baseline: bool, saw_down: bool, kind: Witness
 /// the missing witness. A boot id that merely *appears* (`None`→`Some`), an HTTP
 /// error response, or a transient non-connect read error do **not** pass — only a
 /// real reboot does.
+///
+/// `rebase` (a [`BaseResolver`] + the engine's shared base URL): once the node
+/// has been observed down, every poll that yields no witness asks the resolver
+/// where the device answers now; a changed base rebuilds the status client on it
+/// and is stored back as the engine's base. `None` polls `server_url` throughout.
 #[allow(clippy::too_many_arguments)]
 pub async fn wait_activated(
     server_url: &str,
@@ -881,8 +888,10 @@ pub async fn wait_activated(
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
     kind: WitnessKind,
+    rebase: Option<(&dyn BaseResolver, &RwLock<String>)>,
 ) -> Result<(), EngineError> {
-    let client = status_client(server_url, token, insecure, ca_cert_pem)?;
+    let mut client = status_client(server_url, token, insecure, ca_cert_pem)?;
+    let mut current_url = server_url.to_string();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     // The DOWN half of a down→up transition (1b): set once a poll fails at the
     // CONNECT level (the node is unreachable, i.e. rebooting), so a later ready
@@ -928,6 +937,19 @@ pub async fn wait_activated(
                     saw_down = true;
                 } else {
                     debug!(component = %component_id, error = %e, "status poll: server answered, no witness yet");
+                }
+            }
+        }
+        // The device may answer on another base after the restart (http while
+        // unprovisioned → https once the restart applied provisioning), so the old
+        // one stays dead. Once the node was seen down, ask where it is now.
+        if let (Some((resolver, slot)), true) = (rebase, saw_down) {
+            if let Some(new_url) = resolver.resolve().await {
+                if new_url != current_url {
+                    info!(old = %current_url, new = %new_url, "device base changed after restart");
+                    client = status_client(&new_url, token, insecure, ca_cert_pem)?;
+                    *slot.write().unwrap() = new_url.clone();
+                    current_url = new_url;
                 }
             }
         }
@@ -982,6 +1004,7 @@ pub async fn restart_and_verify(
         insecure,
         ca_cert_pem,
         WitnessKind::RebootAndReady,
+        None,
     )
     .await
 }

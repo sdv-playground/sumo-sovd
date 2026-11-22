@@ -21,8 +21,8 @@ use sovd_core::{
 };
 
 use sumo_sovd_flash_engine::{
-    CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts, FlashEngine, FlashJob,
-    FlashPlan, HealthCheck, NoAuth, Payload, PayloadSource, UpdateType,
+    BaseResolver, CameUp, CampaignStep, EcuState, EcuStatus, EngineError, EngineTimeouts,
+    FlashEngine, FlashJob, FlashPlan, HealthCheck, NoAuth, Payload, PayloadSource, UpdateType,
 };
 
 // Off-board toolkit — builds + signs a real SUIT disable envelope so the
@@ -1210,6 +1210,160 @@ async fn node_reset_tolerates_the_restart_call_dying_mid_request() {
         .expect("a dropped restart connection is the reboot, not a failure");
 
     assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+}
+
+/// Serve the real sovd-api as a node that goes away on its node restart: the
+/// `PUT /vehicle/v1/status/restart` answers 202, rotates `node_boot`, and sets the
+/// returned flag; the next `down_requests` requests then die with no reply (the
+/// same connection drop `Restart::DropsConnection` plays — a connect-level
+/// failure to the client). `u32::MAX` ⇒ this base never answers again.
+async fn serve_node_that_goes_away(
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+    node_boot: Arc<AtomicU32>,
+    down_requests: u32,
+) -> (String, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    use axum::response::IntoResponse;
+    let restarted = Arc::new(AtomicBool::new(false));
+    let down_left = Arc::new(AtomicU32::new(down_requests));
+    let (boot_l, restarted_l) = (node_boot.clone(), restarted.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).layer(
+        axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let (node_boot, restarted, down_left) =
+                    (boot_l.clone(), restarted_l.clone(), down_left.clone());
+                async move {
+                    if restarted.load(Ordering::SeqCst)
+                        && down_left
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok()
+                    {
+                        panic!("simulated node down after restart: connection dropped");
+                    }
+                    if req.method() == axum::http::Method::PUT
+                        && req.uri().path() == "/vehicle/v1/status/restart"
+                    {
+                        node_boot.fetch_add(1, Ordering::SeqCst);
+                        restarted.store(true, Ordering::SeqCst);
+                        return axum::http::StatusCode::ACCEPTED.into_response();
+                    }
+                    next.run(req).await
+                }
+            },
+        ),
+    );
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), restarted, handle)
+}
+
+/// Answers `before` until the node restart was issued, `after` from then on —
+/// the caller's view of where the device answers.
+struct MovesOnRestart {
+    restarted: Arc<AtomicBool>,
+    before: String,
+    after: Option<String>,
+}
+#[async_trait]
+impl BaseResolver for MovesOnRestart {
+    async fn resolve(&self) -> Option<String> {
+        if self.restarted.load(Ordering::SeqCst) {
+            self.after.clone()
+        } else {
+            Some(self.before.clone())
+        }
+    }
+}
+
+/// A committed singleshot `rt` declaring `requires_ecu_reset` on node A, which
+/// goes away on the node restart; the same component answers ready on node B
+/// (another 127.0.0.1 port) with the rotated node boot id.
+async fn node_moving_to_another_base() -> (String, String, Arc<AtomicBool>) {
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt_a = Arc::new(TestBackend::new("rt").with_node_boot(node_boot.clone()));
+    rt_a.set_update_mode(false, "requires_ecu_reset");
+    let mut a: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    a.insert("rt".into(), rt_a);
+    let (url_a, restarted, _ha) = serve_node_that_goes_away(a, node_boot.clone(), u32::MAX).await;
+    let mut b: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    b.insert(
+        "rt".into(),
+        Arc::new(TestBackend::new("rt").with_node_boot(node_boot)),
+    );
+    let (url_b, _hb) = serve(b).await;
+    (url_a, url_b, restarted)
+}
+
+#[tokio::test]
+async fn device_moves_to_another_base_after_the_node_restart() {
+    // Field bug: the device serves http while unprovisioned and https only after
+    // the node restart, so the witness wait kept polling the dead pre-restart
+    // base. With a resolver the engine follows the device to its new base — for
+    // the witness and for everything after it.
+    let (url_a, url_b, restarted) = node_moving_to_another_base().await;
+    let eng = engine_with_reset_budget(&url_a, 10).with_base_resolver(Arc::new(MovesOnRestart {
+        restarted,
+        before: url_a.clone(),
+        after: Some(url_b.clone()),
+    }));
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("the rotated node boot id on the new base is the witness");
+
+    assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+    assert_eq!(
+        eng.server_url(),
+        url_b,
+        "the engine must stay on the new base"
+    );
+}
+
+#[tokio::test]
+async fn device_moving_base_without_a_resolver_fails_the_witness() {
+    // Pins the behaviour without a resolver: the base is fixed, so the dead
+    // pre-restart base is polled until the activation deadline.
+    let (url_a, _url_b, _restarted) = node_moving_to_another_base().await;
+    let eng = engine_with_reset_budget(&url_a, 3);
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    let err = eng.reset_all(&mut ecus).await;
+
+    assert!(
+        matches!(err, Err(EngineError::Timeout { ref operation, .. }) if operation
+            == "no reboot witness: boot id(s) captured but never rotated and down observed \
+                but the node never came back ready"),
+        "got {err:?}"
+    );
+    assert_eq!(eng.server_url(), url_a);
+}
+
+#[tokio::test]
+async fn resolver_answering_nowhere_keeps_polling_the_old_base() {
+    // A resolver that cannot place the device yet (None) changes nothing: the
+    // wait keeps polling the old base, which comes back on the same base with a
+    // rotated node boot id.
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let rt = Arc::new(TestBackend::new("rt").with_node_boot(node_boot.clone()));
+    rt.set_update_mode(false, "requires_ecu_reset");
+    let mut backends: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    backends.insert("rt".into(), rt);
+    let (url, restarted, _h) = serve_node_that_goes_away(backends, node_boot, 2).await;
+    let eng = engine_with_reset_budget(&url, 10).with_base_resolver(Arc::new(MovesOnRestart {
+        restarted,
+        before: url.clone(),
+        after: None,
+    }));
+
+    let mut ecus = vec![committed_singleshot("rt", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("the old base came back rotated");
+
+    assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+    assert_eq!(eng.server_url(), url);
 }
 
 #[tokio::test]
