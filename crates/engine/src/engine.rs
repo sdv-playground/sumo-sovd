@@ -43,8 +43,8 @@ pub struct FlashEngine {
     /// re-resolved after a restart is seen by every clone — `run_campaign`'s
     /// per-step engines included. Read via [`server_url`](Self::server_url).
     server_url: Arc<RwLock<String>>,
-    /// Asked for the device's current base after a node restart; `None` (the
-    /// default) keeps `server_url` fixed for the engine's lifetime.
+    /// Asked for the device's current base after a node or component restart;
+    /// `None` (the default) keeps `server_url` fixed for the engine's lifetime.
     base_resolver: Option<Arc<dyn BaseResolver>>,
     token: Arc<dyn TokenSource>,
     trust_anchor: Vec<u8>,
@@ -99,10 +99,11 @@ impl FlashEngine {
         self
     }
 
-    /// Re-resolve the device base after a node restart: once the witness wait
-    /// observes the node down, it asks `resolver` where the device is now and
-    /// follows a changed base — for the wait and for everything afterwards on
-    /// this engine (and its clones). Without one, the base is fixed.
+    /// Re-resolve the device base after a node or component restart: once the
+    /// witness wait observes the server down, it asks `resolver` where the
+    /// device is now and follows a changed base — for the wait and for
+    /// everything afterwards on this engine (and its clones). Without one, the
+    /// base is fixed.
     pub fn with_base_resolver(mut self, resolver: Arc<dyn BaseResolver>) -> Self {
         self.base_resolver = Some(resolver);
         self
@@ -362,6 +363,8 @@ impl FlashEngine {
                 let secs = self.timeouts.local_reset_secs;
                 let insecure = self.insecure;
                 let ca_cert_pem = self.ca_cert_pem.clone();
+                let resolver = self.base_resolver.clone();
+                let url_slot = self.server_url.clone();
                 set.spawn(async move {
                     let result = ecu::restart_and_verify(
                         &url,
@@ -371,6 +374,7 @@ impl FlashEngine {
                         &token,
                         insecure,
                         ca_cert_pem.as_deref(),
+                        resolver.as_deref().map(|r| (r, &*url_slot)),
                     )
                     .await;
                     (comp, result)
@@ -526,6 +530,9 @@ impl FlashEngine {
                 &token,
                 self.insecure,
                 self.ca_cert_pem.as_deref(),
+                self.base_resolver
+                    .as_deref()
+                    .map(|r| (r, &*self.server_url)),
             )
             .await;
             if let Err(err) = outcome {
