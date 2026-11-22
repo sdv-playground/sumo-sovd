@@ -11,7 +11,7 @@ mod engine;
 pub mod error;
 pub mod types;
 
-pub use engine::FlashEngine;
+pub use engine::{BaseResolver, FlashEngine};
 pub use error::EngineError;
 pub use types::{
     CameUp, CampaignReport, CampaignStep, EcuState, EcuStatus, EngineTimeouts, FlashJob, FlashPlan,
