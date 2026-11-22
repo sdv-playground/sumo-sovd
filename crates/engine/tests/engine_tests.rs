@@ -1366,6 +1366,198 @@ async fn resolver_answering_nowhere_keeps_polling_the_old_base() {
     assert_eq!(eng.server_url(), url);
 }
 
+/// How the mocked server answers a component restart
+/// (`PUT /vehicle/v1/components/{id}/status/restart`). None of them touches the
+/// backend, so the component's heartbeat boot id never rotates — the witness
+/// must come from the server going down, or not at all.
+#[derive(Clone, Copy)]
+enum ComponentRestart {
+    /// Answers the restart, then the whole server process goes away for good.
+    AnswersThenGoesAway,
+    /// The restart call itself dies with no reply, and the server stays away.
+    DropsAndGoesAway,
+    /// Answers the restart and stays up, but nothing restarts.
+    AnswersAndStaysUp,
+}
+
+/// Serve the real sovd-api, playing the component restart per `restart`. The
+/// returned flag is set once the restart was requested.
+async fn serve_component_restart(
+    backends: HashMap<String, Arc<dyn DiagnosticBackend>>,
+    restart: ComponentRestart,
+) -> (String, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+    use axum::response::IntoResponse;
+    let restarted = Arc::new(AtomicBool::new(false));
+    let restarted_l = restarted.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = sovd_api::create_router(sovd_api::AppState::new(backends)).layer(
+        axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let restarted = restarted_l.clone();
+                async move {
+                    let goes_away = !matches!(restart, ComponentRestart::AnswersAndStaysUp);
+                    if goes_away && restarted.load(Ordering::SeqCst) {
+                        panic!("simulated server process restart: connection dropped");
+                    }
+                    if req.method() == axum::http::Method::PUT
+                        && req.uri().path().starts_with("/vehicle/v1/components/")
+                        && req.uri().path().ends_with("/status/restart")
+                    {
+                        restarted.store(true, Ordering::SeqCst);
+                        if matches!(restart, ComponentRestart::DropsAndGoesAway) {
+                            panic!("simulated mid-request server restart: connection dropped");
+                        }
+                        return axum::Json(serde_json::json!({
+                            "status": "completed",
+                            "reset_type": "hard",
+                        }))
+                        .into_response();
+                    }
+                    next.run(req).await
+                }
+            },
+        ),
+    );
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (format!("http://127.0.0.1:{port}"), restarted, handle)
+}
+
+/// A committed singleshot `hsm` declaring `local` on server A, which plays the
+/// component restart per `restart`; the same component answers ready on server B
+/// (another 127.0.0.1 port) with the SAME node boot id and the SAME heartbeat
+/// boot id — the node did not reboot and the component shows no fresh lifetime.
+async fn component_restart_bouncing_the_server(
+    restart: ComponentRestart,
+) -> (String, String, Arc<AtomicBool>) {
+    let node_boot = Arc::new(AtomicU32::new(1));
+    let hsm_a = Arc::new(TestBackend::new("hsm").with_node_boot(node_boot.clone()));
+    hsm_a.set_update_mode(false, "local");
+    let mut a: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    a.insert("hsm".into(), hsm_a);
+    let (url_a, restarted, _ha) = serve_component_restart(a, restart).await;
+    let mut b: HashMap<String, Arc<dyn DiagnosticBackend>> = HashMap::new();
+    b.insert(
+        "hsm".into(),
+        Arc::new(TestBackend::new("hsm").with_node_boot(node_boot)),
+    );
+    let (url_b, _hb) = serve(b).await;
+    (url_a, url_b, restarted)
+}
+
+/// The engine with a SHORT local-reset budget (see `engine_with_reset_budget`).
+fn engine_with_local_reset_budget(server_url: &str, local_reset_secs: u64) -> FlashEngine {
+    FlashEngine::new(
+        server_url.to_string(),
+        Arc::new(NoAuth),
+        dummy_trust_anchor(),
+        EngineTimeouts {
+            local_reset_secs,
+            ecu_reset_activation_secs: 300,
+        },
+        false,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn component_restart_that_bounces_the_server_to_another_base_is_witnessed() {
+    // Field bug (CVC .20): an old server answers the hsm component restart by
+    // restarting its whole SOVD process, which comes back on https with the same
+    // node boot id. The wait kept polling the dead http base until the budget
+    // ran out. Server down after the restart + the component ready again on the
+    // base the resolver names is the witness.
+    let (url_a, url_b, restarted) =
+        component_restart_bouncing_the_server(ComponentRestart::AnswersThenGoesAway).await;
+    let eng =
+        engine_with_local_reset_budget(&url_a, 10).with_base_resolver(Arc::new(MovesOnRestart {
+            restarted,
+            before: url_a.clone(),
+            after: Some(url_b.clone()),
+        }));
+
+    let mut ecus = vec![committed_singleshot("hsm", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("server down→up on the new base is the component restart witness");
+
+    assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+    assert_eq!(
+        eng.server_url(),
+        url_b,
+        "the engine must stay on the new base"
+    );
+}
+
+#[tokio::test]
+async fn component_restart_tolerates_the_restart_call_dying_mid_request() {
+    // The server process restart can beat the restart response out the door:
+    // that is the restart happening, and the witness wait stays the arbiter.
+    let (url_a, url_b, restarted) =
+        component_restart_bouncing_the_server(ComponentRestart::DropsAndGoesAway).await;
+    let eng =
+        engine_with_local_reset_budget(&url_a, 10).with_base_resolver(Arc::new(MovesOnRestart {
+            restarted,
+            before: url_a.clone(),
+            after: Some(url_b.clone()),
+        }));
+
+    let mut ecus = vec![committed_singleshot("hsm", UpdateType::Firmware)];
+    eng.reset_all(&mut ecus)
+        .await
+        .expect("a dropped restart connection is the restart, not a failure");
+
+    assert!(ecus[0].error.is_none(), "got {:?}", ecus[0].error);
+    assert_eq!(eng.server_url(), url_b);
+}
+
+#[tokio::test]
+async fn component_restart_moving_base_without_a_resolver_fails_the_witness() {
+    // Pins that the resolver is what follows the move: without one the dead
+    // pre-restart base is polled until the local-reset deadline.
+    let (url_a, _url_b, _restarted) =
+        component_restart_bouncing_the_server(ComponentRestart::AnswersThenGoesAway).await;
+    let eng = engine_with_local_reset_budget(&url_a, 3);
+
+    let mut ecus = vec![committed_singleshot("hsm", UpdateType::Firmware)];
+    let err = eng.reset_all(&mut ecus).await;
+
+    assert!(
+        matches!(err, Err(EngineError::Timeout { ref operation, .. }) if operation
+            == "no reboot witness: boot id(s) captured but never rotated and down observed \
+                but the node never came back ready"),
+        "got {err:?}"
+    );
+    assert_eq!(eng.server_url(), url_a);
+}
+
+#[tokio::test]
+async fn component_restart_with_the_server_never_down_is_not_witnessed() {
+    // No false witness: the server stays up and the component shows no fresh
+    // lifetime, so nothing proves a restart — even with a resolver that would
+    // name a ready base, which is only asked once the server was seen down.
+    let (url_a, url_b, restarted) =
+        component_restart_bouncing_the_server(ComponentRestart::AnswersAndStaysUp).await;
+    let eng =
+        engine_with_local_reset_budget(&url_a, 3).with_base_resolver(Arc::new(MovesOnRestart {
+            restarted,
+            before: url_b.clone(),
+            after: Some(url_b),
+        }));
+
+    let mut ecus = vec![committed_singleshot("hsm", UpdateType::Firmware)];
+    let err = eng.reset_all(&mut ecus).await;
+
+    assert!(
+        matches!(err, Err(EngineError::Timeout { ref operation, .. }) if operation
+            == "no reboot witness: boot id(s) captured but never rotated and no down→up \
+                transition observed"),
+        "got {err:?}"
+    );
+    assert_eq!(eng.server_url(), url_a);
+}
+
 #[tokio::test]
 async fn mixed_reset_group_witnesses_the_non_removal_component() {
     // A group of one Removal + one firmware singleshot: the firmware component is

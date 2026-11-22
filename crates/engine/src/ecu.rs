@@ -922,6 +922,18 @@ pub async fn wait_activated(
                     kind,
                 ) {
                     Witness::NotYet => {}
+                    // Name the down→up pass (and the base move, if any): it is the
+                    // only witness when a restart took the server process with it
+                    // and the component reports no fresh lifetime of its own.
+                    Witness::PassDownUp => {
+                        info!(
+                            component = %component_id,
+                            old_base = %server_url,
+                            base = %current_url,
+                            "restart witnessed: server went down and came back ready"
+                        );
+                        return Ok(());
+                    }
                     pass => {
                         info!(component = %component_id, witness = ?pass, "reboot witnessed — component ready");
                         return Ok(());
@@ -971,7 +983,10 @@ pub async fn wait_activated(
 /// Local reset of one component: capture its boot_id, restart it, and wait for a
 /// fresh, ready lifetime — the per-component analogue of the node path, same
 /// `/status` boot_id witness, just a per-component `status/restart` instead of a
-/// coalesced node reboot.
+/// coalesced node reboot. A server that restarts its whole process on the
+/// component restart is witnessed by the observed down→up, and `rebase` follows
+/// it to a new base exactly as on the node path (see [`wait_activated`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn restart_and_verify(
     server_url: &str,
     component_id: &str,
@@ -980,6 +995,7 @@ pub async fn restart_and_verify(
     token: &str,
     insecure: bool,
     ca_cert_pem: Option<&[u8]>,
+    rebase: Option<(&dyn BaseResolver, &RwLock<String>)>,
 ) -> Result<(), EngineError> {
     let baseline = read_boot_id(server_url, component_id, token, insecure, ca_cert_pem).await;
     trigger_local_restart(
@@ -1004,7 +1020,7 @@ pub async fn restart_and_verify(
         insecure,
         ca_cert_pem,
         WitnessKind::RebootAndReady,
-        None,
+        rebase,
     )
     .await
 }
@@ -1466,7 +1482,10 @@ pub async fn rollback_node_trials(
 }
 
 /// Trigger a per-component restart via `PUT components/{id}/status/restart`
-/// (used for `ResetKind::Local`). Does NOT wait for activation.
+/// (used for `ResetKind::Local`). Does NOT wait for activation. A call that dies
+/// at the connect level (the restart took the server down before the response
+/// flushed) is the restart happening, as on the node path: the caller's witness
+/// wait stays the arbiter.
 pub async fn trigger_local_restart(
     server_url: &str,
     component_id: &str,
@@ -1484,14 +1503,22 @@ pub async fn trigger_local_restart(
         ca_cert_pem,
     )?;
     info!(component = %component_id, "resetting ECU");
-    flash_client
-        .ecu_reset("hard")
-        .await
-        .map_err(|e| EngineError::FlashFailed {
+    match flash_client.ecu_reset("hard").await {
+        Ok(_) => Ok(()),
+        Err(FlashError::Http(e)) => {
+            info!(
+                component = %component_id,
+                error = %e,
+                "restart request did not return — server likely restarted mid-request; \
+                 verifying via the restart witness"
+            );
+            Ok(())
+        }
+        Err(e) => Err(EngineError::FlashFailed {
             component: component_id.to_string(),
             message: format!("reset: {e}"),
-        })?;
-    Ok(())
+        }),
+    }
 }
 
 /// Read a component's declared `reset_kind` off the `/updates` wire (the
