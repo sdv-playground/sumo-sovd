@@ -181,7 +181,7 @@ pub struct EngineTimeouts {
     /// Budget for a `Local` per-component reset → `Activated`.
     pub local_reset_secs: u64,
     /// Budget for a coalesced `RequiresEcuReset` group → `Activated` (covers
-    /// host reboot + supernova respawn + VM auto-start).
+    /// host reboot + node manager respawn + VM auto-start).
     pub ecu_reset_activation_secs: u64,
 }
 
