@@ -1463,7 +1463,7 @@ fn engine_with_local_reset_budget(server_url: &str, local_reset_secs: u64) -> Fl
 
 #[tokio::test]
 async fn component_restart_that_bounces_the_server_to_another_base_is_witnessed() {
-    // Field bug (CVC .20): an old server answers the hsm component restart by
+    // Field bug on target hardware: an old server answers the hsm component restart by
     // restarting its whole SOVD process, which comes back on https with the same
     // node boot id. The wait kept polling the dead http base until the budget
     // ran out. Server down after the restart + the component ready again on the

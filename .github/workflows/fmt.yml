@@ -15,3 +15,11 @@ jobs:
           toolchain: "1.96.0"
           components: rustfmt
       - run: cargo fmt --all -- --check
+  neutral-names:
+    name: neutral names
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No downstream product/organisation names in the tree; the denylist and
+      # its allow-list live in the script.
+      - run: bash scripts/check-neutral-names.sh

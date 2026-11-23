@@ -1,0 +1,2 @@
+# Functional identifiers that still carry a downstream name — see
+# scripts/check-neutral-names.sh. One `path:literal  # reason` per line.

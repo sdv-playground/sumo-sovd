@@ -549,7 +549,7 @@ impl FlashEngine {
             let restart_key = gateway_id.as_deref().unwrap_or("");
             info!(gateway = ?gateway_id, components = ?comps, "rebooting node for committed singleshot (RequiresEcuReset) — new firmware and/or removals");
             // Witness the reboot, don't just ping. `system_restart` is async — it
-            // returns 202 while the OLD supernova is still up, and the actual
+            // returns 202 while the OLD node manager is still up, and the actual
             // restart fires seconds later (esp. behind the reboot_host VM/loopback
             // teardown). A bare reachability ping (`wait_reachable`) returns on that
             // still-alive old instance, so the campaign races into the NEXT step,
